@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lan/meta-gateway/internal/domain"
 	"github.com/lan/meta-gateway/internal/ratelimit"
 
 	"github.com/go-chi/chi/v5"
@@ -35,6 +36,15 @@ type RelayProxy interface {
 	ChatCompletionsWithMeta(ctx context.Context, req proxy.Request) (*relay.Result, *proxy.AttemptMeta)
 	RecordUsage(req proxy.Request, channelID int64, status int, tokens usage.Tokens)
 	RecordStreamFailure(memberID int64)
+}
+
+// downstreamRouteGroup returns the authenticated key's route group binding
+// ("" = every route's default group).
+func downstreamRouteGroup(r *http.Request) string {
+	if key := auth.DownstreamKey(r); key != nil {
+		return key.RouteGroupName
+	}
+	return ""
 }
 
 // RelayHandler serves public /v1/* endpoints.
@@ -170,9 +180,15 @@ func (h *RelayHandler) computeRawModels() []string {
 		}
 	}
 	if len(raw) == 0 {
+		// Cold fallback (no enabled routes at all): manual-sync channels
+		// adopt models on demand, so their unadopted models_csv entries are
+		// not part of the catalogue.
 		channels, err := h.db.Channel.ListEnabled()
 		if err == nil {
 			for _, channel := range channels {
+				if channel.ModelSyncMode == domain.ModelSyncModeManual {
+					continue
+				}
 				for _, model := range strings.Split(channel.ModelsCSV, ",") {
 					add(model)
 				}
@@ -383,6 +399,7 @@ func (h *RelayHandler) forwardPassthrough(w http.ResponseWriter, r *http.Request
 		SessionKey:      r.Header.Get("X-Meta-Session-Id"),
 		ReasoningEffort: reasoningEffort,
 		Headers:         clientHeaders(r.Header),
+		RouteGroup:      downstreamRouteGroup(r),
 	}
 	result, meta := h.proxy.ForwardWithMeta(r.Context(), proxyReq)
 	// Binary / non-JSON responses: do not force SSE content-type unless stream.
@@ -567,6 +584,7 @@ func (h *RelayHandler) forwardModelRequest(w http.ResponseWriter, r *http.Reques
 		SessionKey:         r.Header.Get("X-Meta-Session-Id"),
 		ReasoningEffort:    reasoningEffort,
 		Headers:            clientHeaders(r.Header),
+		RouteGroup:         downstreamRouteGroup(r),
 	}
 	result, meta := h.proxy.ForwardWithMeta(r.Context(), proxyReq)
 	writeUpstreamResult(

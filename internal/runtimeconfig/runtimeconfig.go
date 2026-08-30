@@ -19,6 +19,23 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
+// ProbeSchedule is the scheduled model-probe configuration, hot-applied as one
+// unit so a partly-updated schedule can never run.
+type ProbeSchedule struct {
+	// Cron is a five-field cron expression; empty disables the schedule.
+	Cron string
+	// Prompt is the user message sent upstream; empty means the default.
+	Prompt      string
+	MaxTokens   int
+	Concurrency int
+	// AutoDisableAfter is the consecutive-failure threshold for automatic
+	// member disabling; 0 means the scheduled run only reports.
+	AutoDisableAfter int
+	// ChannelIDs and Models scope the run. Empty means everything.
+	ChannelIDs []int64
+	Models     []string
+}
+
 // Editable is the Admin-writable subset of gateway runtime parameters.
 type Editable struct {
 	RetryTimes                  int    `json:"retry_times"`
@@ -29,6 +46,22 @@ type Editable struct {
 	// DiscoveryCron is the scheduled model-list refresh expression (five-field
 	// cron; empty = disabled). Same format as checkin_cron.
 	DiscoveryCron string `json:"discovery_cron"`
+	// ProbeCron is the scheduled model-probe expression (five-field cron;
+	// empty = disabled). The probe_* fields below configure that run: a probe
+	// is a real upstream call, so its scope and cost stay explicit.
+	ProbeCron string `json:"probe_cron"`
+	// ProbePrompt is the user message the scheduled probe sends; empty means
+	// the built-in default.
+	ProbePrompt      string `json:"probe_prompt"`
+	ProbeMaxTokens   int    `json:"probe_max_tokens"`
+	ProbeConcurrency int    `json:"probe_concurrency"`
+	// ProbeAutoDisable is the consecutive-failure threshold at which the
+	// scheduled run disables a member; 0 leaves routing untouched.
+	ProbeAutoDisable int `json:"probe_auto_disable"`
+	// ProbeChannels and ProbeModels scope the scheduled run. Empty means
+	// every model of every route on every channel.
+	ProbeChannels []int64  `json:"probe_channels"`
+	ProbeModels   []string `json:"probe_models"`
 	// DBGCCron is the scheduled database maintenance expression (orphan GC +
 	// VACUUM; empty = disabled).
 	DBGCCron           string `json:"db_gc_cron"`
@@ -94,6 +127,10 @@ type Editable struct {
 	ChannelRetryTimes int `json:"channel_retry_times"`
 	// KeyPoolRotation enables rotating through the site key pool on failure.
 	KeyPoolRotation bool `json:"key_pool_rotation"`
+	// DefaultModelSyncMode is the sync mode ("auto"|"manual") new channels
+	// get when the create request omits model_sync_mode. Existing channels
+	// keep their own mode.
+	DefaultModelSyncMode string `json:"default_model_sync_mode"`
 }
 
 // Snapshot is the effective runtime view returned to Admin UI.
@@ -139,6 +176,9 @@ type Appliers struct {
 	// SetDBGCCron hot-applies the database-maintenance expression
 	// ("" = disabled).
 	SetDBGCCron func(expression string) error
+	// SetProbeSchedule hot-applies the scheduled model-probe configuration.
+	// An empty Cron disables the schedule.
+	SetProbeSchedule func(schedule ProbeSchedule) error
 	// SetRecoveryProbe hot-applies the passive-recovery probe configuration.
 	SetRecoveryProbe func(enabled bool, interval time.Duration)
 	// SetStableFirst hot-applies the grayscale pool (selector + promotion).
@@ -211,6 +251,10 @@ func New(cfg *config.Config, settingsStore *store.RuntimeSettingsStore, appliers
 		HealthSweepTimeoutSeconds:        cfg.HealthSweepTimeoutSeconds,
 		ChannelRetryTimes:                cfg.ChannelRetryTimes,
 		KeyPoolRotation:                  cfg.KeyPoolRotation,
+		// No env knob: the bootstrap default for new channels is manual
+		// (discovery only fills the candidate snapshot until models are
+		// explicitly adopted); Admin can override it here.
+		DefaultModelSyncMode: "manual",
 	}
 	c := &Controller{
 		env:      env,
@@ -316,6 +360,13 @@ func (c *Controller) Update(next Editable) (Snapshot, error) {
 		ProxyURL:                         next.ProxyURL,
 		DiscoveryCron:                    next.DiscoveryCron,
 		DBGCCron:                         next.DBGCCron,
+		ProbeCron:                        next.ProbeCron,
+		ProbePrompt:                      next.ProbePrompt,
+		ProbeMaxTokens:                   next.ProbeMaxTokens,
+		ProbeConcurrency:                 next.ProbeConcurrency,
+		ProbeAutoDisable:                 next.ProbeAutoDisable,
+		ProbeChannels:                    next.ProbeChannels,
+		ProbeModels:                      next.ProbeModels,
 		WebhookThrottleSeconds:           next.WebhookThrottleSeconds,
 		StableFirstEnabled:               boolInt(next.StableFirstEnabled),
 		StableFirstDenominator:           next.StableFirstDenominator,
@@ -336,6 +387,7 @@ func (c *Controller) Update(next Editable) (Snapshot, error) {
 		HealthSweepTimeoutSeconds:        next.HealthSweepTimeoutSeconds,
 		ChannelRetryTimes:                next.ChannelRetryTimes,
 		KeyPoolRotation:                  boolInt(next.KeyPoolRotation),
+		DefaultModelSyncMode:             next.DefaultModelSyncMode,
 	}
 	previousRow, err := c.store.Get()
 	if err != nil {
@@ -432,6 +484,19 @@ func (c *Controller) applyWithError(values Editable) error {
 	if c.appliers.SetDBGCCron != nil {
 		if err := c.appliers.SetDBGCCron(values.DBGCCron); err != nil {
 			return fmt.Errorf("db_gc_cron is invalid: %w", err)
+		}
+	}
+	if c.appliers.SetProbeSchedule != nil {
+		if err := c.appliers.SetProbeSchedule(ProbeSchedule{
+			Cron:             values.ProbeCron,
+			Prompt:           values.ProbePrompt,
+			MaxTokens:        values.ProbeMaxTokens,
+			Concurrency:      values.ProbeConcurrency,
+			AutoDisableAfter: values.ProbeAutoDisable,
+			ChannelIDs:       values.ProbeChannels,
+			Models:           values.ProbeModels,
+		}); err != nil {
+			return fmt.Errorf("probe_cron is invalid: %w", err)
 		}
 	}
 	if c.appliers.RelayLimiter != nil {
@@ -554,6 +619,13 @@ func rowToEditable(row *store.RuntimeSettingsRow) Editable {
 		ProxyURL:                         row.ProxyURL,
 		DiscoveryCron:                    row.DiscoveryCron,
 		DBGCCron:                         row.DBGCCron,
+		ProbeCron:                        row.ProbeCron,
+		ProbePrompt:                      row.ProbePrompt,
+		ProbeMaxTokens:                   row.ProbeMaxTokens,
+		ProbeConcurrency:                 row.ProbeConcurrency,
+		ProbeAutoDisable:                 row.ProbeAutoDisable,
+		ProbeChannels:                    row.ProbeChannels,
+		ProbeModels:                      row.ProbeModels,
 		WebhookThrottleSeconds:           row.WebhookThrottleSeconds,
 		StableFirstEnabled:               row.StableFirstEnabled == 1,
 		StableFirstDenominator:           row.StableFirstDenominator,
@@ -572,6 +644,7 @@ func rowToEditable(row *store.RuntimeSettingsRow) Editable {
 		HealthSweepTimeoutSeconds:        row.HealthSweepTimeoutSeconds,
 		ChannelRetryTimes:                row.ChannelRetryTimes,
 		KeyPoolRotation:                  row.KeyPoolRotation == 1,
+		DefaultModelSyncMode:             row.DefaultModelSyncMode,
 	}
 }
 
@@ -659,6 +732,9 @@ func (c *Controller) rowToEditableWithEnv(row *store.RuntimeSettingsRow) Editabl
 	}
 	if editable.KeyPoolRotation == false && row.KeyPoolRotation == -1 {
 		editable.KeyPoolRotation = c.env.KeyPoolRotation
+	}
+	if editable.DefaultModelSyncMode == "" {
+		editable.DefaultModelSyncMode = c.env.DefaultModelSyncMode
 	}
 	return editable
 }
@@ -767,6 +843,19 @@ func Validate(values Editable) error {
 		if _, err := parser.Parse(values.DBGCCron); err != nil {
 			return fmt.Errorf("db_gc_cron is invalid")
 		}
+	}
+	if values.ProbeCron != "" {
+		if _, err := parser.Parse(values.ProbeCron); err != nil {
+			return fmt.Errorf("probe_cron is invalid")
+		}
+	}
+	// A scheduled probe that disables members is the most consequential knob
+	// here, so a negative threshold is rejected rather than silently coerced.
+	if values.ProbeAutoDisable < 0 {
+		return fmt.Errorf("probe_auto_disable must be >= 0")
+	}
+	if values.DefaultModelSyncMode != "auto" && values.DefaultModelSyncMode != "manual" {
+		return fmt.Errorf("default_model_sync_mode must be auto or manual")
 	}
 	return nil
 }

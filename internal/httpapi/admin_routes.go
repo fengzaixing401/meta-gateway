@@ -2,9 +2,22 @@ package httpapi
 
 import (
 	"net/http"
+	"net/url"
+	"strings"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/lan/meta-gateway/internal/domain"
 )
+
+// maxRouteGroupNameLen caps route member group names (trimmed).
+const maxRouteGroupNameLen = 64
+
+// validateRouteGroup rejects group names that are too long. Empty is allowed
+// here — the store falls back to the 'default' group.
+func validateRouteGroup(name string) (string, bool) {
+	name = strings.TrimSpace(name)
+	return name, len(name) <= maxRouteGroupNameLen
+}
 
 func (h *AdminHandler) listRoutes(w http.ResponseWriter, r *http.Request) {
 	routes, err := h.db.Route.List()
@@ -168,6 +181,10 @@ func (h *AdminHandler) createRouteMember(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "weight must be non-negative")
 		return
 	}
+	if _, ok := validateRouteGroup(rm.GroupName); !ok {
+		writeError(w, http.StatusBadRequest, "group name too long")
+		return
+	}
 	id, err := h.db.RouteMember.Create(&rm)
 	if err != nil {
 		writeStoreError(w, err)
@@ -200,7 +217,18 @@ func (h *AdminHandler) updateRouteMember(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "weight must be non-negative")
 		return
 	}
+	if _, ok := validateRouteGroup(rm.GroupName); !ok {
+		writeError(w, http.StatusBadRequest, "group name too long")
+		return
+	}
 	if err := h.db.RouteMember.Update(&rm); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	// The PUT came from an operator action, so record the intent: this is what
+	// keeps a probe-disabled flag from surviving a manual toggle and a manual
+	// disable from being resurrected by automatic recovery.
+	if err := h.db.RouteMember.ApplyManualIntent(id, rm.Enabled); err != nil {
 		writeStoreError(w, err)
 		return
 	}
@@ -243,6 +271,99 @@ func (h *AdminHandler) deleteRouteMember(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// renameRouteMemberGroup moves every member of one group to another name.
+func (h *AdminHandler) renameRouteMemberGroup(w http.ResponseWriter, r *http.Request) {
+	routeID, ok := pathID(w, r, "routeId")
+	if !ok {
+		return
+	}
+	var body struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+	}
+	if err := decodeJSON(w, r, &body, 0, false); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	to, valid := validateRouteGroup(body.To)
+	if !valid {
+		writeError(w, http.StatusBadRequest, "group name too long")
+		return
+	}
+	if to == "" {
+		writeError(w, http.StatusBadRequest, "group name is required")
+		return
+	}
+	moved, err := h.db.RouteMember.RenameMemberGroup(routeID, body.From, to)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "moved": moved})
+}
+
+// deleteRouteMemberGroup removes every member of one group of a route.
+func (h *AdminHandler) deleteRouteMemberGroup(w http.ResponseWriter, r *http.Request) {
+	routeID, ok := pathID(w, r, "routeId")
+	if !ok {
+		return
+	}
+	name, err := url.PathUnescape(chi.URLParam(r, "name"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid group name")
+		return
+	}
+	removed, err := h.db.RouteMember.DeleteMemberGroup(routeID, name)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "removed": removed})
+}
+
+// copyRouteMemberGroup clones every member of one group into another, skipping
+// channels already present in the destination group.
+func (h *AdminHandler) copyRouteMemberGroup(w http.ResponseWriter, r *http.Request) {
+	routeID, ok := pathID(w, r, "routeId")
+	if !ok {
+		return
+	}
+	var body struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+	}
+	if err := decodeJSON(w, r, &body, 0, false); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	to, valid := validateRouteGroup(body.To)
+	if !valid {
+		writeError(w, http.StatusBadRequest, "group name too long")
+		return
+	}
+	if to == "" {
+		writeError(w, http.StatusBadRequest, "group name is required")
+		return
+	}
+	copied, err := h.db.RouteMember.CopyMemberGroup(routeID, body.From, to)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "copied": copied})
+}
+
+// listRouteGroupNames returns every distinct member group name across all
+// routes, for pick lists (e.g. key routing group selection).
+func (h *AdminHandler) listRouteGroupNames(w http.ResponseWriter, r *http.Request) {
+	groups, err := h.db.RouteMember.ListRouteGroupNames()
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
 }
 
 // ---------------------------------------------------------------------------

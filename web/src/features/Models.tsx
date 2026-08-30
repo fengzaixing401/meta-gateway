@@ -1,13 +1,15 @@
 import {
+  Activity,
   ExternalLink,
   ChevronDown,
+  Combine,
   GripVertical,
+  History,
   Info,
   Pencil,
   Plus,
   Power,
   RotateCcw,
-  Route as RouteIcon,
   Search,
   Shield,
   Sparkles,
@@ -16,7 +18,7 @@ import {
   X,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type FocusEvent } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
 import type {
@@ -30,7 +32,7 @@ import { EmptyHero } from "../components/EmptyHero";
 import { ListShell } from "../components/ListShell";
 import { PaginationBar } from "../components/PaginationBar";
 import { EntityState } from "../components/EntityState";
-import { StatGrid } from "../components/StatGrid";
+import { TelemetryStrip } from "../components/TelemetryStrip";
 import {
   Button,
   ConfirmDialog,
@@ -52,6 +54,9 @@ import { modelGroup } from "./models/modelGroups";
 import { ModelMetadataDialog } from "./models/ModelMetadataDialog";
 import { RouteDialog } from "./models/RouteDialog";
 import { MemberDialog } from "./models/MemberDialog";
+import { UnifyDialog } from "./models/UnifyDialog";
+import { UnifyHistory } from "./models/UnifyHistory";
+import { ProbeDialog } from "./models/ProbeDialog";
 
 function readMissingDismissed() {
   try {
@@ -219,10 +224,23 @@ function ModelCatalog({
   const [member, setMember] = useState<Partial<RouteMember> | null>(null);
   const [removeMember, setRemoveMember] = useState<RouteMember | null>(null);
   const [tryOpen, setTryOpen] = useState(false);
+  const [unifyOpen, setUnifyOpen] = useState(false);
+  const [unifyHistoryOpen, setUnifyHistoryOpen] = useState(false);
+  const [probeOpen, setProbeOpen] = useState(false);
   const [bulkSelect, setBulkSelect] = useState(false);
   const [selectedMemberIds, setSelectedMemberIds] = useState<Set<number>>(
     () => new Set(),
   );
+  /** Route-group tab currently being viewed ("default" = legacy behavior). */
+  const [activeGroup, setActiveGroup] = useState("default");
+  /** Inline tab editor: create a new group or rename an existing one. */
+  const [groupDraft, setGroupDraft] = useState<{
+    mode: "new" | "rename";
+    from?: string;
+    value: string;
+    copyDefault?: boolean;
+  } | null>(null);
+  const [removeGroup, setRemoveGroup] = useState<string | null>(null);
   const [missingDismissed, setMissingDismissed] =
     useState(readMissingDismissed);
   const [contextMenu, setContextMenu] = useState<{
@@ -341,6 +359,9 @@ function ModelCatalog({
   useEffect(() => {
     setSelectedMemberIds(new Set());
     setBulkSelect(false);
+    setActiveGroup("default");
+    setGroupDraft(null);
+    setRemoveGroup(null);
   }, [selected]);
 
   // Price-aware member ordering (cheapest first) when the toggle is on.
@@ -351,6 +372,39 @@ function ModelCatalog({
   const orderedMembers = useMemo(
     () => sortMembers(selectedMembers),
     [selectedMembers],
+  );
+  /** Normalized member groups; the active tab stays visible while empty. */
+  const groupNames = useMemo(() => {
+    const names = new Set<string>();
+    for (const candidate of orderedMembers) {
+      names.add(
+        (candidate.member.group_name || "").trim() || "default",
+      );
+    }
+    names.add("default");
+    if (activeGroup) names.add(activeGroup);
+    return [...names].sort((left, right) => {
+      if (left === "default") return -1;
+      if (right === "default") return 1;
+      return left.localeCompare(right);
+    });
+  }, [activeGroup, orderedMembers]);
+  const groupCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const candidate of orderedMembers) {
+      const group = (candidate.member.group_name || "").trim() || "default";
+      counts.set(group, (counts.get(group) ?? 0) + 1);
+    }
+    return counts;
+  }, [orderedMembers]);
+  const visibleMembers = useMemo(
+    () =>
+      orderedMembers.filter(
+        (candidate) =>
+          ((candidate.member.group_name || "").trim() || "default") ===
+          activeGroup,
+      ),
+    [activeGroup, orderedMembers],
   );
   const primary = primaryMember(selectedMembers);
   const selectedRoutingMode = selectedRoute?.routing_mode || "auto";
@@ -549,6 +603,82 @@ function ModelCatalog({
     },
     invalidateKeys: [...ROUTING_INVALIDATE_KEYS],
   });
+  const renameGroup = useAdminMutation({
+    mutationFn: (input: { from: string; to: string }) =>
+      service.renameMemberGroup(selected!, input.from, input.to),
+    invalidateKeys: [...ROUTING_INVALIDATE_KEYS],
+    toastOnError: false,
+    onSuccess: (_data, input) => {
+      setActiveGroup(input.to);
+      setGroupDraft(null);
+    },
+  });
+  const copyDefaultGroup = useAdminMutation({
+    mutationFn: (to: string) =>
+      service.copyMemberGroup(selected!, "default", to),
+    invalidateKeys: [...ROUTING_INVALIDATE_KEYS],
+    toastOnError: false,
+    onSuccess: (_data, to) => {
+      setActiveGroup(to);
+      setGroupDraft(null);
+    },
+  });
+  const removeGroupMut = useAdminMutation({
+    mutationFn: (name: string) => service.deleteMemberGroup(selected!, name),
+    invalidateKeys: [...ROUTING_INVALIDATE_KEYS],
+    toastOnError: false,
+    onSuccess: (_data, name) => {
+      setRemoveGroup(null);
+      setActiveGroup((current) => (current === name ? "default" : current));
+    },
+  });
+  /** Blur cancels the inline group editor — unless focus is only moving to
+   *  another part of it (the copy-default checkbox), which would unmount
+   *  together with the draft and become impossible to click. */
+  const groupEditorBlur = (event: FocusEvent) => {
+    const scope = event.currentTarget.closest(".member-group-tabs");
+    if (
+      scope &&
+      event.relatedTarget instanceof Node &&
+      scope.contains(event.relatedTarget)
+    )
+      return;
+    setGroupDraft(null);
+  };
+  /** Commits the inline tab editor; new groups are local until first member. */
+  const submitGroupDraft = () => {
+    if (!groupDraft || !selected) return;
+    const name = groupDraft.value.trim();
+    if (!name || name.length > 64) return;
+    if (groupDraft.mode === "new") {
+      if (groupNames.includes(name)) return;
+      if (groupDraft.copyDefault) {
+        copyDefaultGroup.mutate(name);
+        return;
+      }
+      setActiveGroup(name);
+      setGroupDraft(null);
+      return;
+    }
+    const from = groupDraft.from!;
+    if (name === from) {
+      setGroupDraft(null);
+      return;
+    }
+    if (groupNames.includes(name)) return;
+    renameGroup.mutate({ from, to: name });
+  };
+  /** Opens the member dialog preset for the active group tab. */
+  const openAddMember = () => {
+    saveMember.reset();
+    setMember({
+      priority: (visibleMembers.length || 0) + 1,
+      weight: 100,
+      enabled: true,
+      manual_override: true,
+      group_name: activeGroup,
+    });
+  };
   /** Batch toggle "independent priority/weight" for every member of a model.
    *  Turning it off snaps members back to the channel's global values. */
   const pinAllMembers = useAdminMutation({
@@ -622,17 +752,6 @@ function ModelCatalog({
         },
       },
       {
-        key: "overrides",
-        label: t("modelsPage.editOverrides"),
-        icon: <Pencil size={14} />,
-        disabled: busy,
-        onSelect: () => {
-          close();
-          save.reset();
-          setEdit(route);
-        },
-      },
-      {
         key: "toggle",
         label: route.enabled
           ? t("common.disableAction")
@@ -651,16 +770,6 @@ function ModelCatalog({
         onSelect: () => {
           close();
           navigate(`/logs?model=${encodeURIComponent(route.model_pattern)}`);
-        },
-      },
-      {
-        key: "routing",
-        label: t("modelsPage.showRouting"),
-        icon: <RouteIcon size={14} />,
-        onSelect: () => {
-          close();
-          selectRow(route.id);
-          setShowAdvanced(true);
         },
       },
       {
@@ -714,15 +823,17 @@ function ModelCatalog({
 
   return (
     <div className="ops-canvas">
-      <StatGrid
+      <TelemetryStrip
         items={[
           {
             label: t("modelsPage.stat.total"),
             value: overviews.isPending ? "—" : total,
+            tone: "primary",
           },
           {
             label: t("modelsPage.stat.enabled"),
             value: overviews.isPending ? "—" : enabledCount,
+            tone: "success",
           },
           {
             label: t("modelsPage.stat.multi"),
@@ -731,6 +842,7 @@ function ModelCatalog({
               : (overviews.data ?? []).filter(
                   (o) => (o.members ?? []).length > 1,
                 ).length,
+            tone: "info",
           },
         ]}
       />
@@ -835,16 +947,42 @@ function ModelCatalog({
           className="ops-list-panel"
           title={t("modelsPage.listTitle")}
           actions={
-            <Button
-              variant="secondary"
-              icon={<Plus size={16} />}
-              onClick={() => {
-                save.reset();
-                setEdit({ enabled: true });
-              }}
-            >
-              {t("routing.addRoute")}
-            </Button>
+            <>
+              <Button
+                variant="secondary"
+                icon={<Combine size={16} />}
+                onClick={() => setUnifyOpen(true)}
+                title={t("modelsPage.unify.actionHint")}
+              >
+                {t("modelsPage.unify.action")}
+              </Button>
+              <Button
+                variant="secondary"
+                icon={<History size={16} />}
+                onClick={() => setUnifyHistoryOpen(true)}
+                title={t("modelsPage.unify.history.actionHint")}
+              >
+                {t("modelsPage.unify.history.action")}
+              </Button>
+              <Button
+                variant="secondary"
+                icon={<Activity size={16} />}
+                onClick={() => setProbeOpen(true)}
+                title={t("modelsPage.probe.actionHint")}
+              >
+                {t("modelsPage.probe.action")}
+              </Button>
+              <Button
+                variant="secondary"
+                icon={<Plus size={16} />}
+                onClick={() => {
+                  save.reset();
+                  setEdit({ enabled: true });
+                }}
+              >
+                {t("routing.addRoute")}
+              </Button>
+            </>
           }
         >
           <div className="models-simple-toolbar">
@@ -1324,15 +1462,7 @@ function ModelCatalog({
                     <Button
                       variant="secondary"
                       icon={<Plus size={14} />}
-                      onClick={() => {
-                        saveMember.reset();
-                        setMember({
-                          priority: (selectedMembers.length || 0) + 1,
-                          weight: 100,
-                          enabled: true,
-                          manual_override: true,
-                        });
-                      }}
+                      onClick={openAddMember}
                     >
                       {t("routing.addMember")}
                     </Button>
@@ -1382,7 +1512,7 @@ function ModelCatalog({
                       </Button>
                     </div>
                   ) : null}
-				  {selectedMembers.length > 1 ? (
+				  {visibleMembers.length > 1 ? (
 				    <div className="routing-reorder-hint">
 				      <span>
 				        {reorderMembers.isPending
@@ -1391,10 +1521,142 @@ function ModelCatalog({
 				      </span>
 				    </div>
 				  ) : null}
+                  <div className="member-group-tabs">
+                    <div
+                      className="member-group-tablist"
+                      role="tablist"
+                      aria-label={t("routing.memberGroupLabel")}
+                    >
+                      {groupNames.map((name) => {
+                        const active = name === activeGroup;
+                        const count = groupCounts.get(name) ?? 0;
+                        return (
+                          <div
+                            key={name}
+                            className={`member-group-tab${active ? " is-active" : ""}`}
+                          >
+                            <button
+                              type="button"
+                              role="tab"
+                              aria-selected={active}
+                              onClick={() => setActiveGroup(name)}
+                            >
+                              <span className="member-group-tab-main">
+                                {name === "default"
+                                  ? t("routing.groupDefault")
+                                  : name}
+                                <span className="member-group-count">
+                                  {count}
+                                </span>
+                              </span>
+                            </button>
+                            {name !== "default" ? (
+                              <ActionMenu
+                                compact
+                                label={t("common.moreActions")}
+                                items={[
+                                  {
+                                    key: "rename",
+                                    icon: <Pencil size={14} />,
+                                    label: t("routing.groupRename"),
+                                    onSelect: () =>
+                                      setGroupDraft({
+                                        mode: "rename",
+                                        from: name,
+                                        value: name,
+                                      }),
+                                  },
+                                  {
+                                    key: "delete",
+                                    icon: <Trash2 size={14} />,
+                                    label: t("routing.groupDelete"),
+                                    danger: true,
+                                    onSelect: () => setRemoveGroup(name),
+                                  },
+                                ]}
+                              />
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                      {groupDraft ? (
+                        <input
+                          className="member-group-input"
+                          autoFocus
+                          value={groupDraft.value}
+                          maxLength={64}
+                          placeholder={
+                            groupDraft.mode === "new"
+                              ? t("routing.groupNewPlaceholder")
+                              : t("routing.groupRenamePlaceholder")
+                          }
+                          onChange={(event) =>
+                            setGroupDraft({
+                              ...groupDraft,
+                              value: event.target.value,
+                            })
+                          }
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") submitGroupDraft();
+                            if (event.key === "Escape") setGroupDraft(null);
+                          }}
+                          onBlur={groupEditorBlur}
+                        />
+                      ) : (
+                        <button
+                          type="button"
+                          className="member-group-add"
+                          onClick={() =>
+                            setGroupDraft({ mode: "new", value: "" })
+                          }
+                        >
+                          <Plus size={12} />
+                          {t("routing.groupNew")}
+                        </button>
+                      )}
+                    </div>
+                    {groupDraft?.mode === "new" ? (
+                      <label className="member-group-copy">
+                        <input
+                          type="checkbox"
+                          checked={groupDraft.copyDefault ?? false}
+                          onChange={(event) =>
+                            setGroupDraft({
+                              ...groupDraft,
+                              copyDefault: event.target.checked,
+                            })
+                          }
+                          onBlur={groupEditorBlur}
+                        />
+                        <span>{t("routing.groupCopyDefault")}</span>
+                      </label>
+                    ) : null}
+                    <p className="member-group-hint">
+                      {t("routing.groupTabsHint")}
+                    </p>
+                  </div>
                   {!selectedMembers.length ? (
                     <Empty>{t("routing.noMembers")}</Empty>
+                  ) : visibleMembers.length === 0 ? (
+                    <div className="routing-group-empty">
+                      <span>
+                        {t("routing.groupEmpty", {
+                          name:
+                            activeGroup === "default"
+                              ? t("routing.groupDefault")
+                              : activeGroup,
+                        })}
+                      </span>
+                      <Button
+                        variant="secondary"
+                        icon={<Plus size={14} />}
+                        onClick={openAddMember}
+                      >
+                        {t("routing.addMember")}
+                      </Button>
+                    </div>
                   ) : (
-                    orderedMembers.map((candidate, rowIndex) => {
+                    visibleMembers.map((candidate, rowIndex) => {
                       const entry = candidate.member;
                       const evaluation = explain.data?.candidates.find(
                         (item) => item.candidate.member.id === entry.id,
@@ -1417,7 +1679,7 @@ function ModelCatalog({
                           (!entry.enabled && entry.fail_count > 0));
                       const resetActionIsCooldown =
                         activeCooldown && entry.enabled;
-                      const ordered = orderedMembers;
+                      const ordered = visibleMembers;
                       const busy =
                         toggleMember.pendingId === entry.id ||
                         clearHealth.pendingId === entry.id ||
@@ -1464,7 +1726,7 @@ function ModelCatalog({
                             );
                             setDragMemberId(null);
                             if (!sourceId || sourceId === entry.id) return;
-                            const current = sortMembers(selectedMembers);
+                            const current = sortMembers(visibleMembers);
                             const from = current.findIndex(
                               (item) => item.member.id === sourceId,
                             );
@@ -1787,6 +2049,11 @@ function ModelCatalog({
         </div>
       </div>
 
+      {unifyOpen ? <UnifyDialog onClose={() => setUnifyOpen(false)} /> : null}
+      {unifyHistoryOpen ? (
+        <UnifyHistory onClose={() => setUnifyHistoryOpen(false)} />
+      ) : null}
+      {probeOpen ? <ProbeDialog onClose={() => setProbeOpen(false)} /> : null}
       {edit ? (
         <RouteDialog
           value={edit}
@@ -1827,6 +2094,7 @@ function ModelCatalog({
             id: channel.id,
             name: channel.name,
           }))}
+          groups={groupNames}
           pending={saveMember.isPending}
           error={saveMember.error}
           onClose={() => setMember(null)}
@@ -1853,6 +2121,19 @@ function ModelCatalog({
           error={delMember.error}
           onClose={() => setRemoveMember(null)}
           onConfirm={() => delMember.mutate(removeMember.id)}
+        />
+      ) : null}
+      {removeGroup ? (
+        <ConfirmDialog
+          title={t("routing.groupDelete")}
+          message={t("routing.groupDeleteConfirm", {
+            name: removeGroup,
+            count: groupCounts.get(removeGroup) ?? 0,
+          })}
+          pending={removeGroupMut.isPending}
+          error={removeGroupMut.error}
+          onClose={() => setRemoveGroup(null)}
+          onConfirm={() => removeGroupMut.mutate(removeGroup)}
         />
       ) : null}
       {tryOpen && selectedRoute ? (

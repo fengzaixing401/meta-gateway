@@ -159,6 +159,11 @@ type Channel struct {
 	// RetryConfig is a JSON-encoded RetryConfig (per-channel retryable status
 	// codes and error-text patterns). Empty string = global defaults only.
 	RetryConfig string `json:"retry_config,omitempty"`
+	// ModelSyncMode controls what discovery does with probed models: "auto"
+	// adopts every model as route+member (legacy behaviour), "manual" only
+	// refreshes the discovery snapshot and models_csv — adoption happens per
+	// model from the channel models panel.
+	ModelSyncMode string `json:"model_sync_mode,omitempty"`
 	// StableFirst marks the channel as a grayscale candidate: it receives a
 	// small 1/N fraction of traffic until it earns promotion.
 	StableFirst bool `json:"stable_first,omitempty"`
@@ -169,6 +174,24 @@ type Channel struct {
 	ConsecutiveFailures int       `json:"-"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+}
+
+// Model sync modes for Channel.ModelSyncMode. The empty string and unknown
+// values are treated as ModelSyncModeManual (opt-in adoption is the safe
+// default; only explicitly configured channels auto-adopt).
+const (
+	ModelSyncModeAuto   = "auto"
+	ModelSyncModeManual = "manual"
+)
+
+// NormalizeModelSyncMode maps an empty or unknown mode to ModelSyncModeManual.
+func NormalizeModelSyncMode(mode string) string {
+	switch mode {
+	case ModelSyncModeAuto:
+		return ModelSyncModeAuto
+	default:
+		return ModelSyncModeManual
+	}
 }
 
 // RetryableErrorPattern matches an upstream error message (substring or regex).
@@ -366,25 +389,37 @@ type Route struct {
 // RouteMember
 // ---------------------------------------------------------------------------
 
+// DefaultRouteGroup is the built-in route member group every legacy member
+// belongs to. Keys without a route_group_name always use it.
+const DefaultRouteGroup = "default"
+
 // RouteMember binds a channel to a route with priority/weight.
 type RouteMember struct {
-	ID             int64      `json:"id"`
-	RouteID        int64      `json:"route_id"`
-	ChannelID      int64      `json:"channel_id"`
-	Priority       int        `json:"priority"`
-	Weight         int        `json:"weight"`
-	Enabled        bool       `json:"enabled"`
-	Auto           bool       `json:"auto"`
-	ManualOverride bool       `json:"manual_override"`
+	ID             int64 `json:"id"`
+	RouteID        int64 `json:"route_id"`
+	ChannelID      int64 `json:"channel_id"`
+	Priority       int   `json:"priority"`
+	Weight         int   `json:"weight"`
+	Enabled        bool  `json:"enabled"`
+	Auto           bool  `json:"auto"`
+	ManualOverride bool  `json:"manual_override"`
+	// AutoDisabled marks a member a probe turned off, as opposed to one an
+	// operator disabled. The probe keeps probing such members so recovery can
+	// reach them.
+	AutoDisabled bool `json:"auto_disabled"`
 	// MappingJSON holds a per-member alias redirect ({"real":"…"}) so several
 	// channels can share one route/alias name while each rewrites to its own
 	// upstream model. Empty = follow the route-level mapping_json (legacy).
-	MappingJSON string     `json:"mapping_json,omitempty"`
-	FailCount      int        `json:"fail_count"`
-	CooldownUntil  *time.Time `json:"cooldown_until,omitempty"`
-	LastError      string     `json:"last_error,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	MappingJSON   string     `json:"mapping_json,omitempty"`
+	// GroupName scopes the member to a route group; each group has its own
+	// priority ordering. 'default' is the built-in group every legacy member
+	// belongs to.
+	GroupName     string     `json:"group_name,omitempty"`
+	FailCount     int        `json:"fail_count"`
+	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
+	LastError     string     `json:"last_error,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 // ---------------------------------------------------------------------------
@@ -423,8 +458,12 @@ type DownstreamKey struct {
 	AllowedIPs string `json:"allowed_ips,omitempty"`
 	// GroupName is the multi-tenant group this key belongs to ("default" when
 	// unset). Group quotas/rate limits apply on top of the key's own limits.
-	GroupName string    `json:"group_name"`
-	CreatedAt time.Time `json:"created_at"`
+	GroupName string `json:"group_name"`
+	// RouteGroupName picks a route group for every model this key relays.
+	// Empty = each route's 'default' group. When a route has no group of this
+	// name, its 'default' group (then all members) is used.
+	RouteGroupName string    `json:"route_group_name,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // KeyGroup is a multi-tenant token group with its own quota and rate limits.

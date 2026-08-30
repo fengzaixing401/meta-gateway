@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -185,13 +186,13 @@ func TestMigrationsAreTrackedAndIdempotent(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 79 {
-		t.Fatalf("got %d applied migrations, want 79", count)
+	if count != 85 {
+		t.Fatalf("got %d applied migrations, want 85", count)
 	}
 	if err := store.Migrate(db.DB); err != nil {
 		t.Fatalf("second migrate: %v", err)
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil || count != 79 {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil || count != 85 {
 		t.Fatalf("migration history after rerun: count=%d err=%v", count, err)
 	}
 }
@@ -310,6 +311,7 @@ func TestSiteDeleteCascadesChannelsModelsAndEmptyRoutes(t *testing.T) {
 	}
 	channelID, err := db.Channel.Create(&domain.Channel{
 		SiteID: &siteID, CredentialID: &credID, Name: "owned-ch", Status: domain.StatusEnabled,
+		ModelSyncMode: domain.ModelSyncModeAuto,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -346,6 +348,7 @@ func TestChannelDeleteCleansEmptyRoutes(t *testing.T) {
 	})
 	channelID, err := db.Channel.Create(&domain.Channel{
 		SiteID: &siteID, CredentialID: &credID, Name: "only", Status: domain.StatusEnabled,
+		ModelSyncMode: domain.ModelSyncModeAuto,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -415,7 +418,7 @@ func TestCheckinCredentialAndLogs(t *testing.T) {
 
 func TestDiscoveryReconcileIsIdempotentAndProtectsManualMembers(t *testing.T) {
 	db := openTestDB(t)
-	channelID, err := db.Channel.Create(&domain.Channel{Name: "discovery", Priority: 7, Weight: 33, Status: domain.StatusEnabled})
+	channelID, err := db.Channel.Create(&domain.Channel{Name: "discovery", Priority: 7, Weight: 33, Status: domain.StatusEnabled, ModelSyncMode: domain.ModelSyncModeAuto})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +474,7 @@ func TestDiscoveryReconcileIsIdempotentAndProtectsManualMembers(t *testing.T) {
 
 func TestDiscoveryReconcileRemovesAndRecreatesAutomaticMember(t *testing.T) {
 	db := openTestDB(t)
-	channelID, _ := db.Channel.Create(&domain.Channel{Name: "discovery", Priority: 2, Weight: 10, Status: domain.StatusEnabled})
+	channelID, _ := db.Channel.Create(&domain.Channel{Name: "discovery", Priority: 2, Weight: 10, Status: domain.StatusEnabled, ModelSyncMode: domain.ModelSyncModeAuto})
 	base := store.ReconcileInput{ChannelID: channelID, Models: []string{"model-a"}, Source: "new-api", CheckedAt: time.Now()}
 	if _, err := db.DiscoveredModel.Reconcile(t.Context(), base); err != nil {
 		t.Fatal(err)
@@ -512,7 +515,7 @@ func TestDiscoveryReconcileRemovesAndRecreatesAutomaticMember(t *testing.T) {
 
 func TestDiscoveryReconcileDoesNotChangeManualMember(t *testing.T) {
 	db := openTestDB(t)
-	channelID, _ := db.Channel.Create(&domain.Channel{Name: "manual", Status: domain.StatusEnabled})
+	channelID, _ := db.Channel.Create(&domain.Channel{Name: "manual", Status: domain.StatusEnabled, ModelSyncMode: domain.ModelSyncModeAuto})
 	routeID, _ := db.Route.Create(&domain.Route{ModelPattern: "manual-model", Enabled: true})
 	memberID, err := db.RouteMember.Create(&domain.RouteMember{RouteID: routeID, ChannelID: channelID, Priority: 42, Weight: 9, Enabled: true, Auto: false})
 	if err != nil {
@@ -535,7 +538,7 @@ func TestDiscoveryReconcileDoesNotChangeManualMember(t *testing.T) {
 
 func TestDiscoveredModelsCascadeWithChannel(t *testing.T) {
 	db := openTestDB(t)
-	channelID, _ := db.Channel.Create(&domain.Channel{Name: "cascade", Status: domain.StatusEnabled})
+	channelID, _ := db.Channel.Create(&domain.Channel{Name: "cascade", Status: domain.StatusEnabled, ModelSyncMode: domain.ModelSyncModeAuto})
 	_, err := db.DiscoveredModel.Reconcile(t.Context(), store.ReconcileInput{ChannelID: channelID, Models: []string{"model"}, CheckedAt: time.Now()})
 	if err != nil {
 		t.Fatal(err)
@@ -551,7 +554,7 @@ func TestDiscoveredModelsCascadeWithChannel(t *testing.T) {
 
 func TestDiscoveryReconcileRollsBackAllState(t *testing.T) {
 	db := openTestDB(t)
-	channelID, _ := db.Channel.Create(&domain.Channel{Name: "rollback", Status: domain.StatusEnabled})
+	channelID, _ := db.Channel.Create(&domain.Channel{Name: "rollback", Status: domain.StatusEnabled, ModelSyncMode: domain.ModelSyncModeAuto})
 	valid := store.ReconcileInput{ChannelID: channelID, Models: []string{"old-model"}, Source: "openai-compatible", CheckedAt: time.Now()}
 	if _, err := db.DiscoveredModel.Reconcile(t.Context(), valid); err != nil {
 		t.Fatal(err)
@@ -680,6 +683,197 @@ func TestRoutingUniqueConstraints(t *testing.T) {
 	if _, err := db.RouteMember.Create(member); err == nil {
 		t.Fatal("expected duplicate member to fail")
 	}
+	// The same channel may join the same route again under another group with
+	// its own priority, but not twice within one group.
+	member.GroupName = "B"
+	if _, err := db.RouteMember.Create(member); err != nil {
+		t.Fatalf("same channel in another group should be allowed: %v", err)
+	}
+	if _, err := db.RouteMember.Create(member); err == nil {
+		t.Fatal("expected duplicate member within group B to fail")
+	}
+}
+
+func TestRoutingCandidatesGroupFilterAndFallback(t *testing.T) {
+	db := openTestDB(t)
+	routeID, err := db.Route.Create(&domain.Route{ModelPattern: "group-model", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newChannel := func(name string) int64 {
+		id, err := db.Channel.Create(&domain.Channel{Name: name, Status: domain.StatusEnabled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	defA, defB, groupA, groupB := newChannel("def-a"), newChannel("def-b"), newChannel("A-ch"), newChannel("B-ch")
+	createMember := func(channelID int64, group string, priority int) {
+		if _, err := db.RouteMember.Create(&domain.RouteMember{
+			RouteID: routeID, ChannelID: channelID, GroupName: group,
+			Priority: priority, Enabled: true, Weight: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	createMember(defA, "default", 2)
+	createMember(defB, "default", 1)
+	createMember(groupA, "A", 1)
+	createMember(groupB, "B", 1)
+
+	channelNames := func(candidates []domain.RoutingCandidate) []string {
+		var out []string
+		for _, c := range candidates {
+			out = append(out, c.Channel.Name)
+		}
+		return out
+	}
+
+	// No group: everything (legacy behavior).
+	_, candidates, err := db.RouteMember.RoutingCandidates("group-model", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := channelNames(candidates); len(got) != 4 {
+		t.Fatalf("no-group candidates = %v, want all 4", got)
+	}
+	// Requested group wins.
+	_, candidates, err = db.RouteMember.RoutingCandidates("group-model", "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := channelNames(candidates); len(got) != 1 || got[0] != "A-ch" {
+		t.Fatalf("group A candidates = %v, want [A-ch]", got)
+	}
+	// Unknown group falls back to 'default'.
+	_, candidates, err = db.RouteMember.RoutingCandidates("group-model", "nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := channelNames(candidates); len(got) != 2 {
+		t.Fatalf("fallback candidates = %v, want the default group's 2", got)
+	}
+	// Rename moves members; deleting a group removes them.
+	if moved, err := db.RouteMember.RenameMemberGroup(routeID, "A", "A2"); err != nil || moved != 1 {
+		t.Fatalf("rename moved=%d err=%v", moved, err)
+	}
+	_, candidates, _ = db.RouteMember.RoutingCandidates("group-model", "A2")
+	if got := channelNames(candidates); len(got) != 1 || got[0] != "A-ch" {
+		t.Fatalf("renamed group A2 candidates = %v", got)
+	}
+	if removed, err := db.RouteMember.DeleteMemberGroup(routeID, "B"); err != nil || removed != 1 {
+		t.Fatalf("delete removed=%d err=%v", removed, err)
+	}
+	// A deleted group behaves like an unknown one: request falls back to default.
+	_, candidates, _ = db.RouteMember.RoutingCandidates("group-model", "B")
+	if got := channelNames(candidates); len(got) != 2 {
+		t.Fatalf("deleted group B candidates = %v, want default fallback's 2", got)
+	}
+}
+
+func TestCopyMemberGroupAndListNames(t *testing.T) {
+	db := openTestDB(t)
+	routeID, err := db.Route.Create(&domain.Route{ModelPattern: "copy-model", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newChannel := func(name string) int64 {
+		id, err := db.Channel.Create(&domain.Channel{Name: name, Status: domain.StatusEnabled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	ch1, ch2, ch3 := newChannel("c1"), newChannel("c2"), newChannel("c3")
+	memberID := func(channelID int64, group string) int64 {
+		members, err := db.RouteMember.ListByRoute(routeID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range members {
+			if m.ChannelID == channelID && m.GroupName == group {
+				return m.ID
+			}
+		}
+		t.Fatalf("member ch=%d group=%q not found", channelID, group)
+		return 0
+	}
+	create := func(channelID int64, group string, priority int, enabled bool, mapping string) {
+		if _, err := db.RouteMember.Create(&domain.RouteMember{
+			RouteID: routeID, ChannelID: channelID, GroupName: group,
+			Priority: priority, Enabled: enabled, Weight: 1, MappingJSON: mapping,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// default: two real members (one failed) + one alias; dest already holds ch1.
+	create(ch1, "default", 5, true, "")
+	create(ch2, "default", 3, false, "")
+	create(ch3, "default", 1, true, `{"model":"alias"}`)
+	create(ch1, "X", 9, true, "")
+	failed := memberID(ch2, "default")
+	cooldown := time.Now().Add(time.Hour)
+	failedMember, err := db.RouteMember.GetByID(failed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedMember.FailCount = 2
+	failedMember.CooldownUntil = &cooldown
+	failedMember.LastError = "boom"
+	if err := db.RouteMember.Update(failedMember); err != nil {
+		t.Fatal(err)
+	}
+
+	copied, err := db.RouteMember.CopyMemberGroup(routeID, "default", "X")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if copied != 1 {
+		t.Fatalf("copy copied=%d, want 1 (ch1 skipped by OR IGNORE, alias skipped)", copied)
+	}
+	members, err := db.RouteMember.ListByRoute(routeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var xCh1, xCh2 domain.RouteMember
+	for _, m := range members {
+		if m.GroupName != "X" {
+			continue
+		}
+		switch m.ChannelID {
+		case ch1:
+			xCh1 = m
+		case ch2:
+			xCh2 = m
+		default:
+			t.Fatalf("unexpected member in group X for channel %d", m.ChannelID)
+		}
+	}
+	// Pre-existing member is untouched; the copy keeps priority/enabled but
+	// starts with clean failure state.
+	if xCh1.Priority != 9 || xCh2.Priority != 3 || xCh2.Enabled {
+		t.Fatalf("X members = %+v / %+v, want ch1 priority 9, ch2 priority 3 disabled", xCh1, xCh2)
+	}
+	if xCh2.FailCount != 0 || xCh2.CooldownUntil != nil || xCh2.LastError != "" {
+		t.Fatalf("copied member kept failure state: %+v", xCh2)
+	}
+	// Copying again has nothing new to add.
+	if again, err := db.RouteMember.CopyMemberGroup(routeID, "default", "X"); err != nil || again != 0 {
+		t.Fatalf("second copy = %d err=%v, want 0", again, err)
+	}
+	// from == to is a no-op.
+	if same, err := db.RouteMember.CopyMemberGroup(routeID, "X", "X"); err != nil || same != 0 {
+		t.Fatalf("same-group copy = %d err=%v, want 0", same, err)
+	}
+	// Distinct names across all routes, sorted.
+	names, err := db.RouteMember.ListRouteGroupNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"X", "default"}
+	if fmt.Sprint(names) != fmt.Sprint(want) {
+		t.Fatalf("group names = %v, want %v", names, want)
+	}
 }
 
 func TestRuntimeSettingsProxyURLRoundTrip(t *testing.T) {
@@ -725,6 +919,67 @@ func TestRuntimeSettingsMaintenanceCronsRoundTrip(t *testing.T) {
 	}
 	if got.DiscoveryCron != row.DiscoveryCron || got.DBGCCron != row.DBGCCron {
 		t.Fatalf("maintenance cron round trip mismatch: discovery=%q gc=%q", got.DiscoveryCron, got.DBGCCron)
+	}
+}
+
+// The probe columns were appended to a long SELECT whose scan is positional, so
+// every field is asserted individually: a one-column slip here would otherwise
+// land a value in a compatible neighbour and pass silently.
+func TestRuntimeSettingsProbeScheduleRoundTrip(t *testing.T) {
+	db := openTestDB(t)
+	row := &store.RuntimeSettingsRow{
+		HasOverride:      true,
+		ProbeCron:        "0 */6 * * *",
+		ProbePrompt:      "ping",
+		ProbeMaxTokens:   32,
+		ProbeConcurrency: 8,
+		ProbeAutoDisable: 2,
+		ProbeChannels:    []int64{7, 9},
+		ProbeModels:      []string{"gpt-4o", "claude-3"},
+	}
+	if err := db.RuntimeSettings.Save(row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.RuntimeSettings.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProbeCron != row.ProbeCron {
+		t.Errorf("probe_cron = %q, want %q", got.ProbeCron, row.ProbeCron)
+	}
+	if got.ProbePrompt != row.ProbePrompt {
+		t.Errorf("probe_prompt = %q, want %q", got.ProbePrompt, row.ProbePrompt)
+	}
+	if got.ProbeMaxTokens != row.ProbeMaxTokens {
+		t.Errorf("probe_max_tokens = %d, want %d", got.ProbeMaxTokens, row.ProbeMaxTokens)
+	}
+	if got.ProbeConcurrency != row.ProbeConcurrency {
+		t.Errorf("probe_concurrency = %d, want %d", got.ProbeConcurrency, row.ProbeConcurrency)
+	}
+	if got.ProbeAutoDisable != row.ProbeAutoDisable {
+		t.Errorf("probe_auto_disable = %d, want %d", got.ProbeAutoDisable, row.ProbeAutoDisable)
+	}
+	if len(got.ProbeChannels) != 2 || got.ProbeChannels[0] != 7 || got.ProbeChannels[1] != 9 {
+		t.Errorf("probe_channels = %v, want [7 9]", got.ProbeChannels)
+	}
+	if len(got.ProbeModels) != 2 || got.ProbeModels[0] != "gpt-4o" {
+		t.Errorf("probe_models = %v, want [gpt-4o claude-3]", got.ProbeModels)
+	}
+}
+
+// A malformed scope must degrade to "everything" rather than break startup.
+func TestRuntimeSettingsProbeScopeDegradesGracefully(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`UPDATE runtime_settings SET probe_channels = 'not json', probe_models = '{{{'`); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.RuntimeSettings.Get()
+	if err != nil {
+		t.Fatalf("malformed scope must not fail the read: %v", err)
+	}
+	if len(got.ProbeChannels) != 0 || len(got.ProbeModels) != 0 {
+		t.Errorf("malformed scope = %v / %v, want empty (meaning everything)",
+			got.ProbeChannels, got.ProbeModels)
 	}
 }
 
@@ -930,7 +1185,7 @@ func TestModelRouteOverridesApplyToRoutingCandidates(t *testing.T) {
 	if _, err := db.RouteMember.Create(&domain.RouteMember{RouteID: routeID, ChannelID: channelID, Enabled: true, Weight: 100}); err != nil {
 		t.Fatal(err)
 	}
-	_, candidates, err := db.RouteMember.RoutingCandidates("override-live")
+	_, candidates, err := db.RouteMember.RoutingCandidates("override-live", "")
 	if err != nil || len(candidates) != 1 {
 		t.Fatalf("candidates=%+v err=%v", candidates, err)
 	}
@@ -985,7 +1240,7 @@ func TestRouteMemberCooldownRoundTrip(t *testing.T) {
 	}
 	// A member inside an active cooldown is excluded from routing until the
 	// penalty expires.
-	route, candidates, err := db.RouteMember.RoutingCandidates("cooldown-model")
+	route, candidates, err := db.RouteMember.RoutingCandidates("cooldown-model", "")
 	if err != nil || route == nil || len(candidates) != 1 {
 		t.Fatalf("candidates=%+v err=%v", candidates, err)
 	}
@@ -1076,7 +1331,7 @@ func TestRouteMemberRecoverExpired(t *testing.T) {
 
 func TestChannelUpdatePropagatesDefaultsOnlyToAutomaticMembers(t *testing.T) {
 	db := openTestDB(t)
-	channelID, err := db.Channel.Create(&domain.Channel{Name: "defaults", Priority: 1, Weight: 10, Status: domain.StatusEnabled})
+	channelID, err := db.Channel.Create(&domain.Channel{Name: "defaults", Priority: 1, Weight: 10, Status: domain.StatusEnabled, ModelSyncMode: domain.ModelSyncModeAuto})
 	if err != nil {
 		t.Fatal(err)
 	}
