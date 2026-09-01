@@ -484,16 +484,16 @@ type KeyGroup struct {
 
 // ProxyLog records a relayed request (without secrets).
 type ProxyLog struct {
-	ID               int64  `json:"id"`
-	RequestID        string `json:"request_id"`
-	ChannelID        int64  `json:"channel_id"`
-	RouteID          int64  `json:"route_id,omitempty"`
-	RoutePattern     string `json:"route_pattern,omitempty"`
-	Model            string `json:"model"`
-	Status           int    `json:"status"`
-	LatencyMs        int    `json:"latency_ms"`
-	Attempt          int    `json:"attempt"`
-	ErrorBrief       string `json:"error_brief,omitempty"`
+	ID           int64  `json:"id"`
+	RequestID    string `json:"request_id"`
+	ChannelID    int64  `json:"channel_id"`
+	RouteID      int64  `json:"route_id,omitempty"`
+	RoutePattern string `json:"route_pattern,omitempty"`
+	Model        string `json:"model"`
+	Status       int    `json:"status"`
+	LatencyMs    int    `json:"latency_ms"`
+	Attempt      int    `json:"attempt"`
+	ErrorBrief   string `json:"error_brief,omitempty"`
 	// ErrorDetail is a truncated excerpt of what the upstream actually
 	// returned for a failed attempt (error body text, or the transport error
 	// string when no response arrived). Empty on success.
