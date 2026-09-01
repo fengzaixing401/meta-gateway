@@ -30,6 +30,11 @@ export const en: Dict = {
     "This connection stores a user access_token (good for check-in / account APIs). Model sync needs an OpenAI-compatible API key. Edit the connection and add an API key.",
   "error.backup_unlock_required":
     "This cloud backup is encrypted. Enter the backup unlock password (not the WebDAV login password), save, then sync again.",
+  "error.webdavInvalidBackup": "Cloud backup is not a supported import format",
+  "error.webdavInvalidBackupCause":
+    "The download succeeded, but the file in your cloud folder is neither a Meta Gateway exchange package nor a recognizable All API Hub backup.",
+  "error.webdavInvalidBackupFix":
+    "Make sure the folder contains the AAH automatic backup (or a Meta Gateway export), then sync again.",
   "error.upstream_unauthorized":
     "Upstream returned 401/403. Check the API key and whether the base URL is correct.",
   "error.upstream_failure": "Upstream model discovery failed.",
@@ -83,6 +88,15 @@ export const en: Dict = {
   "err.server.cause":
     "Meta Gateway hit an internal error while processing the request.",
   "err.server.fix": "Check the gateway logs and retry.",
+  "err.cancelled.title": "Request cancelled",
+  "err.cancelled.cause":
+    "The client disconnected or the deadline hit before the upstream answered; the gateway stopped forwarding (no automatic retry).",
+  "err.cancelled.fix": "Send the request again; if this repeats, review the client timeout.",
+  "err.emptyResponse.title": "Upstream returned an empty reply",
+  "err.emptyResponse.cause":
+    "The upstream answered 200 with no content; the gateway already failed over to the next channel.",
+  "err.emptyResponse.fix":
+    "Nothing to do; if it clusters on one channel, disable that model there.",
   "err.unknown.title": "Unexpected error",
   "err.unknown.cause": "The gateway returned an unrecognized error.",
   "err.unknown.fix": "Retry, or check the gateway logs for details.",
@@ -176,6 +190,7 @@ export const en: Dict = {
   "app.brand": "Meta Gateway",
   "app.themeDark": "Switch to dark mode",
   "app.themeLight": "Switch to light mode",
+  "app.updateAvailable": "New version {version}",
   "app.console": "Admin Console",
   "dashboard.kicker": "Gateway status",
   "dashboard.title": "Overview",
@@ -261,7 +276,7 @@ export const en: Dict = {
   "app.connect.subtitle":
     "Use ADMIN_TOKEN to open the multi-channel relay console.",
   "app.connect.token": "Admin token",
-  "app.connect.remember": "Remember for this browser tab",
+  "app.connect.remember": "Remember me",
   "app.connect.submit": "Connect",
   "app.connect.totpRequired":
     "Two-factor code required — enter your authenticator code.",
@@ -269,7 +284,7 @@ export const en: Dict = {
   "app.connect.connecting": "Connecting...",
   "app.connect.failed": "Connection failed",
   "app.connect.hint":
-    "Token stays in memory, or this tab session only. Never put it in the URL.",
+    "When checked, the token is kept in the browser and you stay signed in. Never put it in the URL.",
   "app.connect.background": "Custom login background",
   "app.connect.bgPlaceholder": "Image URL, press Enter",
   "app.connect.bgApply": "Apply",
@@ -768,6 +783,8 @@ export const en: Dict = {
     "Use the row action menu to test, enable, inspect logs, or edit this model.",
   "modelsPage.groupFilter": "Model family",
   "modelsPage.allGroups": "All model families",
+  "modelsPage.statusFilter": "Status filter",
+  "modelsPage.statusAll": "All",
   "modelsPage.showOverrides": "Show model-level settings",
   "modelsPage.hideOverrides": "Hide model-level settings",
   "modelsPage.overrideEnabled": "Override channel default",
@@ -907,6 +924,9 @@ export const en: Dict = {
   "logsPage.errorClass.upstream_reject": "Upstream rejected",
   "logsPage.errorClass.not_found": "Not found",
   "logsPage.errorClass.server": "Server error",
+  "logsPage.errorClass.cancelled": "Cancelled (client gone/timeout, no retry)",
+  "logsPage.errorClass.empty_response": "Empty reply (200 without content, failed over)",
+  "logsPage.errorDetail": "Upstream returned",
   "logsPage.errorClass.unknown": "Unknown error",
   "logsPage.selectHint":
     "Select a request to inspect errors and jump to the connection.",
@@ -983,7 +1003,7 @@ export const en: Dict = {
   "exchange.formatBadge.compat": "Compat",
   "exchange.formatCanonical": "Meta Gateway exchange",
   "exchange.formatNewApi": "New API channels",
-  "exchange.formatAah": "All API Hub V2 backup",
+  "exchange.formatAah": "All API Hub backup",
   "exchange.selectedCount": "{n} selected",
   "exchange.searchChannels": "Search channels…",
   "exchange.clearSelection": "Clear",
@@ -1005,13 +1025,22 @@ export const en: Dict = {
     "{n} channels were skipped (no credential or invalid base URL).",
   "exchange.webdavTitle": "Cloud backup sync",
   "exchange.webdavHint":
-    "Connect the same WebDAV folder used by All API Hub. We only download and import — nothing is uploaded.",
+    "Connect a WebDAV folder. The two sections below are independent: AAH backup import pulls remote backups into this gateway; native WebDAV sync pushes an encrypted backup of this gateway to the drive.",
+  "exchange.webdavImportTitle": "AAH backup import",
+  "exchange.webdavImportHint":
+    "Pull the Meta Gateway exchange package or an All API Hub backup from the drive and merge it into this gateway; files on the drive are never modified.",
+  "exchange.webdavImportNow": "Import now",
+  "exchange.webdavBackupTitle": "Native WebDAV sync",
+  "exchange.webdavBackupHint":
+    "Export all channels as a Meta Gateway exchange package and upload it to the meta-gateway-backup/ folder; encrypted automatically when a backup unlock password is set.",
+  "exchange.webdavBackupNow": "Sync now",
+  "exchange.webdavTestConnection": "Test connection",
+  "exchange.webdavCardNotConfigured": "Not configured",
   "exchange.webdavTest": "Test",
-  "exchange.webdavSync": "Sync now",
   "exchange.webdavSave": "Save",
   "exchange.webdavNotConfigured":
     "Add your cloud folder details below to get started.",
-  "exchange.webdavLastResult": "Last sync",
+  "exchange.webdavLastResult": "Last result",
   "exchange.webdavEncrypted": "encrypted backup",
   "exchange.webdavUrl": "Cloud folder link",
   "exchange.webdavUrlHint":
@@ -1024,12 +1053,12 @@ export const en: Dict = {
     "Different from the cloud login password. Required when the backup file is encrypted (AAH encryption). Leave blank to keep a saved value.",
   "exchange.webdavBackupPasswordPlaceholder":
     "If sync says unlock password required, fill this",
-  "exchange.webdavSchedule": "Auto-sync",
+  "exchange.webdavSchedule": "Automatic",
   "exchange.webdavScheduleHint":
-    "How often to pull the latest backup in the background. Scheduled runs always use incremental mode.",
-  "exchange.webdavMode": "Sync method",
+    "How often this direction runs on its own. Scheduled runs always use incremental merge.",
+  "exchange.webdavMode": "Import method",
   "exchange.webdavModeHint":
-    "Choose how a manual sync applies the downloaded backup.",
+    "Choose how a manual import applies the downloaded backup.",
   "exchange.webdavMode.incremental": "Incremental merge",
   "exchange.webdavMode.incrementalHint":
     "Add new connections and update matches. Keep local-only connections.",
@@ -1040,7 +1069,7 @@ export const en: Dict = {
   "exchange.webdavReplaceConfirmBody":
     "This deletes all current connections, credentials, discovered models, and model routes before importing the cloud backup. Downstream tokens, settings, proxy/audit/usage logs, and WebDAV credentials are kept; check-in logs tied to deleted credentials are removed by cascade.",
   "exchange.webdavReplaceConfirmAction": "Replace and sync",
-  "exchange.webdavSchedule.off": "Off — only when I click Sync",
+  "exchange.webdavSchedule.off": "Off (manual sync still available)",
   "exchange.webdavSchedule.hourly": "Every hour",
   "exchange.webdavSchedule.every3h": "Every 3 hours",
   "exchange.webdavSchedule.every6h": "Every 6 hours",
@@ -1499,7 +1528,7 @@ export const en: Dict = {
   "ops.runtime.section.cooldown": "Fault protection",
   "ops.runtime.faultProtection": "Enable fault protection",
   "ops.runtime.faultProtectionHint":
-    "When enabled, retryable 429/5xx failures use fixed cooldown and can auto-disable a channel. Network jitter is not penalized. When disabled, retries and failover still work.",
+    "When enabled, retryable 429/5xx failures use fixed cooldown and can auto-disable a channel. Transport failures (refused/timeouts) skip the cooldown on the first strike but cool down when they repeat. When disabled, retries and failover still work but failures are not remembered.",
   "ops.runtime.section.healthSweep": "Channel health sweep",
   "ops.runtime.autoDisable": "Auto-disable threshold",
   "ops.runtime.autoDisableHint":
@@ -1542,6 +1571,7 @@ export const en: Dict = {
   "ops.maintenance.cron": "Maintenance schedule",
   "ops.maintenance.cronHint":
     "Five-field cron for the daily maintenance pass (default 0 4 * * *); empty = disabled.",
+  "ops.runtime.section.sync": "Model sync",
   "ops.runtime.section.probe": "Scheduled model probing",
   "ops.runtime.probeIntro":
     "Calls every model of every route on a schedule to catch broken members before traffic reaches them. Probing spends upstream quota, so watch the cadence.",
@@ -1616,7 +1646,7 @@ export const en: Dict = {
   "ops.runtime.stickyTTL": "Sticky TTL (minutes)",
   "ops.runtime.stickyTTLHint":
     "How long a session binding stays valid without renewal (1-1440).",
-  "ops.runtime.section.server": "Server",
+  "ops.runtime.section.server": "Service & network",
   "ops.runtime.sectionNav": "Jump to section",
   "ops.runtime.navGroup.routing": "Routing",
   "ops.runtime.navGroup.health": "Health",
@@ -1628,6 +1658,27 @@ export const en: Dict = {
     "Rotate through the site's API keys when one fails. Off = only the channel's bound key is used (no key switching; same-key re-sends still apply).",
   "ops.runtime.crossChannelFailoverHint":
     "When disabled, each request uses only its first selected channel. The retry limit is retained for when this is enabled again; same-channel API-key rotation is unchanged.",
+  "ops.runtime.updateCheck": "Check for updates",
+  "ops.runtime.updateCheckHint":
+    "Periodically query GitHub for the latest release and flag new versions in the top bar. Off = no outbound calls at all. Env: UPDATE_CHECK_ENABLED.",
+  "ops.runtime.group.routingDesc":
+    "Failover and retries, routing strategy, gray release, session stickiness",
+  "ops.runtime.group.healthDesc":
+    "Fault protection, channel health sweeps, and model probing",
+  "ops.runtime.group.governanceDesc": "Rate limits and audit log retention",
+  "ops.runtime.group.opsDesc":
+    "Alerting, maintenance, scheduled check-ins, and service info",
+  "ops.runtime.group.tools": "Maintenance tools",
+  "ops.runtime.group.toolsDesc":
+    "TOTP, alert and error rules, maintenance operations, and factory reset",
+  "ops.runtime.buildVersion": "Build",
+  "ops.runtime.updateNow": "Check now",
+  "ops.runtime.updateChecking": "Checking…",
+  "ops.runtime.updateUpToDate": "Up to date",
+  "ops.runtime.updateFound": "New version {version} available",
+  "ops.runtime.updateFailed": "Check failed, try again",
+  "ops.runtime.updateOff": "Update check is off",
+  "ops.runtime.updateNotYet": "Not checked yet",
   "ops.runtime.retryTimes": "Retry rounds",
   "ops.runtime.retryTimesHint":
     "How many failover rounds are attempted after a failure: each round tries one more channel (0 = first channel only). Within each round the same key is re-sent channel-retry-times times before moving on. Env: RETRY_TIMES.",

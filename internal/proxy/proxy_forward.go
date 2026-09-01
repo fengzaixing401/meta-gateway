@@ -149,9 +149,10 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 	var last *relay.Result
 	var lastMeta *AttemptMeta
 	retrySafe := retrySafeRequest(req)
-	// Route-level retry overrides historically opt a model back into failover
-	// even when the process default is off. They can never override an admin
-	// pin or the non-idempotent-write safety gate.
+	// Route-level retry overrides tune the round counts (retry_times /
+	// channel_retry_times) but cannot re-enable cross-channel failover when
+	// the process default is off, bypass an admin channel pin, or skip the
+	// non-idempotent-write safety gate.
 	allowCrossChannelRetries := s.crossChannelFailoverEnabled.Load() && req.PreferChannelID <= 0 && retrySafe
 	maxAttempts := int(s.retryTimes.Load())
 	if !allowCrossChannelRetries {
@@ -201,6 +202,9 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 		// refreshed tracks whether a 401 triggered a credential refresh for
 		// this request; a successful replay is logged as refresh_retry.
 		refreshed := false
+		// attemptDeadlineFired records that the non-stream per-attempt timeout
+		// (fwdCtx) expired — our own patience cap, after which failover stops.
+		attemptDeadlineFired := false
 		// monitorSkipped is set when an ignore_monitor error-passthrough rule
 		// fired; the breaker/cooldown bookkeeping is skipped for that attempt.
 		monitorSkipped := false
@@ -219,7 +223,9 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 			if decision.Selected.Channel.ID > 0 {
 				selectedID = decision.Selected.Channel.ID
 			}
-			if snapErr := s.db.InsertDecisionSnapshot(req.RequestID, req.Model, decision.RouteID, selectedID, payload, s.now()); snapErr != nil {
+			// attempt+1 matches the proxy_logs row this selection produces, so
+			// the log UI can show the decision behind EACH attempt.
+			if snapErr := s.db.InsertDecisionSnapshot(req.RequestID, req.Model, decision.RouteID, selectedID, attempt+1, payload, s.now()); snapErr != nil {
 				log.Printf("proxy: decision snapshot request_id=%s: %v", req.RequestID, snapErr)
 			}
 		}
@@ -624,18 +630,31 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 								Err:        fmt.Errorf("proxy: %s response: %w", adapter.Name(), convErr),
 							}
 						} else {
-							result.Body = io.NopCloser(bytes.NewReader(converted))
-							if result.Header == nil {
-								result.Header = make(http.Header)
+							// Empty-success check: a 2xx chat completion with no
+							// choices or an empty message is a silent upstream
+							// failure — fail over instead of returning emptiness.
+							if effectivePath == "chat/completions" && isEmptyChatSuccess(converted) {
+								result = &relay.Result{
+									StatusCode: result.StatusCode,
+									Header:     result.Header,
+									LatencyMs:  result.LatencyMs,
+									Err:        ErrEmptyCompletion,
+								}
+							} else {
+								result.Body = io.NopCloser(bytes.NewReader(converted))
+								if result.Header == nil {
+									result.Header = make(http.Header)
+								}
+								result.Header.Set("Content-Type", transformedContentType(effectivePath, adapter.Name(), result.Header.Get("Content-Type")))
 							}
-							result.Header.Set("Content-Type", transformedContentType(effectivePath, adapter.Name(), result.Header.Get("Content-Type")))
 						}
 					}
 				}
 				streamInterrupted := false
 				if req.Stream && result.Err == nil && result.StatusCode >= 200 && result.StatusCode < 300 {
-					first, peekErr := peekFirstChunkWithTimeout(result.Body, streamFirstByteTimeout)
-					if peekErr != nil {
+					first, silent, peekErr := peekStreamStartWithTimeout(result.Body, streamFirstByteTimeout)
+					switch {
+					case peekErr != nil:
 						// Upstream answered 200 and then died before emitting any
 						// data. The client has not received a byte yet, so this is a
 						// normal retryable failure — fail over to the next key/channel.
@@ -647,43 +666,54 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 							Err:        fmt.Errorf("proxy: stream closed before first byte: %w", peekErr),
 						}
 						streamInterrupted = true
-					} else {
-						// Semantic check: a 200 stream that immediately delivers a
-						// terminal/empty SSE frame ([DONE] or a delta with neither
-						// content nor role) is a silent failure — the client would
-						// receive an empty response. Treat it like a first-byte death
-						// and fail over.
-						if isSilentSSEStart(first) {
-							_ = result.Body.Close()
-							result = &relay.Result{
-								StatusCode: result.StatusCode,
-								Header:     result.Header,
-								LatencyMs:  result.LatencyMs,
-								Err:        fmt.Errorf("proxy: stream ended silently before any content"),
-							}
-							streamInterrupted = true
-						} else {
-							// Replay the buffered prefix, then continue streaming the rest.
-							result.Body = &replayReadCloser{
-								ReadCloser: result.Body,
-								prefix:     bytes.NewReader(first),
-							}
-							result.Body = &idleTimeoutBody{ReadCloser: result.Body, timeout: streamIdleTimeout}
-							// First-byte latency measured from relay start to the first
-							// upstream byte (the peek above consumed it).
-							result.FirstByteMs = int(s.now().Sub(forwardStarted).Milliseconds())
+					case silent:
+						// A 200 stream that ended without delivering any content
+						// frame ([DONE]/EOF after only role/usage frames) is a
+						// silent failure — the client would receive an empty
+						// response. Treat it like a first-byte death and fail over.
+						_ = result.Body.Close()
+						result = &relay.Result{
+							StatusCode: result.StatusCode,
+							Header:     result.Header,
+							LatencyMs:  result.LatencyMs,
+							Err:        fmt.Errorf("proxy: stream ended silently before any content: %w", ErrEmptyCompletion),
 						}
+						streamInterrupted = true
+					default:
+						// Replay the buffered prefix, then continue streaming the rest.
+						result.Body = &replayReadCloser{
+							ReadCloser: result.Body,
+							prefix:     bytes.NewReader(first),
+						}
+						result.Body = &idleTimeoutBody{ReadCloser: result.Body, timeout: streamIdleTimeout}
+						// First-byte latency measured from relay start to the first
+						// upstream byte (the peek above consumed it).
+						result.FirstByteMs = int(s.now().Sub(forwardStarted).Milliseconds())
 					}
 				}
 				if attemptCancel != nil {
 					if result != nil && result.Err == nil && result.Body != nil {
 						result.Body = &cancelBoundBody{ReadCloser: result.Body, cancel: attemptCancel}
 					} else {
+						// Capture the cap state before the cancel wipes fwdCtx.Err().
+						if errors.Is(fwdCtx.Err(), context.DeadlineExceeded) {
+							attemptDeadlineFired = true
+						}
 						attemptCancel()
 					}
 					attemptCancel = nil
 				}
 				category, retryable = classifyForChannel(result, domain.ParseRetryConfig(candidate.Channel.RetryConfig))
+				// A transport-level timeout (outbound header/TLS timeout) surfaces
+				// as context.DeadlineExceeded even though the client request
+				// context is still alive and waiting. Reclassify it as a retryable
+				// transport failure so the failover walk can try a faster channel;
+				// only our own per-attempt cap (attemptDeadlineFired) or a dead
+				// request context keeps the terminal "cancelled" semantics.
+				if errors.Is(result.Err, context.DeadlineExceeded) && ctx.Err() == nil && !attemptDeadlineFired {
+					category = "transport"
+					retryable = true
+				}
 				localAdapterFailure := isLocalFailure(result.Err)
 				// 401 refresh-retry: an expired session/access-token credential is
 				// re-established through the check-in machinery exactly once per
@@ -703,7 +733,11 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 					}
 				}
 				if streamInterrupted && !localAdapterFailure {
-					category = "stream_interrupted"
+					// The silent-empty variant keeps the finer empty_response
+					// category; plain first-byte deaths read as interrupted.
+					if !errors.Is(result.Err, ErrEmptyCompletion) {
+						category = "stream_interrupted"
+					}
 					retryable = true
 				}
 				// The channel consecutive-failure counter is incremented exactly once
@@ -774,6 +808,7 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 				}
 				s.decayError(candidate.Channel.ID, req.Model)
 				s.recordMemberSuccess(candidate.Channel.ID)
+				s.resetTransportFails(candidate.Member.ID)
 				if s.latencyAware.Load() && result.LatencyMs > 0 {
 					s.observeLatency(candidate.Channel.ID, req.Model, result.LatencyMs)
 				}
@@ -798,7 +833,10 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 			}
 			return result, meta
 		}
-		if errors.Is(result.Err, context.Canceled) || errors.Is(result.Err, context.DeadlineExceeded) || ctx.Err() != nil {
+		// A dead request context (client gone, request deadline) or our own
+		// per-attempt patience cap ends the walk. Transport-level timeouts with
+		// a still-waiting client were reclassified above and keep failing over.
+		if ctx.Err() != nil || errors.Is(result.Err, context.Canceled) || attemptDeadlineFired {
 			return result, meta
 		}
 		// Configurable error passthrough rules (error_passthrough_rules)
@@ -828,10 +866,18 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 			}
 		}
 		if retryable {
-			// Pure transport jitter is not penalized: no cooldown, no channel
-			// failure count. ignore_monitor rules skip bookkeeping entirely.
-			if !monitorSkipped && category != "transport" {
+			// 429/5xx take the fixed cooldown (extended by Retry-After).
+			// Transport failures (refused/TLS/timeout) get the jitter
+			// exemption: the first failure of a consecutive streak earns no
+			// cooldown, a repeat does — the channel never silently keeps
+			// eating full timeouts on every request. ignore_monitor rules
+			// skip bookkeeping entirely.
+			if !monitorSkipped && !req.Probe {
 				penalty := retryAfterCooldown(result.Header, s.now(), cooldown)
+				if category == "transport" {
+					penalty = s.transportPenalty(candidate.Member.ID, cooldown)
+					s.observeTransportFailure(candidate.Member.ID)
+				}
 				s.recordMemberFailure(req, candidate.Member.ID, candidate.Channel.ID, req.Model, penalty, category)
 			}
 			// Two-layer fallback scope: an upstream that ANSWERED (any status,
@@ -842,6 +888,10 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 			// failure applies to everything on the channel.
 			switch {
 			case category == "stream_interrupted":
+				memberScopedFailure = true
+			case errors.Is(result.Err, ErrEmptyCompletion):
+				// An empty 2xx (body or stream) still speaks for this name's
+				// account — retire the variant, keep walking this channel.
 				memberScopedFailure = true
 			case result.Err == nil && result.StatusCode >= 400 &&
 				result.StatusCode != http.StatusUnauthorized && result.StatusCode != http.StatusForbidden:

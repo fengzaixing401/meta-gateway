@@ -32,6 +32,7 @@ import type {
   SyncKeysResult,
   CreateUpstreamKeyResult,
   WebDAVStatus,
+  WebDAVSyncDirection,
   WebDAVSyncMode,
   WebDAVSyncResult,
   WebDAVSettings,
@@ -48,6 +49,7 @@ import type {
   StickySnapshot,
   RuntimeEditableSettings,
   RuntimeSettings,
+  UpdateCheckStatus,
   Site,
   UnifyApplyResult,
   UnifyGroup,
@@ -604,13 +606,14 @@ export const api = (client: ApiClient) => ({
       `/admin/health-history/summary?hours=${hours}`,
       signal,
     ),
-  decisionSnapshot: (requestId: string, signal?: AbortSignal) =>
+  decisionSnapshot: (requestId: string, attempt?: number, signal?: AbortSignal) =>
     client.get<{
       id: number;
       request_id: string;
       model: string;
       route_id: number;
       selected_channel_id: number;
+      attempt?: number;
       payload: {
         model?: string;
         route_id?: number;
@@ -630,7 +633,9 @@ export const api = (client: ApiClient) => ({
       };
       created_at: string;
     }>(
-      `/admin/decision-snapshot?request_id=${encodeURIComponent(requestId)}`,
+      `/admin/decision-snapshot?request_id=${encodeURIComponent(requestId)}${
+        attempt && attempt > 0 ? `&attempt=${attempt}` : ""
+      }`,
       signal,
     ),
   syncKeys: (
@@ -679,6 +684,10 @@ export const api = (client: ApiClient) => ({
   createBackup: () => client.post<BackupRecord>("/admin/backups"),
   runtimeSettings: (signal?: AbortSignal) =>
     client.get<RuntimeSettings>("/admin/runtime-settings", signal),
+  updateCheck: (signal?: AbortSignal) =>
+    client.get<UpdateCheckStatus>("/admin/update-check", signal),
+  refreshUpdateCheck: () =>
+    client.post<UpdateCheckStatus>("/admin/update-check/refresh"),
   updateRuntimeSettings: (body: RuntimeEditableSettings) =>
     client.put<RuntimeSettings>("/admin/runtime-settings", body),
   resetRuntimeSettings: () =>
@@ -696,9 +705,12 @@ export const api = (client: ApiClient) => ({
     client.get<WebDAVSettings>("/admin/webdav/settings", signal),
   updateWebdavSettings: (body: WebDAVSettingsUpdate) =>
     client.put<WebDAVSettings>("/admin/webdav/settings", body),
-  webdavTest: () => client.post<WebDAVSyncResult>("/admin/webdav/test"),
-  webdavSync: (mode: WebDAVSyncMode = "incremental") =>
-    client.post<WebDAVSyncResult>("/admin/webdav/sync", { mode }),
+  webdavTest: (direction: WebDAVSyncDirection = "download") =>
+    client.post<WebDAVSyncResult>("/admin/webdav/test", { direction }),
+  webdavSync: (
+    direction: WebDAVSyncDirection = "download",
+    mode: WebDAVSyncMode = "incremental",
+  ) => client.post<WebDAVSyncResult>("/admin/webdav/sync", { direction, mode }),
   pluginsMarket: (signal?: AbortSignal) =>
     client.get<{
       sources: Array<{ id: string; name: string; url: string }>;

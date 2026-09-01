@@ -704,7 +704,8 @@ func TestSameKeyResendCountsAreConfigurable(t *testing.T) {
 func TestTransportErrorFailsFastAfterSameKeyResend(t *testing.T) {
 	// A network error (dial refused) is re-sent on the same key, then the
 	// request fails over to the next channel instead of returning early.
-	// Transport jitter is not penalized: no cooldown, no failure count.
+	// The first transport failure of a streak earns no cooldown (jitter
+	// exemption) but is still counted for the error-aware score.
 	upstream := &queuedRelay{results: []*relay.Result{
 		{Err: fmt.Errorf("dial tcp 10.0.0.1:443: connect: connection refused")},
 		{Err: fmt.Errorf("dial tcp 10.0.0.1:443: connect: connection refused")},
@@ -724,14 +725,105 @@ func TestTransportErrorFailsFastAfterSameKeyResend(t *testing.T) {
 	if len(upstream.calls) != 4 {
 		t.Fatalf("expected 4 sends across two channels, got %#v", upstream.calls)
 	}
-	// Transport jitter must NOT cool the members or count channel failures.
+	// First transport failure of the streak: counted, not cooled.
 	high, _ := db.RouteMember.GetByID(highMember)
 	low, _ := db.RouteMember.GetByID(lowMember)
-	if high.FailCount != 0 || high.CooldownUntil != nil {
-		t.Fatalf("transport error must not cool high: %+v", high)
+	if high.FailCount != 1 || high.CooldownUntil != nil {
+		t.Fatalf("first transport failure must count but not cool high: %+v", high)
 	}
-	if low.FailCount != 0 || low.CooldownUntil != nil {
-		t.Fatalf("transport error must not cool low: %+v", low)
+	if low.FailCount != 1 || low.CooldownUntil != nil {
+		t.Fatalf("first transport failure must count but not cool low: %+v", low)
+	}
+}
+
+func TestTransportRepeatFailureCoolsMember(t *testing.T) {
+	// A channel that fails transport on consecutive requests is a chronic
+	// offender, not jitter: the second consecutive failure earns the full
+	// member cooldown. A cooled member is skipped while alternatives exist;
+	// once every member is cooling the selector still tries the least-bad
+	// one (last resort) rather than hard-failing the request.
+	results := make([]*relay.Result, 0, 12)
+	for i := 0; i < 12; i++ {
+		results = append(results, &relay.Result{Err: fmt.Errorf("dial tcp 10.0.0.%d:443: connect: connection refused", i)})
+	}
+	upstream := &queuedRelay{results: results}
+	service, db, highMember, lowMember := setupProxy(t, upstream)
+
+	for i := 0; i < 2; i++ {
+		result := service.ChatCompletions(context.Background(), Request{RequestID: fmt.Sprintf("req-net-%d", i), Model: "model", Body: []byte(`{}`)})
+		if result.Body != nil {
+			_ = result.Body.Close()
+		}
+	}
+	if len(upstream.calls) != 8 {
+		t.Fatalf("expected 8 sends across two failing requests, got %#v", upstream.calls)
+	}
+	high, _ := db.RouteMember.GetByID(highMember)
+	low, _ := db.RouteMember.GetByID(lowMember)
+	if high.CooldownUntil == nil || low.CooldownUntil == nil {
+		t.Fatalf("repeat transport failures must cool both members: high=%+v low=%+v", high, low)
+	}
+
+	// Third request: both members are cooling — the last-resort walk still
+	// attempts them (4 more sends: 2 per member), then returns the error.
+	result := service.ChatCompletions(context.Background(), Request{RequestID: "req-net-2", Model: "model", Body: []byte(`{}`)})
+	if result.Body != nil {
+		_ = result.Body.Close()
+	}
+	if len(upstream.calls) != 12 {
+		t.Fatalf("expected last-resort attempts on cooling members, got %#v", upstream.calls)
+	}
+	if result.Err == nil {
+		t.Fatalf("expected upstream failure after last-resort attempts, got %+v", result)
+	}
+}
+
+func TestTransportStreakResetsOnSuccess(t *testing.T) {
+	// The transport failure streak is per member and clears on that member's
+	// next success: after fail/repair, the next isolated failure is jitter
+	// again (no cooldown), while a member that never recovered escalates.
+	upstream := &queuedRelay{results: []*relay.Result{
+		{Err: fmt.Errorf("dial tcp 10.0.0.1:443: connect: connection refused")},
+		{Err: fmt.Errorf("dial tcp 10.0.0.1:443: connect: connection refused")},
+		response(http.StatusOK, `{"ok":true}`),
+		{Err: fmt.Errorf("dial tcp 10.0.0.1:443: connect: connection refused")},
+		{Err: fmt.Errorf("dial tcp 10.0.0.2:443: connect: connection refused")},
+	}}
+	service, db, highMember, lowMember := setupProxy(t, upstream)
+	service.SetChannelRetryTimes(0)
+
+	// req1: high refused (streak 1, exempt), failover to low refused (streak 1).
+	result := service.ChatCompletions(context.Background(), Request{RequestID: "req-a", Model: "model", Body: []byte(`{}`)})
+	if result.Body != nil {
+		_ = result.Body.Close()
+	}
+	if result.Err == nil {
+		t.Fatalf("expected failure while both members refuse, got %+v", result)
+	}
+	// req2: high recovered and serves — its streak clears.
+	result = service.ChatCompletions(context.Background(), Request{RequestID: "req-b", Model: "model", Body: []byte(`{}`)})
+	if result.Body != nil {
+		_ = result.Body.Close()
+	}
+	if result.Err != nil || result.StatusCode != http.StatusOK {
+		t.Fatalf("expected success from repaired high, got %+v", result)
+	}
+	// req3: high's fresh failure is jitter again (no cooldown); low, never
+	// recovered since its first failure, escalates into cooldown.
+	result = service.ChatCompletions(context.Background(), Request{RequestID: "req-c", Model: "model", Body: []byte(`{}`)})
+	if result.Body != nil {
+		_ = result.Body.Close()
+	}
+	if result.Err == nil {
+		t.Fatalf("expected low's repeat failure to fail the request, got %+v", result)
+	}
+	high, _ := db.RouteMember.GetByID(highMember)
+	low, _ := db.RouteMember.GetByID(lowMember)
+	if high.CooldownUntil != nil {
+		t.Fatalf("high's streak was reset by success — must not cool: %+v", high)
+	}
+	if low.CooldownUntil == nil {
+		t.Fatalf("low never recovered between failures — must cool: %+v", low)
 	}
 }
 
@@ -974,26 +1066,71 @@ func TestBillingCostFormula(t *testing.T) {
 	}
 }
 
-func TestIsSilentSSEStart(t *testing.T) {
+func TestClassifyStreamFrames(t *testing.T) {
+	role := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}\n\n"
+	content := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0}]}\n\n"
 	cases := []struct {
 		name   string
 		prefix string
-		want   bool
+		want   streamPrefixDecision
 	}{
-		{"empty", "", false},
-		{"normal first chunk with role", "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}\n\n", false},
-		{"normal content chunk", "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0}]}\n\n", false},
-		{"immediate DONE", "data: [DONE]\n\n", true},
-		{"empty choices", "data: {\"choices\":[]}\n\ndata: [DONE]\n\n", true},
-		{"delta with neither role nor content", "data: {\"choices\":[{\"delta\":{},\"index\":0}]}\n\n", true},
-		{"usage-only frame then done", "data: {\"choices\":[],\"usage\":{\"total_tokens\":5}}\n\ndata: [DONE]\n\n", true},
-		{"content after silent frame is not silent", "data: {\"choices\":[{\"delta\":{},\"index\":0}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\n", false},
-		{"non-json keepalive not silent", ": keep-alive\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n", false},
-		{"nonstandard json without choices not silent", "data: {\"chunk\":1}\n\n", false},
+		// Role-only frames are inconclusive: the peek keeps reading until
+		// real content or the stream ends (this is what catches a 200 that
+		// emits a role header and then [DONE]/silence — an empty reply).
+		{"role frame alone needs more", role, streamNeedMore},
+		{"role then content commits", role + content, streamCommit},
+		{"immediate DONE is silent", "data: [DONE]\n\n", streamSilent},
+		{"empty choices then DONE is silent", "data: {\"choices\":[]}\n\ndata: [DONE]\n\n", streamSilent},
+		{"empty delta then DONE is silent", "data: {\"choices\":[{\"delta\":{},\"index\":0}]}\n\ndata: [DONE]\n\n", streamSilent},
+		{"usage-only frame then DONE is silent", "data: {\"choices\":[],\"usage\":{\"total_tokens\":5}}\n\ndata: [DONE]\n\n", streamSilent},
+		{"reasoning content commits", "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n", streamCommit},
+		{"tool calls commit", "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"t\"}]}}]}\n\n", streamCommit},
+		// Fail-open shapes must commit immediately (never judged silent).
+		{"non-json keepalive commits", ": keep-alive\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n", streamCommit},
+		{"nonstandard json without choices commits", "data: {\"chunk\":1}\n\n", streamCommit},
+		{"anthropic-style frame commits", "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n", streamCommit},
+		// A trailing partial frame must not be judged yet.
+		{"partial trailing frame needs more", content[:len(content)-2], streamNeedMore},
 	}
 	for _, tc := range cases {
-		if got := isSilentSSEStart([]byte(tc.prefix)); got != tc.want {
-			t.Errorf("%s: isSilentSSEStart=%v want %v", tc.name, got, tc.want)
+		if got := classifyStreamFrames([]byte(tc.prefix)); got != tc.want {
+			t.Errorf("%s: classifyStreamFrames=%v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestPeekStreamStartSilentOnEOF(t *testing.T) {
+	// A stream that delivers a role header and then EOF is an empty answer.
+	prefix, silent, err := peekStreamStart(strings.NewReader(
+		"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !silent {
+		t.Fatalf("EOF after role-only frames must be silent, prefix=%s", prefix)
+	}
+}
+
+func TestIsEmptyChatSuccess(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"normal content", `{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`, false},
+		{"empty choices array", `{"choices":[]}`, true},
+		{"empty content string", `{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"stop"}]}`, true},
+		{"null content", `{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"stop"}]}`, true},
+		{"tool calls are content", `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"t"}]},"finish_reason":"tool_calls"}]}`, false},
+		{"content filter is an answer", `{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"content_filter"}]}`, false},
+		{"2xx wrapped error object", `{"error":{"message":"upstream exploded"}}`, true},
+		{"no choices key fails open", `{"data":[{"embedding":[0.1]}]}`, false},
+		{"non-json fails open", `OK`, false},
+		{"empty body", ``, true},
+	}
+	for _, tc := range cases {
+		if got := isEmptyChatSuccess([]byte(tc.body)); got != tc.want {
+			t.Errorf("%s: isEmptyChatSuccess=%v want %v", tc.name, got, tc.want)
 		}
 	}
 }

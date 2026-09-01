@@ -410,7 +410,7 @@ type RouteMember struct {
 	// MappingJSON holds a per-member alias redirect ({"real":"…"}) so several
 	// channels can share one route/alias name while each rewrites to its own
 	// upstream model. Empty = follow the route-level mapping_json (legacy).
-	MappingJSON   string     `json:"mapping_json,omitempty"`
+	MappingJSON string `json:"mapping_json,omitempty"`
 	// GroupName scopes the member to a route group; each group has its own
 	// priority ordering. 'default' is the built-in group every legacy member
 	// belongs to.
@@ -494,6 +494,10 @@ type ProxyLog struct {
 	LatencyMs        int    `json:"latency_ms"`
 	Attempt          int    `json:"attempt"`
 	ErrorBrief       string `json:"error_brief,omitempty"`
+	// ErrorDetail is a truncated excerpt of what the upstream actually
+	// returned for a failed attempt (error body text, or the transport error
+	// string when no response arrived). Empty on success.
+	ErrorDetail      string `json:"error_detail,omitempty"`
 	DownstreamKeyID  int64  `json:"downstream_key_id,omitempty"`
 	PromptTokens     int    `json:"prompt_tokens,omitempty"`
 	CompletionTokens int    `json:"completion_tokens,omitempty"`

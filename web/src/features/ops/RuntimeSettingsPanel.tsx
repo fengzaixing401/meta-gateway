@@ -1,6 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
 import {
-  Children,
   useEffect,
   useId,
   useState,
@@ -38,7 +37,7 @@ function numberOr(value: string, fallback: number) {
 /** Panel-level anchor order for the runtime settings section nav. */
 const RUNTIME_SECTION_GROUPS = [
   {
-    key: "routing",
+    key: "traffic",
     label: "ops.runtime.navGroup.routing",
     anchors: [
       ["relay", "ops.runtime.section.relay"],
@@ -53,7 +52,8 @@ const RUNTIME_SECTION_GROUPS = [
     anchors: [
       ["cooldown", "ops.runtime.section.cooldown"],
       ["health", "ops.runtime.section.healthSweep"],
-      ["checkin", "ops.runtime.section.checkin"],
+      ["sync", "ops.runtime.section.sync"],
+      ["probe", "ops.runtime.section.probe"],
     ],
   },
   {
@@ -62,7 +62,6 @@ const RUNTIME_SECTION_GROUPS = [
     anchors: [
       ["limits", "ops.runtime.section.limits"],
       ["audit", "ops.runtime.section.audit"],
-      ["server", "ops.runtime.section.server"],
     ],
   },
   {
@@ -71,6 +70,8 @@ const RUNTIME_SECTION_GROUPS = [
     anchors: [
       ["alerts", "ops.runtime.section.alerts"],
       ["maintenance", "ops.runtime.section.maintenance"],
+      ["checkin", "ops.runtime.section.checkin"],
+      ["server", "ops.runtime.section.server"],
     ],
   },
 ] as const;
@@ -154,19 +155,9 @@ function ValidatedNumberInput({
   );
 }
 
-/** Render the row-major cards as two independent vertical columns. */
+/** Masonry container: CSS columns balance the cards by height. */
 function RuntimeSettingsColumns({ children }: { children: ReactNode }) {
-  const cards = Children.toArray(children);
-  return (
-    <div className="runtime-settings-grid">
-      <div className="runtime-settings-column">
-        {cards.filter((_, index) => index % 2 === 0)}
-      </div>
-      <div className="runtime-settings-column">
-        {cards.filter((_, index) => index % 2 === 1)}
-      </div>
-    </div>
-  );
+  return <div className="runtime-settings-grid">{children}</div>;
 }
 
 /** Admin-writable runtime parameters with hot reload. */
@@ -195,6 +186,16 @@ export function RuntimeSettingsPanel() {
     mutationFn: () => s.resetRuntimeSettings(),
     invalidateKeys: [["runtime-settings"]],
   });
+  const updateCheckQuery = useQuery({
+    queryKey: ["update-check"],
+    queryFn: ({ signal }) => s.updateCheck(signal),
+    staleTime: 10 * 60_000,
+    refetchInterval: 30 * 60_000,
+  });
+  const refreshUpdate = useAdminMutation({
+    mutationFn: () => s.refreshUpdateCheck(),
+    invalidateKeys: [["update-check"]],
+  });
 
   if (query.isPending || !draft) {
     return (
@@ -220,6 +221,28 @@ export function RuntimeSettingsPanel() {
     reset.reset();
     setDraft((prev) => (prev ? { ...prev, [key]: value } : prev));
   };
+
+  const updateInfo = refreshUpdate.data ?? updateCheckQuery.data;
+  const updateResult = (() => {
+    if (!draft.update_check_enabled)
+      return <span className="muted">{t("ops.runtime.updateOff")}</span>;
+    if (!updateInfo)
+      return <span className="muted">{t("ops.runtime.updateNotYet")}</span>;
+    if (!updateInfo.latest && updateInfo.error)
+      return <span className="muted">{t("ops.runtime.updateFailed")}</span>;
+    if (updateInfo.has_update)
+      return (
+        <a
+          className="runtime-update-link"
+          href={updateInfo.release_url || undefined}
+          target="_blank"
+          rel="noreferrer"
+        >
+          {t("ops.runtime.updateFound", { version: updateInfo.latest })}
+        </a>
+      );
+    return <span>{t("ops.runtime.updateUpToDate")}</span>;
+  })();
 
   return (
     <div className="runtime-settings">
@@ -278,7 +301,14 @@ export function RuntimeSettingsPanel() {
           </div>
         ))}
       </nav>
-      <RuntimeSettingsColumns>
+      <section className="runtime-group" id="runtime-group-traffic">
+        <header className="runtime-group-header">
+          <div className="runtime-group-title">
+            <strong>{t("ops.runtime.navGroup.routing")}</strong>
+            <p>{t("ops.runtime.group.routingDesc")}</p>
+          </div>
+        </header>
+        <RuntimeSettingsColumns>
         <Panel className="runtime-card runtime-card-relay" id="runtime-relay">
           <div className="panel-header">
             <strong>{t("ops.runtime.section.relay")}</strong>
@@ -344,6 +374,190 @@ export function RuntimeSettingsPanel() {
           </label>
         </Panel>
 
+        <Panel
+          className="runtime-card runtime-card-routing"
+          id="runtime-routing"
+        >
+          <div className="panel-header">
+            <strong>{t("ops.runtime.section.routing")}</strong>
+          </div>
+          <label className="check">
+            <input
+              type="checkbox"
+              disabled={busy}
+              checked={draft.routing_latency_aware}
+              onChange={(e) => patch("routing_latency_aware", e.target.checked)}
+            />
+            <span className="setting-check-label">
+              <span>{t("ops.runtime.latencyAware")}</span>
+              <InfoTip label={t("ops.runtime.latencyAwareHint")} />
+            </span>
+          </label>
+          <label
+            className="check"
+            style={{
+              display: "flex",
+              gap: 8,
+              alignItems: "center",
+              marginTop: 10,
+            }}
+          >
+            <input
+              type="checkbox"
+              disabled={busy}
+              checked={draft.routing_error_aware}
+              onChange={(e) => patch("routing_error_aware", e.target.checked)}
+            />
+            <span className="setting-check-label">
+              <span>{t("ops.runtime.errorAware")}</span>
+              <InfoTip label={t("ops.runtime.errorAwareHint")} />
+            </span>
+          </label>
+          <label
+            className="check"
+            style={{
+              display: "flex",
+              gap: 8,
+              alignItems: "center",
+              marginTop: 10,
+            }}
+          >
+            <input
+              type="checkbox"
+              disabled={busy}
+              checked={draft.routing_concurrency_enabled}
+              onChange={(e) =>
+                patch("routing_concurrency_enabled", e.target.checked)
+              }
+            />
+            <span className="setting-check-label">
+              <span>{t("ops.runtime.concurrencyGuard")}</span>
+              <InfoTip label={t("ops.runtime.concurrencyGuardHint")} />
+            </span>
+          </label>
+          <label className="field">
+            <SettingLabel
+              label={t("ops.runtime.concurrencyLimit")}
+              hint={t("ops.runtime.concurrencyLimitHint")}
+            />
+            <ValidatedNumberInput
+              min={1}
+              max={100000}
+              disabled={busy}
+              value={draft.routing_concurrency_limit}
+              onChange={(e) =>
+                patch(
+                  "routing_concurrency_limit",
+                  numberOr(e.target.value, draft.routing_concurrency_limit),
+                )
+              }
+            />
+          </label>
+        </Panel>
+
+        <Panel
+          className="runtime-card runtime-card-stable-first"
+          id="runtime-stable-first"
+        >
+          <div className="panel-header">
+            <strong>{t("ops.runtime.section.stableFirst")}</strong>
+          </div>
+          <label className="check">
+            <input
+              type="checkbox"
+              disabled={busy}
+              checked={draft.stable_first_enabled}
+              onChange={(e) => patch("stable_first_enabled", e.target.checked)}
+            />
+            <span className="setting-check-label">
+              <span>{t("ops.runtime.stableFirst")}</span>
+              <InfoTip label={t("ops.runtime.stableFirstHint")} />
+            </span>
+          </label>
+          <label className="field">
+            <SettingLabel
+              label={t("ops.runtime.stableFirstDenominator")}
+              hint={t("ops.runtime.stableFirstDenominatorHint")}
+            />
+            <ValidatedNumberInput
+              min={2}
+              max={1000}
+              disabled={busy}
+              value={draft.stable_first_denominator}
+              onChange={(e) =>
+                patch(
+                  "stable_first_denominator",
+                  numberOr(e.target.value, draft.stable_first_denominator),
+                )
+              }
+            />
+          </label>
+          <label className="field">
+            <SettingLabel
+              label={t("ops.runtime.stableFirstPromote")}
+              hint={t("ops.runtime.stableFirstPromoteHint")}
+            />
+            <ValidatedNumberInput
+              min={1}
+              max={100000}
+              disabled={busy}
+              value={draft.stable_first_promote_requests}
+              onChange={(e) =>
+                patch(
+                  "stable_first_promote_requests",
+                  numberOr(e.target.value, draft.stable_first_promote_requests),
+                )
+              }
+            />
+          </label>
+        </Panel>
+
+        <Panel className="runtime-card runtime-card-sticky" id="runtime-sticky">
+          <div className="panel-header">
+            <strong>{t("ops.runtime.section.sticky")}</strong>
+          </div>
+          <label className="check" style={{ marginBottom: 10 }}>
+            <input
+              type="checkbox"
+              disabled={busy}
+              checked={draft.sticky_enabled}
+              onChange={(e) => patch("sticky_enabled", e.target.checked)}
+            />
+            <span className="setting-check-label">
+              <span>{t("ops.runtime.stickyEnabled")}</span>
+              <InfoTip label={t("ops.runtime.stickyEnabledHint")} />
+            </span>
+          </label>
+          <label className="field">
+            <SettingLabel
+              label={t("ops.runtime.stickyTTL")}
+              hint={t("ops.runtime.stickyTTLHint")}
+            />
+            <ValidatedNumberInput
+              min={1}
+              max={1440}
+              disabled={busy || !draft.sticky_enabled}
+              value={draft.sticky_ttl_minutes}
+              onChange={(e) =>
+                patch(
+                  "sticky_ttl_minutes",
+                  numberOr(e.target.value, draft.sticky_ttl_minutes),
+                )
+              }
+            />
+          </label>
+        </Panel>
+
+        </RuntimeSettingsColumns>
+      </section>
+      <section className="runtime-group" id="runtime-group-health">
+        <header className="runtime-group-header">
+          <div className="runtime-group-title">
+            <strong>{t("ops.runtime.navGroup.health")}</strong>
+            <p>{t("ops.runtime.group.healthDesc")}</p>
+          </div>
+        </header>
+        <RuntimeSettingsColumns>
         <Panel
           className="runtime-card runtime-card-cooldown"
           id="runtime-cooldown"
@@ -561,80 +775,135 @@ export function RuntimeSettingsPanel() {
           </label>
         </Panel>
 
-        <Panel className="runtime-card runtime-card-sticky" id="runtime-sticky">
+        <Panel className="runtime-card runtime-card-sync" id="runtime-sync">
           <div className="panel-header">
-            <strong>{t("ops.runtime.section.sticky")}</strong>
+            <strong>{t("ops.runtime.section.sync")}</strong>
           </div>
-          <label className="check" style={{ marginBottom: 10 }}>
-            <input
-              type="checkbox"
-              disabled={busy}
-              checked={draft.sticky_enabled}
-              onChange={(e) => patch("sticky_enabled", e.target.checked)}
+          <label className="field">
+            <SettingLabel
+              label={t("ops.runtime.discoveryCron")}
+              hint={t("ops.runtime.discoveryCronHint")}
             />
-            <span className="setting-check-label">
-              <span>{t("ops.runtime.stickyEnabled")}</span>
-              <InfoTip label={t("ops.runtime.stickyEnabledHint")} />
-            </span>
+            <input
+              type="text"
+              placeholder="0 3 * * *"
+              disabled={busy}
+              value={draft.discovery_cron ?? ""}
+              onChange={(e) => patch("discovery_cron", e.target.value)}
+            />
           </label>
           <label className="field">
             <SettingLabel
-              label={t("ops.runtime.stickyTTL")}
-              hint={t("ops.runtime.stickyTTLHint")}
+              label={t("ops.runtime.defaultModelSyncMode")}
+              hint={t("ops.runtime.defaultModelSyncModeHint")}
             />
-            <ValidatedNumberInput
-              min={1}
-              max={1440}
-              disabled={busy || !draft.sticky_enabled}
-              value={draft.sticky_ttl_minutes}
+            <select
+              disabled={busy}
+              value={draft.default_model_sync_mode ?? "manual"}
               onChange={(e) =>
                 patch(
-                  "sticky_ttl_minutes",
-                  numberOr(e.target.value, draft.sticky_ttl_minutes),
+                  "default_model_sync_mode",
+                  e.target.value === "auto" ? "auto" : "manual",
                 )
+              }
+            >
+              <option value="manual">{t("channels.syncModeManual")}</option>
+              <option value="auto">{t("channels.syncModeAuto")}</option>
+            </select>
+          </label>
+        </Panel>
+
+        <Panel className="runtime-card runtime-card-probe" id="runtime-probe">
+          <div className="panel-header">
+            <strong>{t("ops.runtime.section.probe")}</strong>
+          </div>
+          <p className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+            {t("ops.runtime.probeIntro")}
+          </p>
+          <label className="field">
+            <SettingLabel
+              label={t("ops.runtime.probeCron")}
+              hint={t("ops.runtime.probeCronHint")}
+            />
+            <input
+              type="text"
+              placeholder="0 */6 * * *"
+              disabled={busy}
+              value={draft.probe_cron ?? ""}
+              onChange={(e) => patch("probe_cron", e.target.value)}
+            />
+          </label>
+          <label className="field">
+            <SettingLabel
+              label={t("ops.runtime.probePrompt")}
+              hint={t("ops.runtime.probePromptHint")}
+            />
+            <input
+              type="text"
+              placeholder="hi"
+              disabled={busy}
+              value={draft.probe_prompt ?? ""}
+              onChange={(e) => patch("probe_prompt", e.target.value)}
+            />
+          </label>
+          <label className="field">
+            <SettingLabel
+              label={t("ops.runtime.probeMaxTokens")}
+              hint={t("ops.runtime.probeMaxTokensHint")}
+            />
+            <input
+              type="number"
+              min={1}
+              max={256}
+              disabled={busy}
+              value={draft.probe_max_tokens ?? 1}
+              onChange={(e) => patch("probe_max_tokens", Number(e.target.value))}
+            />
+          </label>
+          <label className="field">
+            <SettingLabel
+              label={t("ops.runtime.probeConcurrency")}
+              hint={t("ops.runtime.probeConcurrencyHint")}
+            />
+            <input
+              type="number"
+              min={1}
+              max={16}
+              disabled={busy}
+              value={draft.probe_concurrency ?? 4}
+              onChange={(e) =>
+                patch("probe_concurrency", Number(e.target.value))
+              }
+            />
+          </label>
+          <label className="field">
+            <SettingLabel
+              label={t("ops.runtime.probeAutoDisable")}
+              hint={t("ops.runtime.probeAutoDisableHint")}
+            />
+            <input
+              type="number"
+              min={0}
+              max={10}
+              disabled={busy}
+              value={draft.probe_auto_disable ?? 0}
+              onChange={(e) =>
+                patch("probe_auto_disable", Number(e.target.value))
               }
             />
           </label>
         </Panel>
 
-        <Panel
-          className="runtime-card runtime-card-checkin"
-          id="runtime-checkin"
-        >
-          <div className="panel-header">
-            <div>
-              <strong>{t("ops.runtime.section.checkin")}</strong>
-              <p className="panel-muted">{t("ops.runtime.checkinScope")}</p>
-            </div>
-            <Link className="button button-quiet" to="/checkins">
-              {t("ops.runtime.openCheckin")}
-            </Link>
+        </RuntimeSettingsColumns>
+      </section>
+      <section className="runtime-group" id="runtime-group-governance">
+        <header className="runtime-group-header">
+          <div className="runtime-group-title">
+            <strong>{t("ops.runtime.navGroup.governance")}</strong>
+            <p>{t("ops.runtime.group.governanceDesc")}</p>
           </div>
-          <label className="check">
-            <input
-              type="checkbox"
-              disabled={busy}
-              checked={draft.checkin_enabled}
-              onChange={(e) => patch("checkin_enabled", e.target.checked)}
-            />
-            <span className="setting-check-label">
-              <span>{t("ops.runtime.checkinEnabled")}</span>
-              <InfoTip label={t("ops.runtime.checkinEnabledHint")} />
-            </span>
-          </label>
-          <label className="field" style={{ marginTop: 10 }}>
-            <SettingLabel
-              label={t("ops.runtime.checkinCron")}
-              hint={t("ops.runtime.checkinCronHint")}
-            />
-            <CheckinTimePicker
-              value={draft.checkin_cron}
-              disabled={busy}
-              onChange={(cron) => patch("checkin_cron", cron)}
-            />
-          </label>
-        </Panel>
-
+        </header>
+        <RuntimeSettingsColumns>
         <Panel className="runtime-card runtime-card-limits" id="runtime-limits">
           <div className="panel-header">
             <strong>{t("ops.runtime.section.limits")}</strong>
@@ -770,144 +1039,17 @@ export function RuntimeSettingsPanel() {
             />
           </label>
         </Panel>
-        <Panel
-          className="runtime-card runtime-card-routing"
-          id="runtime-routing"
-        >
-          <div className="panel-header">
-            <strong>{t("ops.runtime.section.routing")}</strong>
-          </div>
-          <label className="check">
-            <input
-              type="checkbox"
-              disabled={busy}
-              checked={draft.routing_latency_aware}
-              onChange={(e) => patch("routing_latency_aware", e.target.checked)}
-            />
-            <span className="setting-check-label">
-              <span>{t("ops.runtime.latencyAware")}</span>
-              <InfoTip label={t("ops.runtime.latencyAwareHint")} />
-            </span>
-          </label>
-          <label
-            className="check"
-            style={{
-              display: "flex",
-              gap: 8,
-              alignItems: "center",
-              marginTop: 10,
-            }}
-          >
-            <input
-              type="checkbox"
-              disabled={busy}
-              checked={draft.routing_error_aware}
-              onChange={(e) => patch("routing_error_aware", e.target.checked)}
-            />
-            <span className="setting-check-label">
-              <span>{t("ops.runtime.errorAware")}</span>
-              <InfoTip label={t("ops.runtime.errorAwareHint")} />
-            </span>
-          </label>
-          <label
-            className="check"
-            style={{
-              display: "flex",
-              gap: 8,
-              alignItems: "center",
-              marginTop: 10,
-            }}
-          >
-            <input
-              type="checkbox"
-              disabled={busy}
-              checked={draft.routing_concurrency_enabled}
-              onChange={(e) =>
-                patch("routing_concurrency_enabled", e.target.checked)
-              }
-            />
-            <span className="setting-check-label">
-              <span>{t("ops.runtime.concurrencyGuard")}</span>
-              <InfoTip label={t("ops.runtime.concurrencyGuardHint")} />
-            </span>
-          </label>
-          <label className="field">
-            <SettingLabel
-              label={t("ops.runtime.concurrencyLimit")}
-              hint={t("ops.runtime.concurrencyLimitHint")}
-            />
-            <ValidatedNumberInput
-              min={1}
-              max={100000}
-              disabled={busy}
-              value={draft.routing_concurrency_limit}
-              onChange={(e) =>
-                patch(
-                  "routing_concurrency_limit",
-                  numberOr(e.target.value, draft.routing_concurrency_limit),
-                )
-              }
-            />
-          </label>
-        </Panel>
 
-        <Panel
-          className="runtime-card runtime-card-stable-first"
-          id="runtime-stable-first"
-        >
-          <div className="panel-header">
-            <strong>{t("ops.runtime.section.stableFirst")}</strong>
+        </RuntimeSettingsColumns>
+      </section>
+      <section className="runtime-group" id="runtime-group-ops">
+        <header className="runtime-group-header">
+          <div className="runtime-group-title">
+            <strong>{t("ops.runtime.navGroup.ops")}</strong>
+            <p>{t("ops.runtime.group.opsDesc")}</p>
           </div>
-          <label className="check">
-            <input
-              type="checkbox"
-              disabled={busy}
-              checked={draft.stable_first_enabled}
-              onChange={(e) => patch("stable_first_enabled", e.target.checked)}
-            />
-            <span className="setting-check-label">
-              <span>{t("ops.runtime.stableFirst")}</span>
-              <InfoTip label={t("ops.runtime.stableFirstHint")} />
-            </span>
-          </label>
-          <label className="field">
-            <SettingLabel
-              label={t("ops.runtime.stableFirstDenominator")}
-              hint={t("ops.runtime.stableFirstDenominatorHint")}
-            />
-            <ValidatedNumberInput
-              min={2}
-              max={1000}
-              disabled={busy}
-              value={draft.stable_first_denominator}
-              onChange={(e) =>
-                patch(
-                  "stable_first_denominator",
-                  numberOr(e.target.value, draft.stable_first_denominator),
-                )
-              }
-            />
-          </label>
-          <label className="field">
-            <SettingLabel
-              label={t("ops.runtime.stableFirstPromote")}
-              hint={t("ops.runtime.stableFirstPromoteHint")}
-            />
-            <ValidatedNumberInput
-              min={1}
-              max={100000}
-              disabled={busy}
-              value={draft.stable_first_promote_requests}
-              onChange={(e) =>
-                patch(
-                  "stable_first_promote_requests",
-                  numberOr(e.target.value, draft.stable_first_promote_requests),
-                )
-              }
-            />
-          </label>
-        </Panel>
-
+        </header>
+        <RuntimeSettingsColumns>
         <Panel className="runtime-card runtime-card-alerts" id="runtime-alerts">
           <div className="panel-header">
             <strong>{t("ops.runtime.section.alerts")}</strong>
@@ -1014,51 +1156,6 @@ export function RuntimeSettingsPanel() {
           </div>
           <label className="field">
             <SettingLabel
-              label={t("ops.runtime.proxyURL")}
-              hint={t("ops.runtime.proxyURLHint")}
-            />
-            <input
-              type="url"
-              placeholder="http://127.0.0.1:7897"
-              disabled={busy}
-              value={draft.proxy_url ?? ""}
-              onChange={(e) => patch("proxy_url", e.target.value)}
-            />
-          </label>
-          <label className="field">
-            <SettingLabel
-              label={t("ops.runtime.discoveryCron")}
-              hint={t("ops.runtime.discoveryCronHint")}
-            />
-            <input
-              type="text"
-              placeholder="0 3 * * *"
-              disabled={busy}
-              value={draft.discovery_cron ?? ""}
-              onChange={(e) => patch("discovery_cron", e.target.value)}
-            />
-          </label>
-          <label className="field">
-            <SettingLabel
-              label={t("ops.runtime.defaultModelSyncMode")}
-              hint={t("ops.runtime.defaultModelSyncModeHint")}
-            />
-            <select
-              disabled={busy}
-              value={draft.default_model_sync_mode ?? "manual"}
-              onChange={(e) =>
-                patch(
-                  "default_model_sync_mode",
-                  e.target.value === "auto" ? "auto" : "manual",
-                )
-              }
-            >
-              <option value="manual">{t("channels.syncModeManual")}</option>
-              <option value="auto">{t("channels.syncModeAuto")}</option>
-            </select>
-          </label>
-          <label className="field">
-            <SettingLabel
               label={t("ops.maintenance.cron")}
               hint={t("ops.maintenance.cronHint")}
             />
@@ -1072,83 +1169,40 @@ export function RuntimeSettingsPanel() {
           </label>
         </Panel>
 
-        <Panel className="runtime-card runtime-card-probe" id="runtime-probe">
+        <Panel
+          className="runtime-card runtime-card-checkin"
+          id="runtime-checkin"
+        >
           <div className="panel-header">
-            <strong>{t("ops.runtime.section.probe")}</strong>
+            <div>
+              <strong>{t("ops.runtime.section.checkin")}</strong>
+              <p className="panel-muted">{t("ops.runtime.checkinScope")}</p>
+            </div>
+            <Link className="button button-quiet" to="/checkins">
+              {t("ops.runtime.openCheckin")}
+            </Link>
           </div>
-          <p className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
-            {t("ops.runtime.probeIntro")}
-          </p>
-          <label className="field">
-            <SettingLabel
-              label={t("ops.runtime.probeCron")}
-              hint={t("ops.runtime.probeCronHint")}
-            />
+          <label className="check">
             <input
-              type="text"
-              placeholder="0 */6 * * *"
+              type="checkbox"
               disabled={busy}
-              value={draft.probe_cron ?? ""}
-              onChange={(e) => patch("probe_cron", e.target.value)}
+              checked={draft.checkin_enabled}
+              onChange={(e) => patch("checkin_enabled", e.target.checked)}
             />
+            <span className="setting-check-label">
+              <span>{t("ops.runtime.checkinEnabled")}</span>
+              <InfoTip label={t("ops.runtime.checkinEnabledHint")} />
+            </span>
           </label>
-          <label className="field">
+          <label className="field" style={{ marginTop: 10 }}>
             <SettingLabel
-              label={t("ops.runtime.probePrompt")}
-              hint={t("ops.runtime.probePromptHint")}
+              label={t("ops.runtime.checkinCron")}
+              hint={t("ops.runtime.checkinCronHint")}
             />
-            <input
-              type="text"
-              placeholder="hi"
+            <CheckinTimePicker
+              value={draft.checkin_cron}
               disabled={busy}
-              value={draft.probe_prompt ?? ""}
-              onChange={(e) => patch("probe_prompt", e.target.value)}
-            />
-          </label>
-          <label className="field">
-            <SettingLabel
-              label={t("ops.runtime.probeMaxTokens")}
-              hint={t("ops.runtime.probeMaxTokensHint")}
-            />
-            <input
-              type="number"
-              min={1}
-              max={256}
-              disabled={busy}
-              value={draft.probe_max_tokens ?? 1}
-              onChange={(e) => patch("probe_max_tokens", Number(e.target.value))}
-            />
-          </label>
-          <label className="field">
-            <SettingLabel
-              label={t("ops.runtime.probeConcurrency")}
-              hint={t("ops.runtime.probeConcurrencyHint")}
-            />
-            <input
-              type="number"
-              min={1}
-              max={16}
-              disabled={busy}
-              value={draft.probe_concurrency ?? 4}
-              onChange={(e) =>
-                patch("probe_concurrency", Number(e.target.value))
-              }
-            />
-          </label>
-          <label className="field">
-            <SettingLabel
-              label={t("ops.runtime.probeAutoDisable")}
-              hint={t("ops.runtime.probeAutoDisableHint")}
-            />
-            <input
-              type="number"
-              min={0}
-              max={10}
-              disabled={busy}
-              value={draft.probe_auto_disable ?? 0}
-              onChange={(e) =>
-                patch("probe_auto_disable", Number(e.target.value))
-              }
+              onChange={(cron) => patch("checkin_cron", cron)}
             />
           </label>
         </Panel>
@@ -1157,9 +1211,30 @@ export function RuntimeSettingsPanel() {
           <div className="panel-header">
             <strong>{t("ops.runtime.section.server")}</strong>
           </div>
+          <label className="field" style={{ marginBottom: 10 }}>
+            <SettingLabel
+              label={t("ops.runtime.proxyURL")}
+              hint={t("ops.runtime.proxyURLHint")}
+            />
+            <input
+              type="url"
+              placeholder="http://127.0.0.1:7897"
+              disabled={busy}
+              value={draft.proxy_url ?? ""}
+              onChange={(e) => patch("proxy_url", e.target.value)}
+            />
+          </label>
           <p className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
             {t("ops.runtime.serverReadonly")}
           </p>
+          <div className="runtime-setting-row">
+            <span className="runtime-setting-label">
+              {t("ops.runtime.buildVersion")}
+            </span>
+            <strong className="runtime-setting-value mono">
+              {updateCheckQuery.data?.current ?? "…"}
+            </strong>
+          </div>
           <div className="runtime-setting-row">
             <span className="runtime-setting-label">
               {t("ops.runtime.httpAddr")}
@@ -1202,17 +1277,50 @@ export function RuntimeSettingsPanel() {
                 : t("ops.runtime.metricsTokenNone")}
             </strong>
           </div>
+          <label className="check" style={{ margin: "12px 0 8px" }}>
+            <input
+              type="checkbox"
+              disabled={busy}
+              checked={draft.update_check_enabled}
+              onChange={(e) => patch("update_check_enabled", e.target.checked)}
+            />
+            <span className="setting-check-label">
+              <span>{t("ops.runtime.updateCheck")}</span>
+              <InfoTip label={t("ops.runtime.updateCheckHint")} />
+            </span>
+          </label>
+          <div className="runtime-update-row">
+            <Button
+              variant="secondary"
+              disabled={refreshUpdate.isPending || !draft.update_check_enabled}
+              onClick={() => refreshUpdate.mutate()}
+            >
+              {refreshUpdate.isPending
+                ? t("ops.runtime.updateChecking")
+                : t("ops.runtime.updateNow")}
+            </Button>
+            <span className="runtime-update-result">{updateResult}</span>
+          </div>
         </Panel>
-      </RuntimeSettingsColumns>
+        </RuntimeSettingsColumns>
+      </section>
 
-      <div className="runtime-tools-grid">
-        <TOTPPanel />
-        <AlertRulesPanel />
-        <ErrorRulesPanel />
-        <PromptGuardPanel />
-        <MaintenancePanel />
-        <FactoryResetPanel />
-      </div>
+      <section className="runtime-group" id="runtime-group-tools">
+        <header className="runtime-group-header">
+          <div className="runtime-group-title">
+            <strong>{t("ops.runtime.group.tools")}</strong>
+            <p>{t("ops.runtime.group.toolsDesc")}</p>
+          </div>
+        </header>
+        <div className="runtime-tools-grid">
+          <TOTPPanel />
+          <AlertRulesPanel />
+          <ErrorRulesPanel />
+          <PromptGuardPanel />
+          <MaintenancePanel />
+          <FactoryResetPanel />
+        </div>
+      </section>
 
       <div className="runtime-settings-actions">
         <Button

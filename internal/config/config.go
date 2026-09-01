@@ -25,7 +25,10 @@ type Config struct {
 	ChannelRetryTimes int
 	// KeyPoolRotation enables rotating through the site key pool on failure.
 	// Disabled = only the channel's bound key is used.
-	KeyPoolRotation             bool
+	KeyPoolRotation bool
+	// UpdateCheckEnabled lets the gateway query GitHub for newer releases to
+	// power the console update badge.
+	UpdateCheckEnabled          bool
 	CrossChannelFailoverEnabled bool
 	Cooldown                    time.Duration
 	// SQLiteMaxOpenConns is the SQLite connection-pool ceiling (WAL allows
@@ -38,12 +41,19 @@ type Config struct {
 	CheckinTZ string
 
 	WebDAVSyncEnabled    bool
+	WebDAVUploadEnabled  bool
 	WebDAVURL            string
 	WebDAVUsername       string
 	WebDAVPassword       string
 	WebDAVBackupPassword string
-	WebDAVCron           string
-	WebDAVMaxBytes       int64
+	// Upload direction owns its own connection; each WEBDAV_UPLOAD_* falls back
+	// to the matching shared variable when unset.
+	WebDAVUploadURL            string
+	WebDAVUploadUsername       string
+	WebDAVUploadPassword       string
+	WebDAVUploadBackupPassword string
+	WebDAVCron                 string
+	WebDAVMaxBytes             int64
 
 	OutboundAllowHosts            []string
 	OutboundAllowCIDRs            []string
@@ -158,6 +168,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	updateCheckEnabled, err := envBool("UPDATE_CHECK_ENABLED", true)
+	if err != nil {
+		return nil, err
+	}
 	crossChannelFailover, err := envBool("CROSS_CHANNEL_FAILOVER_ENABLED", true)
 	if err != nil {
 		return nil, err
@@ -180,10 +194,24 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	webdavUploadEnabled, err := envBool("WEBDAV_UPLOAD_ENABLED", false)
+	if err != nil {
+		return nil, err
+	}
 	webdavMaxBytes, err := envInt("WEBDAV_MAX_BYTES", 10<<20, 1024, 32<<20)
 	if err != nil {
 		return nil, err
 	}
+	webdavURL := strings.TrimSpace(envStr("WEBDAV_URL", ""))
+	webdavUsername := envStr("WEBDAV_USERNAME", "")
+	webdavPassword := envStr("WEBDAV_PASSWORD", "")
+	webdavBackupPassword := envStr("WEBDAV_BACKUP_PASSWORD", "")
+	// The upload direction owns its own connection; unset WEBDAV_UPLOAD_*
+	// variables reuse the shared ones so existing compose files keep working.
+	webdavUploadURL := firstNonEmpty([]string{strings.TrimSpace(envStr("WEBDAV_UPLOAD_URL", "")), webdavURL})
+	webdavUploadUsername := firstNonEmpty([]string{envStr("WEBDAV_UPLOAD_USERNAME", ""), webdavUsername})
+	webdavUploadPassword := firstNonEmpty([]string{envStr("WEBDAV_UPLOAD_PASSWORD", ""), webdavPassword})
+	webdavUploadBackupPassword := firstNonEmpty([]string{envStr("WEBDAV_UPLOAD_BACKUP_PASSWORD", ""), webdavBackupPassword})
 	connectTimeout, err := envDurationSeconds("OUTBOUND_CONNECT_TIMEOUT_SECONDS", 10, 1, 300)
 	if err != nil {
 		return nil, err
@@ -414,19 +442,25 @@ func Load() (*Config, error) {
 		RetryTimes:                  retryTimes,
 		ChannelRetryTimes:           channelRetryTimes,
 		KeyPoolRotation:             keyPoolRotation,
+		UpdateCheckEnabled:          updateCheckEnabled,
 		CrossChannelFailoverEnabled: crossChannelFailover,
 		Cooldown:                    time.Duration(cooldownSeconds) * time.Second,
 		CheckinEnabled:              checkinEnabled,
 		CheckinCron:                 envStr("CHECKIN_CRON", "0 8 * * *"),
 		CheckinTZ:                   checkinTZ,
 
-		WebDAVSyncEnabled:    webdavSyncEnabled,
-		WebDAVURL:            strings.TrimSpace(envStr("WEBDAV_URL", "")),
-		WebDAVUsername:       envStr("WEBDAV_USERNAME", ""),
-		WebDAVPassword:       envStr("WEBDAV_PASSWORD", ""),
-		WebDAVBackupPassword: envStr("WEBDAV_BACKUP_PASSWORD", ""),
-		WebDAVCron:           envStr("WEBDAV_CRON", "0 */6 * * *"),
-		WebDAVMaxBytes:       int64(webdavMaxBytes),
+		WebDAVSyncEnabled:          webdavSyncEnabled,
+		WebDAVUploadEnabled:        webdavUploadEnabled,
+		WebDAVURL:                  webdavURL,
+		WebDAVUsername:             webdavUsername,
+		WebDAVPassword:             webdavPassword,
+		WebDAVBackupPassword:       webdavBackupPassword,
+		WebDAVUploadURL:            webdavUploadURL,
+		WebDAVUploadUsername:       webdavUploadUsername,
+		WebDAVUploadPassword:       webdavUploadPassword,
+		WebDAVUploadBackupPassword: webdavUploadBackupPassword,
+		WebDAVCron:                 envStr("WEBDAV_CRON", "0 */6 * * *"),
+		WebDAVMaxBytes:             int64(webdavMaxBytes),
 
 		OutboundAllowHosts:            hosts,
 		OutboundAllowCIDRs:            cidrs,
