@@ -352,6 +352,31 @@ export const en: Dict = {
   "channels.syncModeManual": "Pick on demand",
   "channels.syncModeManualHint":
     "New models only enter the candidate list; adopt them from the models page.",
+  "channels.syncModeAutoPro": "Callable right after a sync",
+  "channels.syncModeAutoCon": "Models added upstream go live on their own",
+  "channels.syncModeManualPro": "Only the models you check are exposed",
+  "channels.syncModeManualCon": "New models need a manual adoption",
+  "channels.syncModeInheritDefault": "System default ({mode})",
+  "channels.syncModeCounts": "{adopted}/{total} adopted",
+  "channels.syncModeGuide": "What is the difference?",
+  "channels.syncModeGuideSwitch":
+    "Switching never touches already adopted models. Auto → on demand keeps what is adopted and stops adopting new ones; on demand → auto adopts whatever the list is missing on the next sync.",
+  "channels.modelsTotalStat": "Models",
+  "channels.modelsTotalHint": "Candidate models probed from upstream",
+  "channels.modelsAdoptedStat": "Adopted",
+  "channels.modelsAdoptedHint":
+    "Models wired into routing (including manually disabled ones)",
+  "channels.modelsNeverSyncedHint":
+    "Models not synced yet; open the channel and click \u201cSync models\u201d to fetch the list.",
+  "channels.modelsNoneAdoptedHint":
+    "Synced, but no model is wired into routing yet; adopt them on the models page or switch to auto sync.",
+  "channels.modelsSelectedCol": "Selected",
+  "channels.modelsSelectedHint":
+    "Models adopted into routing (a subset of the synced candidates).",
+  "channels.modelsSyncBannerAuto":
+    "Newly probed models are adopted automatically; uncheck one to disable it.",
+  "channels.modelsSyncBannerManual":
+    "A sync only refreshes the candidate list — check a model to adopt it.",
   "channels.adoptHint":
     "Checking a model adopts it; newly probed models start unchecked.",
   "channels.modelAdoptHint": "Not adopted yet; check to start serving this model",
@@ -652,7 +677,7 @@ export const en: Dict = {
   "modelsPage.description":
     "Manage exposed models, upstream members, and model-level routing policy.",
   "modelsPage.empty":
-    "No models are available yet. Verify and sync an upstream connection first.",
+    "No models are available yet. Recommended: edit a channel on the connections page and tick models under model settings — routes are created automatically. You can also add a route manually below.",
   "modelsPage.selectHint":
     "Select a model to edit its route, members, and model-level overrides.",
   "modelsPage.scopeHint":
@@ -718,6 +743,9 @@ export const en: Dict = {
     "These groups only merge because of an owner prefix, a snapshot date or an index suffix. Different owners can publish different models under the same short name, and different snapshots can be different versions, so confirm before checking one.",
   "modelsPage.unify.archivedNote":
     "{count} original name(s) are currently hidden. Restore them from Unify history.",
+  "modelsPage.unify.exposedOriginals": "{count} original(s) restored",
+  "modelsPage.unify.exposedOriginalsHint":
+    "An original route with a variant name is enabled again (usually restored from Unify history). Applying this group hides it once more.",
   "modelsPage.unify.empty":
     "Nothing to unify — no duplicate model names found across channels.",
   "modelsPage.unify.routeExists": "route exists",
@@ -750,6 +778,7 @@ export const en: Dict = {
   "modelsPage.unify.history.restore": "Restore",
   "modelsPage.unify.history.undo": "Revert",
   "modelsPage.unify.history.undone": "reverted",
+  "modelsPage.unify.history.restored": "restored",
   "modelsPage.unify.history.active": "active",
   "modelsPage.unify.history.summary":
     "{members} member(s) · {archived} original(s) hidden",
@@ -771,6 +800,7 @@ export const en: Dict = {
   "modelsPage.listTitle": "Models",
   "modelsPage.col.upstream": "Upstream",
   "modelsPage.noUpstream": "No upstream",
+  "modelsPage.openChannelHint": "Open this channel's model settings",
   "modelsPage.servedBy": "Served by {name}",
   "modelsPage.extraPaths": "+{n} fallback",
   "modelsPage.showRouting": "Show routing options",
@@ -1287,6 +1317,15 @@ export const en: Dict = {
   "routing.cooldownHint": "cooldown {left} left",
   "routing.exactModel": "Exact model",
   "routing.routeEnabled": "Route enabled",
+  "routing.autoMatchLabel": "Auto-match channels serving this model",
+  "routing.autoMatchHint":
+    "On save, scan every enabled channel's model list (models.csv and the discovery snapshot) and attach all channels serving this model as route members in one step — no per-channel manual adding.",
+  "routing.autoMatchSelected":
+    "{total} channel(s) serve this model, {selected} selected — only checked ones are attached on save",
+  "routing.autoMatchNone":
+    "No enabled channel serves this model; nothing will be attached",
+  "routing.autoMatchUnknown":
+    "Match count unavailable; saving still applies the current toggle",
   "routing.retryOverrideTitle": "Retry overrides",
   "routing.retryRounds": "Retry rounds",
   "routing.retryRoundsHint":
@@ -1425,7 +1464,10 @@ export const en: Dict = {
   "ops.schedule.preset.every6h": "Every 6 hours",
   "ops.schedule.preset.every12h": "Every 12 hours",
   "ops.schedule.preset.daily": "Daily at 08:00",
+  "ops.schedule.preset.dailyAt": "Daily at a specific time",
   "ops.schedule.preset.custom": "Custom…",
+  "ops.schedule.presetLabel": "Schedule preset",
+  "ops.schedule.offHint": "Schedule off",
   "ops.runEnabledConfirm":
     "Runs check-in only for credentials with schedule enabled and a session/access token. API keys are skipped. Decrypt failures usually mean re-enter secrets after MASTER_KEY change.",
   "ops.checkinHint":
@@ -1805,4 +1847,101 @@ export const en: Dict = {
   "exchange.downloadSensitive": "Download sensitive export",
 
   "api.unreachable": "Unable to reach Meta Gateway",
+
+  "setup.title": "Setup guide",
+  "setup.progress": "{done}/{total}",
+  "setup.dismiss": "Skip, don't show again",
+  "setup.allDone": "All set — the gateway is ready to use.",
+  "setup.step1Title": "Add your first upstream connection",
+  "setup.step1Desc": "Enter the upstream base URL and API key so the gateway has a channel to relay through.",
+  "setup.step2Title": "Sync models",
+  "setup.step2Desc": "Click “Sync models” on the connection to pull the list; auto sync adopts everything, on-demand lets you pick.",
+  "setup.step3Title": "Create a downstream API key",
+  "setup.step3Desc": "Callers use this key to reach the gateway.",
+  "setup.step4Title": "Make the first call",
+  "setup.step4Desc": "Replace the key and model in the curl below; a 200 response means you are relayed.",
+  "setup.go": "Go",
+  "setup.copy": "Copy",
+  "setup.copied": "Copied",
+
+  "tour.navTitle": "Navigation",
+  "tour.navDesc":
+    "“Connections” manages upstream channels, “Keys” holds the keys you hand to callers, “Logs” traces every relay attempt.",
+  "tour.endpointTitle": "API endpoint",
+  "tour.endpointDesc": "Point caller base_url here; the API is OpenAI-compatible.",
+  "tour.guideTitle": "Four-step checklist",
+  "tour.guideDesc": "Finish the steps and you are relaying; ticks reflect real state, not clicks.",
+  "tour.telemetryTitle": "Live telemetry",
+  "tour.telemetryDesc": "Traffic, channel health and model usage update here in real time.",
+  "tour.addTitle": "Start here: add a connection",
+  "tour.addDesc": "Click “Add connection”, enter the upstream URL and API key, and the gateway has a channel to relay through.",
+  "tour.syncTitle": "Pick a sync mode",
+  "tour.syncDesc": "Auto sync adopts every probed model; on demand adopts only what you pick. Change it here any time.",
+  "tour.keysTitle": "Create a downstream key",
+  "tour.keysDesc": "Click “Create” to mint a key for callers — their credential to reach the gateway.",
+  "tour.logsTitle": "Relay logs",
+  "tour.logsDesc": "Channel, model and latency for every request; start here when something misbehaves.",
+  "tour.checkinsTitle": "Automated check-in",
+  "tour.checkinsDesc":
+    "Turn it on and the gateway checks in to upstream sites on a schedule; logs and external check-ins live here too.",
+  "tour.checkinsOffDesc":
+    "The check-in module is off — enable it in the Store and this page will schedule automatic check-ins for you.",
+  "tour.settingsRelayTitle": "Relay failover",
+  "tour.settingsRelayDesc":
+    "Automatic channel failover, key pool rotation and retry counts — relay resilience lives in this card.",
+  "tour.settingsSyncTitle": "Model sync",
+  "tour.settingsSyncDesc":
+    "Change the default sync mode for new connections here — the same choice you made in the setup wizard.",
+  "tour.settingsAlertsTitle": "Alert notifications",
+  "tour.settingsAlertsDesc":
+    "Fill in a webhook, Bark, Telegram or email to know the moment a channel fails.",
+  "tour.next": "Next",
+  "tour.prev": "Back",
+  "tour.done": "Finish",
+  "tour.progress": "{{current}} / {{total}}",
+
+  "wizard.title": "Meta Gateway setup",
+  "wizard.subtitle": "One minute of initial configuration; everything can be changed later in the console.",
+  "wizard.skip": "Skip wizard",
+  "wizard.stepWelcome": "Welcome",
+  "wizard.stepConnection": "Upstream",
+  "wizard.stepKey": "Downstream key",
+  "wizard.stepDone": "Done",
+  "wizard.welcomeTitle": "Welcome to Meta Gateway",
+  "wizard.welcomeDesc":
+    "A multi-channel AI gateway that aggregates upstreams into one OpenAI-compatible endpoint. Spend a minute on the initial setup.",
+  "wizard.modeTitle": "Default sync mode for new connections",
+  "wizard.modeDesc": "Decides how models probed on each new connection enter the gateway; only affects connections created later.",
+  "wizard.modeAuto": "Auto sync — adopt everything probed, hands-off",
+  "wizard.modeManual": "Pick on demand — adopt only what you choose, full control",
+  "wizard.modeSaved": "Saved as the system default",
+  "wizard.connTitle": "Add your first upstream connection",
+  "wizard.connDesc": "Enter the upstream URL and key manually, or import an AAH plugin backup.",
+  "wizard.manualTab": "Manual entry",
+  "wizard.importTab": "Import from AAH backup",
+  "wizard.importHint":
+    "Pick the automatic backup JSON exported by the AAH plugin; the gateway imports its connections and adopts them.",
+  "wizard.pickFile": "Choose backup file",
+  "wizard.importDone": "Import complete: {created} created, {updated} updated.",
+  "wizard.importInvalid": "Could not parse the file as a JSON backup.",
+  "wizard.createConn": "Create connection",
+  "wizard.name": "Name (optional)",
+  "wizard.baseUrl": "Base URL",
+  "wizard.secret": "Upstream API key",
+  "wizard.connCreated": "Connection created",
+  "wizard.trySync": "Try syncing models",
+  "wizard.syncing": "Syncing (may take a while)…",
+  "wizard.synced": "Models synced",
+  "wizard.syncFail": "Sync failed: check the upstream key, then retry from the connection page.",
+  "wizard.keyTitle": "Create a downstream key",
+  "wizard.keyDesc": "The credential callers use against the gateway — just give it a name.",
+  "wizard.keyName": "Key name",
+  "wizard.createKey": "Create key",
+  "wizard.keyCreated": "Key created — view it any time on the Keys page.",
+  "wizard.doneTitle": "All set",
+  "wizard.doneDesc": "Point caller base_url at the address below and call with your key.",
+  "wizard.next": "Next",
+  "wizard.back": "Back",
+  "wizard.later": "Do it later",
+  "wizard.enter": "Enter the console",
 };

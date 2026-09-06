@@ -4,6 +4,86 @@ All notable changes to Meta Gateway are documented here. Versions follow
 [SemVer](https://semver.org/); each entry lands together with its git tag and
 Docker image (`zichuanlan/meta-gateway:<version>`).
 
+## [Unreleased]
+
+## [v2.3.1] — 2026-09-06
+
+### Added
+
+- The runtime schedule fields (定时模型同步 / 探测计划) use the same
+  preset picker as check-in instead of a raw cron input: off / hourly /
+  every 3-12 hours / daily at a picked time / custom cron, with the empty
+  (disabled) state spelled out instead of a blank text box
+
+### Changed
+
+- The channel edit drawer moved 用户 Access Token / 用户 Cookie out of the
+  main form into the advanced section, and only shows them for site
+  families that can actually use them (New-API-family account surfaces;
+  cookie-only for generic external check-in). Plain OpenAI-compatible
+  relays, official provider APIs, and unsupported families no longer show
+  the fields at all — unless a credential is already stored, so it stays
+  clearable
+
+## [v2.3.0] — 2026-09-06
+
+### Added
+
+- A guided picker for the per-channel model sync mode (auto vs on-demand) in
+  the channel edit drawer, the add-channel dialog, and a quick auto/manual
+  switch on the channel models page: mode cards with trade-offs, a preview
+  of what the next sync will do, live "N models · M adopted" counters, the
+  inherit-system-default marker, and a collapsible "how do the modes
+  differ?" explainer
+- `POST /admin/connections` accepts an optional `model_sync_mode`
+  (`auto`/`manual`; empty inherits the system default)
+- The channel models page telemetry now pairs model total with adopted,
+  enabled, and aliased counts, and manual-mode channels with pending
+  candidates show a "N not adopted yet" hint instead of a bare 0
+- The add-route dialog can auto-match channels serving the model: it lists
+  every enabled channel whose models.csv or discovery snapshot matches the
+  pattern (`GET /admin/discovery/model-channels` previews the match) with
+  per-channel checkboxes, all selected by default, and only the checked
+  ones are attached as members (`auto_match_channel_ids` on
+  `POST /admin/routes`). A route that already carries the pattern is
+  reused — the checked channels attach to it — instead of failing with
+  "already exists"
+- The unify assistant can now re-unify restored originals: a group whose
+  canonical route exists but whose original name is exposed again (restored
+  from history) stays listed with an "N exposed originals" badge, and
+  applying hides the duplicates once more
+- The channel overview and list report the discovered candidate count
+  (`discovered_model_count`) next to the adopted model count, so
+  manual-mode channels read as "N of M adopted" instead of a bare 0
+
+### Fixed
+
+- The channel edit drawer no longer forgets the model sync mode:
+  `ListOverviews` (the endpoint the form seeds from) omitted the
+  `model_sync_mode` column — along with `max_reasoning_effort`,
+  `payload_rules`, `max_concurrent`, and `proxy_url` — so the empty
+  read-back normalized to "manual" and a saved auto-sync channel reopened
+  as on-demand; the columns are now selected, scanned, and normalized, with
+  a regression test covering the projection
+- The channel list model column no longer shows a stark bold 0 for channels
+  without models: synced-but-nothing-adopted renders a muted 0 with a
+  tooltip pointing at the models page or auto sync, never-synced renders a
+  muted dash (mirroring the latency column), and adopted counts stay bold
+- Unify apply no longer leaves a silent dead alias: a pre-existing disabled
+  route with the canonical name is re-enabled, recorded as its own
+  undoable op
+- Unify undo refuses to delete a created route that still carries members
+  from another batch or added by hand, instead of cascading them away
+- Unify history counts only the still-hidden originals per batch and keeps
+  restored entries visible (greyed out) so a restore leaves a trace
+- Jumping from the models page to a channel's model settings drawer no
+  longer needs closing it twice: the deep-link effect is one-shot per
+  navigation (a close committed before the router's param transition used
+  to re-fire it with the stale `?channel=` URL) and closing strips the
+  resurrected param
+- Info tips in checkbox labels stay inline after the label instead of
+  wrapping onto their own line
+
 ## [v2.2.0] — 2026-08-31
 
 ### Added

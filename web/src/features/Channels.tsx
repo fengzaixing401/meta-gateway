@@ -120,6 +120,12 @@ export function Channels() {
   );
   // Synchronous lock for the create-key dialog (see onCreate re-entry guard).
   const createKeyLocked = useRef(false);
+  // Channel id the deep-link effect already popped the models drawer for.
+  // setModelsChannel(null) commits before the router's transition-wrapped
+  // param updates, so the effect re-runs with the stale ?channel= URL right
+  // after a close — without this marker it would re-open the drawer and the
+  // user would have to close it twice.
+  const deepLinkOpened = useRef<number | null>(null);
   const [contextMenu, setContextMenu] = useState<{
     channelId: number;
     top: number;
@@ -157,6 +163,37 @@ export function Channels() {
   useEffect(() => {
     if (searchParam) setQuery(searchParam);
   }, [searchParam]);
+  // Deep-link from the models page (?channel=<id>): pop that channel's model
+  // management drawer open so the user lands directly on the right tab.
+  useEffect(() => {
+    const target = positiveId(params.get("channel"));
+    if (!target || modelsChannel?.id === target) return;
+    // One-shot per navigation: re-running with the same target (a close
+    // committing before the router's param transition) must not re-open.
+    if (deepLinkOpened.current === target) return;
+    const overview = (overviews.data ?? []).find(
+      (entry) => entry.channel.id === target,
+    )?.channel;
+    if (overview) {
+      deepLinkOpened.current = target;
+      setModelsChannel(overview);
+      const next = new URLSearchParams(params);
+      next.delete("channel");
+      setParams(next, { replace: true });
+    }
+  }, [params, overviews.data, modelsChannel, setParams]);
+  // Closing strips the deep-link ?channel= param too: the auto-select effects
+  // below run in the same commit that opens the drawer and re-add the param
+  // from the stale searchParams snapshot, and a surviving param would make the
+  // deep-link effect re-open the drawer right after this close.
+  const closeModelsDrawer = () => {
+    setModelsChannel(null);
+    if (params.has("channel")) {
+      const next = new URLSearchParams(params);
+      next.delete("channel");
+      setParams(next, { replace: true });
+    }
+  };
   useEffect(() => {
     const next = params.get("health") as ConnectionHealthFilter | null;
     if (next === "ready" || next === "missing_key" || next === "attention") {
@@ -238,6 +275,9 @@ export function Channels() {
         type_hint: input.type_hint || "openai-compatible",
         group_name: input.group_name?.trim() || "default",
         status: "enabled",
+        // Explicit choice from the dialog; undefined would silently inherit
+        // the system default, which is exactly what used to confuse people.
+        model_sync_mode: input.model_sync_mode,
       }),
     invalidateKeys: [...INVALIDATE],
     toastOnError: false,
@@ -1290,6 +1330,7 @@ export function Channels() {
                     t("common.name"),
                     t("common.status"),
                     t("common.models"),
+                    t("channels.modelsSelectedCol"),
                     t("common.latency"),
                     t("common.actions"),
                   ]}
@@ -1371,8 +1412,31 @@ export function Channels() {
                             ) : null}
                           </div>
                         </td>
-                        <td>
-                          <strong>{overview.model_count}</strong>
+                        <td
+                          title={t("channels.modelsTotalHint")}
+                        >
+                          {overview.last_checked_at ? (
+                            overview.discovered_model_count > 0 ? (
+                              <strong>{overview.discovered_model_count}</strong>
+                            ) : (
+                              <span className="muted">0</span>
+                            )
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
+                        </td>
+                        <td
+                          title={
+                            overview.model_count > 0
+                              ? t("channels.modelsAdoptedHint")
+                              : t("channels.modelsNoneAdoptedHint")
+                          }
+                        >
+                          {overview.model_count > 0 ? (
+                            <strong>{overview.model_count}</strong>
+                          ) : (
+                            <span className="muted">0</span>
+                          )}
                         </td>
                         <td>
                           {overview.last_checked_at
@@ -1497,6 +1561,10 @@ export function Channels() {
       ) : null}
       {edit ? (
         <EditChannelDialog
+          // Remount per channel: every field seeds from `value`, so reusing
+          // the instance across rows would leave the previous channel's
+          // values (notably the sync mode radio) in the form.
+          key={edit.id}
           value={edit}
           routeOverviews={routeOverviewsQuery.data}
           site={edit.site_id != null ? siteById.get(edit.site_id) : undefined}
@@ -1551,6 +1619,11 @@ export function Channels() {
             setModelsChannel(null);
             setKeysChannel(edit);
           }}
+          onRefreshModels={() => {
+            refresh.reset();
+            refresh.mutate(edit.id);
+          }}
+          refreshingModels={refresh.pendingId === edit.id}
         />
       ) : null}
       {createKeyChannel ? (
@@ -1607,9 +1680,9 @@ export function Channels() {
         <Drawer
           title={t("channels.modelsSection")}
           width={780}
-          onClose={() => setModelsChannel(null)}
+          onClose={closeModelsDrawer}
           footer={
-            <Button variant="secondary" onClick={() => setModelsChannel(null)}>
+            <Button variant="secondary" onClick={closeModelsDrawer}>
               {t("common.close")}
             </Button>
           }

@@ -7182,6 +7182,18 @@ td.actions {
   vertical-align: middle;
   flex-wrap: wrap;
 }
+
+/* Inline link in the models table that jumps to the channel's model settings. */
+.upstream-link {
+  color: inherit;
+  text-decoration: none;
+  border-bottom: 1px dashed transparent;
+  transition: border-color 0.12s ease, color 0.12s ease;
+}
+.upstream-link:hover {
+  border-bottom-color: currentColor;
+  color: var(--accent, #6366f1);
+}
 .model-meta-badge {
   padding: 1px 6px;
   border-radius: var(--radius);
@@ -8584,62 +8596,195 @@ td.actions {
   height: 1px;
   background: var(--line);
 }
-.sync-mode-picker {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-  margin: 10px 0 12px;
-}
-.sync-mode-option {
+/* —— Model sync mode: compact segmented control ——
+   One row: toggle + help popover + muted counts. Guidance lives in the
+   hover/focus popover instead of dominating the drawer. */
+.sync-mode {
   display: flex;
-  align-items: flex-start;
-  gap: 9px;
-  padding: 10px 12px;
+  flex-direction: column;
+  gap: 4px;
+  margin: 10px 0;
+}
+.sync-mode-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.sync-mode-toggle {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--surface-subtle);
   border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--surface);
+  border-radius: 8px;
+}
+.sync-mode-toggle button {
+  border: 0;
+  background: transparent;
+  padding: 4px 14px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  color: var(--muted);
+  border-radius: 6px;
   cursor: pointer;
   transition: all var(--dur-hover) var(--ease-hover);
 }
-.sync-mode-option:hover {
-  border-color: var(--line-strong);
-  background: var(--surface-subtle);
-}
-.sync-mode-option input {
-  width: auto;
-  min-height: 0;
-  margin: 2px 0 0;
-  accent-color: var(--primary);
-  cursor: pointer;
-}
-.sync-mode-option span {
-  display: block;
-  min-width: 0;
-}
-.sync-mode-option strong {
-  display: block;
-  font-size: 13px;
-  font-weight: 650;
+.sync-mode-toggle button:hover {
   color: var(--ink);
 }
-.sync-mode-option small {
-  display: block;
-  margin-top: 2px;
-  font-size: 12px;
-  line-height: 1.45;
-  color: var(--muted);
+.sync-mode-toggle button.is-active {
+  background: var(--surface);
+  color: var(--primary-active);
+  box-shadow: 0 1px 2px rgba(15, 42, 66, 0.08);
 }
-.sync-mode-option.is-active {
-  border-color: color-mix(in srgb, var(--primary) 55%, var(--line));
-  background: var(--primary-soft);
+.sync-mode-info {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  color: var(--muted-dark);
+  cursor: help;
+  outline: none;
 }
-.sync-mode-option.is-active strong {
+.sync-mode-info:hover,
+.sync-mode-info:focus-within {
   color: var(--primary-active);
 }
-@media (max-width: 600px) {
-  .sync-mode-picker {
-    grid-template-columns: 1fr;
-  }
+.sync-mode-pop {
+  display: none;
+  position: absolute;
+  top: calc(100% + 8px);
+  left: -10px;
+  z-index: 40;
+  width: 300px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(15, 42, 66, 0.12);
+}
+.sync-mode-info:hover .sync-mode-pop,
+.sync-mode-info:focus-within .sync-mode-pop {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sync-mode-pop strong {
+  font-size: 12px;
+  color: var(--ink);
+}
+.sync-mode-pop-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.sync-mode-pop-row b {
+  color: var(--ink-soft);
+  font-weight: 600;
+}
+.sync-mode-pop-row em {
+  font-style: normal;
+}
+.sync-mode-pop-row em.is-pro::before {
+  content: "+ ";
+  color: var(--success);
+}
+.sync-mode-pop-row em.is-con::before {
+  content: "− ";
+}
+.sync-mode-pop-row.is-switch {
+  padding-top: 6px;
+  border-top: 1px dashed var(--line);
+  color: var(--muted-strong);
+}
+.sync-mode-counts {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.sync-mode-default {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted-dark);
+}
+
+/* Sync-mode bar on the channel models panel: states the rule that governs
+   the adoption list right where models are adopted. */
+.channel-models-syncbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  padding: 9px 12px;
+  background: var(--surface-raised);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--accent);
+}
+.channel-models-syncbar.is-auto {
+  border-left-color: var(--primary-active);
+}
+.channel-models-syncbar-copy {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.channel-models-syncbar-copy strong {
+  font-size: 12.5px;
+  color: var(--ink);
+}
+.channel-models-syncbar-copy span {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+.channel-models-syncbar-switch {
+  display: inline-flex;
+  flex-shrink: 0;
+  border: 1px solid var(--line-strong);
+}
+.channel-models-syncbar-option {
+  padding: 4px 11px;
+  border: 0;
+  background: var(--surface);
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--muted-strong);
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+.channel-models-syncbar-option + .channel-models-syncbar-option {
+  border-left: 1px solid var(--line);
+}
+.channel-models-syncbar-option:hover:not(:disabled) {
+  background: var(--surface-subtle);
+  color: var(--ink);
+}
+.channel-models-syncbar-option.is-active {
+  background: var(--primary-soft);
+  color: var(--primary-active);
+  font-weight: 600;
+}
+.channel-models-syncbar-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.channel-models-tip {
+  margin: -2px 0 10px;
+}
+.detail-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
 }
 .channel-model-row {
   display: flex;
@@ -13161,4 +13306,445 @@ table {
 }
 .runtime-update-link:hover {
   color: var(--accent);
+}
+
+/* —— First-run setup guide (dashboard checklist) ——
+   Shows while the gateway has no upstream connections; each step reflects
+   real state (channels / adopted models / keys / relay logs). */
+.setup-guide {
+  margin-bottom: 14px;
+}
+.setup-guide-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.setup-guide-progress {
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.setup-guide-dismiss {
+  border: 0;
+  background: none;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--muted-dark);
+  cursor: pointer;
+  padding: 0;
+}
+.setup-guide-dismiss:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
+.setup-guide-complete {
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  color: var(--success);
+}
+.setup-guide-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.setup-guide-steps li {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+.setup-guide-steps li:first-child {
+  border-top: 0;
+}
+.setup-guide-check {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-top: 1px;
+  border-radius: 50%;
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+}
+.setup-guide-steps li.is-done .setup-guide-check {
+  background: var(--success);
+  border-color: var(--success);
+  color: #fff;
+}
+.setup-guide-body {
+  flex: 1;
+  min-width: 0;
+}
+.setup-guide-body strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.setup-guide-steps li.is-done .setup-guide-body strong {
+  color: var(--muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--line-strong);
+}
+.setup-guide-body p {
+  margin: 1px 0 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+.setup-guide-go {
+  flex: none;
+  align-self: center;
+  font-size: 12px;
+  color: var(--primary-active);
+  text-decoration: none;
+}
+.setup-guide-go:hover {
+  text-decoration: underline;
+}
+.setup-guide-curl {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-subtle);
+  overflow: hidden;
+}
+.setup-guide-curl-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+}
+.setup-guide-curl-head button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  background: none;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0;
+}
+.setup-guide-curl-head button:hover {
+  color: var(--ink);
+}
+.setup-guide-curl pre {
+  margin: 0;
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+  overflow-x: auto;
+}
+
+/* —— Guided tour (driver.js spotlight) ——
+   Restyle the stock popover to match the console's hairline aesthetic. */
+.driver-popover {
+  max-width: 320px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line-strong);
+  box-shadow: 0 12px 32px rgba(15, 42, 66, 0.16);
+  font-family: inherit;
+}
+.driver-popover-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.driver-popover-description {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+.driver-popover-progress-text {
+  font-size: 11px;
+  color: var(--muted-dark);
+}
+.driver-popover-close-btn {
+  color: var(--muted);
+}
+.driver-popover-navigation-btns button {
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 6px;
+}
+.driver-popover-navigation-btns button:last-child {
+  background: var(--primary-active);
+  color: #fff;
+  border: 1px solid var(--primary-active);
+}
+.driver-popover-navigation-btns button:first-child {
+  background: var(--surface);
+  color: var(--ink-soft);
+  border: 1px solid var(--line-strong);
+}
+
+/* —— First-run setup wizard (full-screen page, /setup) ——
+   The decision-making counterpart to the spotlight tour: collects the
+   day-one choices (default sync mode, first connection, first key). */
+.setup-wizard {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 16px;
+  background: var(--bg-canvas);
+}
+.setup-wizard-card {
+  width: 100%;
+  max-width: 540px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 26px 30px;
+}
+.setup-wizard-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.setup-wizard-head strong {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--ink);
+}
+.setup-wizard-skip {
+  border: 0;
+  background: none;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--muted-dark);
+  cursor: pointer;
+  padding: 0;
+}
+.setup-wizard-skip:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
+.setup-wizard-subtitle {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.setup-wizard-dots {
+  display: flex;
+  gap: 6px;
+  margin: 16px 0 18px;
+}
+.setup-wizard-dots span {
+  width: 26px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--line);
+}
+.setup-wizard-dots span.is-on {
+  background: var(--primary-active);
+}
+.setup-wizard-card h2 {
+  margin: 0 0 4px;
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--ink);
+}
+.setup-wizard-card h3 {
+  margin: 16px 0 2px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.setup-wizard-desc {
+  margin: 0 0 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+.setup-wizard-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 14px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+}
+.setup-wizard-tabs button {
+  flex: 1;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 6px 10px;
+  transition: background var(--dur-hover) var(--ease-hover),
+    color var(--dur-hover) var(--ease-hover);
+}
+.setup-wizard-tabs button:hover {
+  color: var(--ink);
+}
+.setup-wizard-tabs button.is-active {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.06);
+}
+.setup-wizard-file {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 22px 14px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  font-size: 12.5px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: border-color var(--dur-hover) var(--ease-hover),
+    color var(--dur-hover) var(--ease-hover),
+    background var(--dur-hover) var(--ease-hover);
+}
+.setup-wizard-file:hover {
+  border-color: var(--primary);
+  color: var(--ink);
+  background: var(--primary-soft);
+}
+.setup-wizard-file:has(input:disabled) {
+  cursor: default;
+  opacity: 0.6;
+}
+.setup-wizard-file input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.setup-wizard-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color var(--dur-hover) var(--ease-hover);
+}
+.setup-wizard-option:hover {
+  border-color: var(--line-strong);
+}
+.setup-wizard-option.is-active {
+  border-color: color-mix(in srgb, var(--primary) 55%, var(--line));
+  background: var(--primary-soft);
+}
+.setup-wizard-option input {
+  width: auto;
+  min-height: 0;
+  margin: 2px 0 0;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+.setup-wizard-option strong {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.setup-wizard-option small {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.setup-wizard-ok {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 8px 0;
+  font-size: 12px;
+  color: var(--success);
+}
+.setup-wizard-error {
+  margin: 0 0 10px;
+  padding: 7px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-radius: 8px;
+}
+.setup-wizard-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 18px;
+}
+.setup-wizard-curl {
+  margin: 14px 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+  overflow: hidden;
+}
+.setup-wizard-curl-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+}
+.setup-wizard-curl-head button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  background: none;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0;
+}
+.setup-wizard-curl-head button:hover {
+  color: var(--ink);
+}
+.setup-wizard-curl pre {
+  margin: 0;
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+  overflow-x: auto;
+}
+
+/* Preset dropdown + conditional time picker for runtime cron schedules. */
+.cron-schedule-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cron-schedule-picker select {
+  width: auto;
+  flex: 0 0 auto;
 }

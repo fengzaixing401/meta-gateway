@@ -1,4 +1,5 @@
-import { ChevronDown, ExternalLink } from "lucide-react";
+import { ChevronDown, ExternalLink, RefreshCw } from "lucide-react";
+import { useMemo } from "react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
@@ -17,7 +18,8 @@ import {
   uaFromHeaderOverride,
 } from "../../lib/uaPresets";
 import { useSession } from "../../session";
-import { SECRET_MASK, TYPE_GROUPS, TYPE_OPTIONS } from "./helpers";
+import { SECRET_MASK, TYPE_GROUPS, TYPE_OPTIONS, userAuthFieldsFor } from "./helpers";
+import { SyncModePicker, type ModelSyncMode } from "./SyncModePicker";
 
 export function EditChannelDialog({
   value,
@@ -34,6 +36,8 @@ export function EditChannelDialog({
   onSave,
   onManageModels,
   onManageKeys,
+  onRefreshModels,
+  refreshingModels,
 }: {
   value: Channel;
   routeOverviews?: RouteOverview[];
@@ -70,6 +74,8 @@ export function EditChannelDialog({
 	pending: boolean;
   error: unknown;
   onClose: () => void;
+  onRefreshModels?: () => void;
+  refreshingModels?: boolean;
   onSave: (value: {
     channel: Channel;
     site?: Site;
@@ -100,7 +106,7 @@ export function EditChannelDialog({
     header_override?: string;
     system_prompt?: string;
     retry_config?: string;
-    model_sync_mode: "auto" | "manual";
+    model_sync_mode: ModelSyncMode;
     stable_first?: boolean;
     userToken: string;
     userCookie: string;
@@ -117,6 +123,17 @@ export function EditChannelDialog({
   const [typeHint, setTypeHint] = useState(
     value.type_hint || site?.platform || "openai-compatible",
   );
+  // 用户 Access Token / 用户 Cookie only make sense for site families with
+  // account surfaces (check-in, balance, key creation). They live in the
+  // advanced section and disappear entirely for types that cannot use them.
+  const authFields = userAuthFieldsFor(typeHint);
+  const showUserTokenField =
+    authFields === "both" ||
+    (authFields === "none" && Boolean(userCredential?.has_secret));
+  const showUserCookieField =
+    authFields === "both" ||
+    authFields === "cookie" ||
+    Boolean(userCredential?.has_cookie);
   const [groupName, setGroupName] = useState(value.group_name || "default");
   const [maxReasoningEffort, setMaxReasoningEffort] = useState(
     value.max_reasoning_effort ?? "",
@@ -138,7 +155,7 @@ export function EditChannelDialog({
   };
   const [systemPrompt, setSystemPrompt] = useState(value.system_prompt ?? "");
   const [retryConfig, setRetryConfig] = useState(value.retry_config ?? "");
-  const [syncMode, setSyncMode] = useState<"auto" | "manual">(
+  const [syncMode, setSyncMode] = useState<ModelSyncMode>(
     value.model_sync_mode === "auto" ? "auto" : "manual",
   );
   const [stableFirst, setStableFirst] = useState(value.stable_first ?? false);
@@ -175,17 +192,18 @@ export function EditChannelDialog({
 		},
 		invalidateKeys: [["credentials"], ["channel-overviews"]],
 	});
+  // mappingReal parses a {"real":"…"} mapping value; empty when absent.
+  const mappingReal = (raw: string | undefined): string => {
+    if (!raw) return "";
+    try {
+      const parsed = JSON.parse(raw) as { real?: string };
+      return parsed.real ?? "";
+    } catch {
+      return "";
+    }
+  };
   const aliasOf = (realModel: string) =>
     routeOverviews?.find((overview) => {
-      const mappingReal = (raw: string | undefined): string => {
-        if (!raw) return "";
-        try {
-          const parsed = JSON.parse(raw) as { real?: string };
-          return parsed.real ?? "";
-        } catch {
-          return "";
-        }
-      };
       const onChannel = (overview.members ?? []).some(
         (member) => member.member.channel_id === value.id,
       );
@@ -199,6 +217,28 @@ export function EditChannelDialog({
           mappingReal(overview.route.mapping_json) === realModel)
       );
     });
+
+  // Real model names this channel already serves, resolved through alias
+  // mappings ({"real": …} on the member, falling back to the route) so the
+  // counter stays correct for renamed models. Powers the "N models · M
+  // adopted" readout: in manual mode M is 0 by design, and a bare zero reads
+  // as a bug unless the total is shown next to it.
+  const adoptedCount = useMemo(() => {
+    const bound = new Set<string>();
+    for (const overview of routeOverviews ?? []) {
+      const routeReal = mappingReal(overview.route.mapping_json);
+      for (const wrapped of overview.members ?? []) {
+        if (wrapped.member.channel_id !== value.id) continue;
+        const memberReal = mappingReal(wrapped.member.mapping_json);
+        if (memberReal) bound.add(memberReal);
+        else if (routeReal) bound.add(routeReal);
+        else bound.add(overview.route.model_pattern);
+      }
+    }
+    return (discovered.data ?? []).filter((model) =>
+      bound.has(model.model_name),
+    ).length;
+  }, [routeOverviews, discovered.data, value.id]);
 
   return (
     <Drawer
@@ -290,49 +330,7 @@ export function EditChannelDialog({
               disabled={pending}
             />
           </Field>
-          <Field
-            label={t("channels.userToken")}
-            hint={
-              userCredential?.has_secret
-                ? t("channels.userTokenPresentHint")
-                : t("channels.userTokenHint")
-            }
-          >
-            <input
-              type="password"
-              autoComplete="new-password"
-              value={userToken}
-              onChange={(e) => setUserToken(e.target.value)}
-              placeholder={
-                userCredential?.has_secret
-                  ? t("channels.editSecretPlaceholder")
-                  : t("channels.userTokenEmptyPlaceholder")
-              }
-              disabled={pending}
-            />
-          </Field>
-								<Field
-									label={t("channels.userCookie")}
-									hint={
-										userCredential?.has_cookie
-											? t("channels.userCookiePresentHint")
-											: t("channels.userCookieHint")
-									}
-								>
-									<input
-										type="password"
-										autoComplete="new-password"
-										value={userCookie}
-										onChange={(e) => setUserCookie(e.target.value)}
-										placeholder={
-											userCredential?.has_cookie
-												? t("channels.editSecretPlaceholder")
-												: t("channels.userCookiePlaceholder")
-										}
-										disabled={pending}
-									/>
-								</Field>
-							</div>
+		</div>
 
 							<section
 								className="detail-section connection-subpanel"
@@ -468,43 +466,39 @@ export function EditChannelDialog({
           <div className="detail-section-head">
             <h3>{t("channels.modelsSection")}</h3>
             <span className="detail-section-count">{editModels.length}</span>
-            <button
-              type="button"
-              className="detail-section-expand connection-manage-button connection-manage-button-models"
-              onClick={onManageModels}
-            >
-              <ExternalLink size={12} />
-              {t("channels.modelsManage")}
-            </button>
+            <div className="detail-section-actions">
+              {onRefreshModels ? (
+                <button
+                  type="button"
+                  className="detail-section-expand connection-manage-button"
+                  onClick={onRefreshModels}
+                  disabled={pending || refreshingModels}
+                  title={t("channels.fetchModels")}
+                >
+                  <RefreshCw
+                    size={12}
+                    className={refreshingModels ? "spin" : undefined}
+                  />
+                  {t("channels.fetchModels")}
+                </button>
+              ) : null}
+              <button
+                type="button"
+                className="detail-section-expand connection-manage-button connection-manage-button-models"
+                onClick={onManageModels}
+              >
+                <ExternalLink size={12} />
+                {t("channels.modelsManage")}
+              </button>
+            </div>
           </div>
-          <div className="sync-mode-picker" role="radiogroup" aria-label={t("channels.syncMode")}>
-            <label className={`sync-mode-option${syncMode === "auto" ? " is-active" : ""}`}>
-              <input
-                type="radio"
-                name="sync-mode"
-                checked={syncMode === "auto"}
-                disabled={pending}
-                onChange={() => setSyncMode("auto")}
-              />
-              <span>
-                <strong>{t("channels.syncModeAuto")}</strong>
-                <small>{t("channels.syncModeAutoHint")}</small>
-              </span>
-            </label>
-            <label className={`sync-mode-option${syncMode === "manual" ? " is-active" : ""}`}>
-              <input
-                type="radio"
-                name="sync-mode"
-                checked={syncMode === "manual"}
-                disabled={pending}
-                onChange={() => setSyncMode("manual")}
-              />
-              <span>
-                <strong>{t("channels.syncModeManual")}</strong>
-                <small>{t("channels.syncModeManualHint")}</small>
-              </span>
-            </label>
-          </div>
+          <SyncModePicker
+            value={syncMode}
+            onChange={setSyncMode}
+            disabled={pending}
+            modelCount={discovered.data ? editModels.length : null}
+            adoptedCount={adoptedCount}
+          />
           {discovered.isLoading ? (
             <p className="detail-section-empty is-quiet">
               {t("common.loading")}…
@@ -547,6 +541,56 @@ export function EditChannelDialog({
         </div>
         {showAdvanced ? (
           <div className="advanced-fields">
+            {showUserTokenField || showUserCookieField ? (
+              <div className="form-grid">
+                {showUserTokenField ? (
+                  <Field
+                    label={t("channels.userToken")}
+                    hint={
+                      userCredential?.has_secret
+                        ? t("channels.userTokenPresentHint")
+                        : t("channels.userTokenHint")
+                    }
+                  >
+                    <input
+                      type="password"
+                      autoComplete="new-password"
+                      value={userToken}
+                      onChange={(e) => setUserToken(e.target.value)}
+                      placeholder={
+                        userCredential?.has_secret
+                          ? t("channels.editSecretPlaceholder")
+                          : t("channels.userTokenEmptyPlaceholder")
+                      }
+                      disabled={pending}
+                    />
+                  </Field>
+                ) : null}
+                {showUserCookieField ? (
+                  <Field
+                    label={t("channels.userCookie")}
+                    hint={
+                      userCredential?.has_cookie
+                        ? t("channels.userCookiePresentHint")
+                        : t("channels.userCookieHint")
+                    }
+                  >
+                    <input
+                      type="password"
+                      autoComplete="new-password"
+                      value={userCookie}
+                      onChange={(e) => setUserCookie(e.target.value)}
+                      placeholder={
+                        userCredential?.has_cookie
+                          ? t("channels.editSecretPlaceholder")
+                          : t("channels.userCookiePlaceholder")
+                      }
+                      disabled={pending}
+                    />
+                  </Field>
+                ) : null}
+              </div>
+            ) : null}
             <div className="form-grid">
               <Field
                 label={t("common.priority")}
