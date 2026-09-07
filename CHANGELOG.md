@@ -6,6 +6,40 @@ Docker image (`zichuanlan/meta-gateway:<version>`).
 
 ## [Unreleased]
 
+## [v2.3.3] — 2026-09-06
+
+### Fixed
+
+- The logs page status column no longer shows a misaligned green dot: the
+  colored status light and the status badge now share one vertically
+  centered row, and the badge's redundant built-in dot is hidden
+- The connection type picker no longer freezes when typing Chinese: the
+  search box stayed mounted only while more than four options matched, so
+  two letters unmounted the input mid-composition and stranded the IME.
+  Whether the box appears is now decided once when the panel opens
+
+### Maintenance
+
+- CI is green again: restore gofmt struct-tag alignment (failing since
+  v2.3.1) and remove a data race in the probe service tests that
+  `go test -race` flagged
+
+## [v2.3.2] — 2026-09-06
+
+### Added
+
+- Routing member rows: the channel name is clickable and jumps to that
+  channel's model management page (`/models/channel/:id`), pre-filtered on
+  the member's origin model via a `?model=` deep link (the route pattern
+  when the member has no origin)
+
+### Fixed
+
+- The unify dialog's "strip owner prefix" badge no longer shows a hardcoded
+  `deepseek-ai/` example: it names the prefix the group actually loses
+  (`meta/`, `deepseek-ai/`, one badge per distinct prefix), and the rule
+  checkbox label marks deepseek-ai/ as an example instead
+
 ## [v2.3.1] — 2026-09-06
 
 ### Added
