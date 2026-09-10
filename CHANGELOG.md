@@ -4,7 +4,42 @@ All notable changes to Meta Gateway are documented here. Versions follow
 [SemVer](https://semver.org/); each entry lands together with its git tag and
 Docker image (`zichuanlan/meta-gateway:<version>`).
 
-## [Unreleased]
+## [v2.4.0] — 2026-09-10
+
+### Added
+
+- Responses API translation: a client speaking OpenAI `/v1/responses` is now
+  served by ANY channel — native passthrough when the upstream has the
+  endpoint, an automatic one-shot chat/completions pivot on 404/405 for
+  OpenAI-compatible channels without it, and the translation matrix routes
+  Anthropic/Gemini channels through the chat pivot (`responses → anthropic / gemini` pairs).
+  Streams reshape into the Responses SSE event contract (`response.created`,
+  `output_text.delta`, `response.completed` …) and usage metering understands
+  `response.usage`.
+- Live request trace (admin API): `GET /admin/relay/live` streams in-memory
+  request states over SSE (running → target channel/round → success/failed/
+  canceled) and `POST /admin/relay/live/{request_id}/interrupt` cancels an
+  in-flight upstream attempt.
+- Console live-trace tab: the Logs page gains a "Live Trace" tab wired to
+  `/admin/relay/live` — real-time rows (model, target channel, round, status,
+  duration) with in-flight interrupt buttons, connection state, backoff
+  reconnect, and a bounded window of settled requests.
+
+## [v2.3.4] — 2026-09-10
+
+### Fixed
+
+- WebDAV scheduled sync no longer overwrites a key you saved or rotated in
+  the console: incremental imports now treat a credential with a cleared
+  `import_fingerprint` (the marker left by a manual secret edit) as locally
+  owned and skip the backup value, while import-managed credentials keep
+  their token-rotation semantics and empty creds are still backfilled
+
+### Changed
+
+- External check-in sends a browser `User-Agent` by default so
+  Cloudflare-fronted sites stop rejecting the bare Go client UA with 403;
+  per-credential custom headers still override it
 
 ## [v2.3.3] — 2026-09-06
 
