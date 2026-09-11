@@ -4,6 +4,52 @@ All notable changes to Meta Gateway are documented here. Versions follow
 [SemVer](https://semver.org/); each entry lands together with its git tag and
 Docker image (`zichuanlan/meta-gateway:<version>`).
 
+## [v2.5.1] — 2026-09-10
+
+### Added
+
+- Model discovery merges every enabled API key's list instead of stopping
+  at the first usable key: a New API host with one key per group now syncs
+  all groups' models (sorted, de-duplicated) instead of only whichever key
+  answered first. Keys that fail keep their previously recorded set, so a
+  transiently broken key never blanks its models.
+- Per-key visibility is snapshotted (`credential_models`) on every
+  successful refresh, and the relay's key pool filters each key by its
+  discovered set when no manual `models_csv` allowlist exists: a request
+  for a codex-group model only uses keys that actually list that model,
+  shared models still rotate across the pool; manual allowlists keep
+  precedence over learned sets.
+- Upstream key creation is offered again even when the site already has
+  keys (one key per group is the common setup), and the key drawer shows
+  how many models each key synced.
+
+## [v2.5.0] — 2026-09-10
+
+### Added
+
+- Upstream model change maintenance: the Models page surfaces a change
+  summary (added / possibly removed / impacted routes) and an expandable,
+  filterable history (channel, change type, handling status, model name).
+  Snapshots are compared per channel; the first successful sync establishes
+  a baseline, a failed sync never counts as removal, and a model missing
+  from one channel is reported as possibly removed — not as retired
+  everywhere.
+- The sync no longer silently deletes automatic members or routes when a
+  model disappears: bindings stay in place (IDs, overrides, health state
+  intact) so an operator can inspect and remap them.
+- Replacement workflow: select changes → pick a target model from the
+  current inventory (same-sync additions are shown as candidates, never
+  auto-guessed as "newer versions") → choose affected members → preview on
+  the server → confirm. Supports same-channel bulk replacement and an
+  explicit cross-channel choice; only the upstream mapping changes, public
+  model names, route names and other settings are preserved.
+- Preview tokens are state fingerprints: applying with a stale selection
+  (snapshot refresh, changed mapping, moved credential) is rejected with
+  409, so a preview you looked at applies exactly what it showed. Bulk
+  application rolls back atomically on failure.
+- Ignoring a change only dismisses the reminder; reappearing models are
+  tracked again, and outdated pending entries are resolved.
+
 ## [v2.4.0] — 2026-09-10
 
 ### Added

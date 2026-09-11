@@ -25,7 +25,9 @@ export interface Credential {
   meta_json?: string;
   status: Status;
   checkin_enabled: boolean;
-  models_csv?: string;
+models_csv?: string;
+  /** Distinct models this key listed in the latest discovery snapshot (-1 = none yet). */
+  model_count?: number;
   created_at?: string;
 }
 export interface Channel {
@@ -970,4 +972,49 @@ export interface WebDAVSettingsUpdate {
   clear_backup_password?: boolean;
   clear_upload_password?: boolean;
   clear_upload_backup_password?: boolean;
+}
+
+export interface ModelChangeMember {
+  member_id: number;
+  route_id: number;
+  route_name: string;
+  model_pattern: string;
+  channel_id: number;
+  upstream_model: string;
+  group_name: string;
+}
+export interface ModelChange {
+  id: number;
+  channel_id: number;
+  channel_name: string;
+  model_name: string;
+  kind: "added" | "removed";
+  status: "pending" | "ignored" | "applied" | "resolved";
+  detected_at: string;
+  candidates: string[];
+  members: ModelChangeMember[];
+}
+export interface ModelChangesResponse {
+  items: ModelChange[];
+  summary: { added: number; removed: number; affected_routes: number };
+}
+export interface ModelReplacementRequest {
+  change_ids: number[];
+  member_ids: number[];
+  target_channel_id: number;
+  target_model: string;
+  preview_token?: string;
+}
+export interface ModelReplacementPreview {
+  preview_token: string;
+  items: Array<{
+    member_id: number;
+    route_id: number;
+    route_name: string;
+    model_pattern: string;
+    source_channel_id: number;
+    source_model: string;
+    target_channel_id: number;
+    target_model: string;
+  }>;
 }

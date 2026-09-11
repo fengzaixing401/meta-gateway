@@ -13,14 +13,21 @@ import (
 // DiscoveredModelStore owns discovery snapshots and route reconciliation.
 type DiscoveredModelStore struct {
 	db *sql.DB
+	// credential invalidates the per-site model-set cache after snapshots
+	// rewrite a key's recorded models.
+	credential *CredentialStore
 }
 
 type ReconcileInput struct {
 	ChannelID int64
 	Models    []string
-	Source    string
-	LatencyMs int
-	CheckedAt time.Time
+	// CredentialModels records which models each credential could list in this
+	// successful snapshot (key -> model names). It is persisted so routing can
+	// pick a key that actually serves the requested model.
+	CredentialModels map[int64][]string
+	Source           string
+	LatencyMs        int
+	CheckedAt        time.Time
 }
 
 type ReconcileResult struct {
@@ -93,6 +100,9 @@ func (s *DiscoveredModelStore) Reconcile(ctx context.Context, input ReconcileInp
 	}
 	_ = rows.Close()
 
+	if err = recordModelChanges(tx, input, oldModels); err != nil {
+		return result, err
+	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM discovered_models WHERE channel_id = ?`, input.ChannelID); err != nil {
 		return result, fmt.Errorf("discovery reconcile clear snapshot: %w", err)
 	}
@@ -106,9 +116,21 @@ func (s *DiscoveredModelStore) Reconcile(ctx context.Context, input ReconcileInp
 		return result, fmt.Errorf("discovery reconcile channel models: %w", err)
 	}
 
-	current := make(map[string]struct{}, len(input.Models))
+	// Persist per-credential visibility for this successful snapshot. Keys that
+	// failed to list models in this pass keep their previously recorded set
+	// (stale-but-known beats empty); keys absent from the map are untouched.
+	for credentialID, models := range input.CredentialModels {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM credential_models WHERE credential_id = ?`, credentialID); err != nil {
+			return result, fmt.Errorf("discovery reconcile clear credential models: %w", err)
+		}
+		for _, model := range models {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO credential_models (credential_id, model_name, checked_at) VALUES (?, ?, ?)`, credentialID, model, checkedAt); err != nil {
+				return result, fmt.Errorf("discovery reconcile insert credential model: %w", err)
+			}
+		}
+	}
+
 	for _, model := range input.Models {
-		current[model] = struct{}{}
 		// Manual-sync channels keep the snapshot as the adoption candidate
 		// list only: routes/members are created on demand from the channel
 		// models panel. Auto-sync channels adopt every probed model.
@@ -132,6 +154,13 @@ func (s *DiscoveredModelStore) Reconcile(ctx context.Context, input ReconcileInp
 			return result, fmt.Errorf("discovery reconcile route: %w", err)
 		}
 
+		var replaced int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_change_remaps x JOIN route_members m ON m.id=x.member_id WHERE m.route_id=? AND x.source_channel_id=?`, routeID, input.ChannelID).Scan(&replaced); err != nil {
+			return result, err
+		}
+		if replaced > 0 {
+			continue
+		}
 		var memberID int64
 		err = tx.QueryRowContext(ctx, `SELECT id FROM route_members WHERE route_id = ? AND channel_id = ?`, routeID, input.ChannelID).Scan(&memberID)
 		if err == sql.ErrNoRows {
@@ -145,43 +174,19 @@ func (s *DiscoveredModelStore) Reconcile(ctx context.Context, input ReconcileInp
 		}
 		// An existing member's enabled flag is left alone: whether a member is
 		// off belongs to the operator (or the probe that disabled it), not to a
-		// snapshot refresh. Reconcile only creates and removes members.
+		// snapshot refresh. Reconcile only creates members.
 	}
 
-	for _, model := range oldModels {
-		if _, exists := current[model]; exists {
-			continue
-		}
-		// Upstream models that disappeared are dropped from automatic routing:
-		// auto-created members are removed (manual_override=1 members survive),
-		// and the route itself is deleted once no member references it anymore.
-		res, execErr := tx.ExecContext(ctx, `DELETE FROM route_members WHERE channel_id = ? AND auto = 1 AND manual_override = 0 AND route_id = (SELECT id FROM routes WHERE model_pattern = ?)`, input.ChannelID, model)
-		if execErr != nil {
-			return result, fmt.Errorf("discovery reconcile remove stale member: %w", execErr)
-		}
-		if count, countErr := res.RowsAffected(); countErr == nil {
-			result.DeletedMembers += int(count)
-		}
-		var routeID int64
-		rowErr := tx.QueryRowContext(ctx, `SELECT id FROM routes WHERE model_pattern = ?`, model).Scan(&routeID)
-		if rowErr == nil {
-			var remaining int
-			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM route_members WHERE route_id = ?`, routeID).Scan(&remaining); err != nil {
-				return result, fmt.Errorf("discovery reconcile count route members: %w", err)
-			}
-			if remaining == 0 {
-				if _, delErr := tx.ExecContext(ctx, `DELETE FROM routes WHERE id = ?`, routeID); delErr != nil {
-					return result, fmt.Errorf("discovery reconcile remove empty route: %w", delErr)
-				}
-				result.DeletedRoutes++
-			}
-		} else if rowErr != sql.ErrNoRows {
-			return result, fmt.Errorf("discovery reconcile lookup route: %w", rowErr)
-		}
-	}
+	// Retain disappeared bindings and routes, including automatic ones, so an
+	// operator can remap them without losing IDs, overrides, or health state.
 
 	if err = tx.Commit(); err != nil {
 		return result, fmt.Errorf("discovery reconcile commit: %w", err)
+	}
+	// Offline cache of the per-key model sets changed inside this transaction;
+	// drop the stale cached copy so the next relay sees the fresh sets.
+	for credentialID := range input.CredentialModels {
+		s.credential.InvalidateModelSetFor(credentialID)
 	}
 	return result, nil
 }
