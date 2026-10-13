@@ -49,5 +49,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 上游 Dockerfile 通过 ldflags 注入 internal/buildinfo；不传这两个参数
+          # /healthz 会一直显示 version=dev commit=unknown。
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
