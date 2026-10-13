@@ -20,11 +20,6 @@ func (n *recordingNotifier) SendAlert(_ context.Context, _ webhook.AlertLevel, _
 	return true
 }
 
-// deliverable is the subset of the notifier the evaluator needs.
-type deliverable interface {
-	SendAlert(ctx context.Context, level, title, message string) bool
-}
-
 func TestOperatorEvaluation(t *testing.T) {
 	cases := []struct {
 		op        string
@@ -67,7 +62,7 @@ func TestValidateRule(t *testing.T) {
 // TestTickFiresAfterSustained: rule fires only after sustained ticks and
 // respects the cooldown.
 func TestTickFiresAfterSustained(t *testing.T) {
-	db, err := store.Open(t.TempDir())
+	db, err := store.OpenTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

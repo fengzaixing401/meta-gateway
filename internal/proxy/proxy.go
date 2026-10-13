@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +41,10 @@ var (
 	// upstream answered, so the failure is variant-scoped, and the request
 	// fails over instead of handing the client an empty reply.
 	ErrEmptyCompletion = errors.New("proxy: upstream answered 200 with an empty completion")
+	// ErrPluginRejected marks a request a sidecar plugin's hook refused before
+	// it reached an upstream. It is a deliberate local decision, not an
+	// upstream fault: the request must not fail over to another channel.
+	ErrPluginRejected = errors.New("proxy: request rejected by plugin")
 )
 
 type Selector interface {
@@ -70,17 +75,42 @@ type Relay interface {
 }
 
 type Service struct {
-	selector                    Selector
-	relay                       Relay
+	selector Selector
+	relay    Relay
+	// slowRelay serves the endpoints that legitimately take minutes. Image
+	// generation and editing is the only such family: the client is waiting for
+	// an artifact, the operation is non-idempotent so it is never retried, and
+	// the upstream may genuinely need 60-180s to answer. Sharing the chat
+	// client's 60s response-header timeout made those requests fail with
+	// "http2: timeout awaiting response headers" while the upstream was still
+	// working (production, 2026-10-07: two image edits at 60.06s, 502).
+	// nil = use relay for everything (the historical behaviour).
+	slowRelay Relay
+	// nativeResponsesMiss records the channels that answered 404/405 for
+	// /v1/responses, so the native probe is paid once instead of per request.
+	nativeResponsesMu   sync.Mutex
+	nativeResponsesMiss map[int64]time.Time
+	// lastRealCallAt throttles the write of channels.last_real_call_at, the
+	// clock a site's "no call for N days" ban counts against. In memory on
+	// purpose: the window is measured in days, and a write per attempt would
+	// serialise SQLite's single writer for a value a one-minute-old row already
+	// answers.
+	realCallMu                  sync.Mutex
+	lastRealCallAt              map[int64]time.Time
 	db                          *store.DB
 	enc                         *crypto.Encrypter
 	retryTimes                  atomic.Int64
 	channelRetryTimes           atomic.Int64
 	crossChannelFailoverEnabled atomic.Bool
-	keyPoolRotation             atomic.Bool
-	cooldownNs                  atomic.Int64
-	now                         func() time.Time
-	registry                    *adapters.Registry
+	// keyPoolCursor advances once per pool resolution and picks the starting
+	// key inside a priority tier, so equal-priority keys rotate instead of
+	// pinning every request on the first one. Process-wide and monotonic: a
+	// per-site cursor would need lifecycle management for no observable gain,
+	// since the offset only has to vary between requests.
+	keyPoolCursor atomic.Uint64
+	cooldownNs    atomic.Int64
+	now           func() time.Time
+	registry      *adapters.Registry
 	// autoDisableThreshold: consecutive member failures before a channel is
 	// auto-disabled (0 = feature off).
 	autoDisableThreshold   atomic.Int64
@@ -121,6 +151,13 @@ type Service struct {
 	nonStreamTimeout time.Duration
 	// liveTraceObserver receives per-round attempt callbacks (optional).
 	liveTraceObserver atomic.Pointer[LiveTraceObserver]
+	// interceptor is the optional plugin hook host (nil disables plugin hooks).
+	interceptor atomic.Pointer[Interceptor]
+	// hookModels caches the HookRoute model catalogue briefly, so the route
+	// hook's own pre-check never puts a route listing on the hot path.
+	hookModelsMu    sync.Mutex
+	hookModelsAt    time.Time
+	hookModelsCache []string
 }
 
 // channelModel scopes adaptive latency/error EWMA to one channel on one model,
@@ -131,12 +168,19 @@ type channelModel struct {
 	model     string
 }
 
+type BillingSnapshot struct {
+	Layer domain.PriceLayer
+	Ratio float64
+	At    time.Time
+}
+
 type Request struct {
-	RequestID string
-	Model     string
-	Body      []byte
-	Stream    bool
-	Method    string
+	BillingSnapshot *BillingSnapshot
+	RequestID       string
+	Model           string
+	Body            []byte
+	Stream          bool
+	Method          string
 	// OpenAIPath is the path under the upstream OpenAI root, e.g. "chat/completions".
 	OpenAIPath string
 	// DownstreamProtocol is the client-side wire contract: "openai" (default)
@@ -149,14 +193,40 @@ type Request struct {
 	Headers map[string]string
 	// PreferChannelID pins upstream selection (admin try). Zero means normal routing.
 	PreferChannelID int64
+	// PreferMemberID pins one ROUTE MEMBER (admin try). A route may hold
+	// several members on the SAME channel — the alias form unifies N upstream
+	// names into one callable model, one member per {"real":"…"} — and a
+	// channel pin can only ever address the first of them. Member pins win
+	// over PreferChannelID and, like a channel pin, are never silently
+	// redirected: an unavailable member stays a visible failure rather than
+	// turning the probe into a test of something else.
+	PreferMemberID int64
 	// Probe marks a synthetic availability check (model probing). Probe traffic
 	// must not look like real traffic to the health bookkeeping: a probe that
 	// fails is information, not a fault, so member cooldowns and the channel
 	// consecutive-failure counter are left untouched. Probes are also never
 	// metered (no DownstreamKeyID), so they cost nothing but upstream tokens.
+	// They are not logged either — their outcome lives in probe_results.
 	Probe bool
+	// Diagnostic marks the console's 试调: a synthetic call the operator pressed
+	// the button for. It shares Probe's exemption from the health bookkeeping
+	// (see recordMemberFailure) but KEEPS its proxy_logs row, because "what did
+	// that 试调 do" is a question the log page has to be able to answer.
+	Diagnostic bool
 	// DownstreamKeyID is the authenticated client key, used for usage metering.
 	DownstreamKeyID int64
+	UserID          int64
+	TeamAccess      *domain.TeamAccess
+	// RequestedModel is the model name the client asked for, preserved when a
+	// plugin's route hook rewrites it. Empty means Model was never rewritten.
+	// Routing, billing, and the log row follow Model; this field exists so the
+	// original request stays attributable.
+	RequestedModel string
+	// ModelRewrittenBy is the id of the plugin whose route hook chose Model.
+	ModelRewrittenBy string
+	// HookDecisions is the audit trail of plugin decisions taken for this
+	// request, in order. Never re-read to change behavior.
+	HookDecisions []HookDecision
 	// ContentType preserves client Content-Type for multipart passthrough.
 	ContentType string
 	// SessionKey is an explicit sticky-session identifier from the client
@@ -169,6 +239,28 @@ type Request struct {
 	// RouteID is filled after selection so usage accounting can update a
 	// model-level stable-first route without changing the public relay API.
 	RouteID int64
+	// UpstreamModel is the model name actually sent upstream for this attempt,
+	// filled after selection: it differs from Model when the route or member
+	// rewrote the alias via a {"real":"…"} mapping. Recorded on the log row so
+	// a shared alias stays attributable.
+	UpstreamModel string
+	// UpstreamPath / UpstreamURL are per-request endpoint overrides, supplied by
+	// the client body or by a payload rule (the latter through the request
+	// header map). UpstreamURL wins over UpstreamPath. Both are validated by the
+	// relay handler before they reach the proxy; a value that fails here was set
+	// by a channel rule, and the request is rejected as a bad request rather than
+	// forwarded to an invented endpoint.
+	UpstreamPath string
+	UpstreamURL  string
+	// UpstreamURLActual is the endpoint this attempt called, filled after URL
+	// resolution. Recorded on the log row so a relocated request (channel
+	// endpoint map, per-request override, custom path) stays attributable.
+	UpstreamURLActual string
+	// MemberID is the route member that actually served the request, filled
+	// after selection. Billing needs the exact row: (route_id, channel_id) is
+	// not unique across route groups and alias members, so the member's own
+	// prices can only be resolved by id.
+	MemberID int64
 	// GrayAttempt indicates that the selected candidate came from the gray pool.
 	GrayAttempt bool
 	// ReasoningEffort is the client-requested OpenAI-style reasoning effort
@@ -185,13 +277,84 @@ type Request struct {
 
 // AttemptMeta describes which upstream was used for an admin try / last attempt.
 type AttemptMeta struct {
-	RouteID     int64  `json:"route_id,omitempty"`
-	GrayAttempt bool   `json:"gray_attempt,omitempty"`
-	ChannelID   int64  `json:"channel_id"`
-	ChannelName string `json:"channel_name"`
-	MemberID    int64  `json:"member_id"`
-	Priority    int    `json:"priority"`
-	Weight      int    `json:"weight"`
+	BillingSnapshot *BillingSnapshot `json:"-"`
+	AttemptLogID    int64            `json:"-"`
+	RouteGroup      string           `json:"route_group,omitempty"`
+	ResolvedModel   string           `json:"resolved_model,omitempty"`
+	RouteID         int64            `json:"route_id,omitempty"`
+	GrayAttempt     bool             `json:"gray_attempt,omitempty"`
+	ChannelID       int64            `json:"channel_id"`
+	ChannelName     string           `json:"channel_name"`
+	MemberID        int64            `json:"member_id"`
+	Priority        int              `json:"priority"`
+	Weight          int              `json:"weight"`
+	// UpstreamModel is the name this attempt actually sent upstream. An alias
+	// shared by several upstream names looks identical in the channel name, so
+	// the console needs this to say WHAT it just tested.
+	UpstreamModel string `json:"upstream_model,omitempty"`
+	// HookDecisions is the plugin decision trail for the whole request, in
+	// order (route, then per-attempt request/response decisions). Empty when no
+	// plugin was involved.
+	HookDecisions []HookDecision `json:"hook_decisions,omitempty"`
+}
+
+// SetImageRelay installs the client used for the image endpoints, which need a
+// longer response-header timeout than chat. nil keeps the single client.
+func (s *Service) SetImageRelay(upstream Relay) { s.slowRelay = upstream }
+
+// responsesNativeMissTTL is how long a channel stays marked as lacking a native
+// /v1/responses surface. Short enough that an upstream which adds one is noticed
+// without operator action, long enough that the probe is a one-off rather than a
+// per-request cost.
+const responsesNativeMissTTL = 10 * time.Minute
+
+// nativeResponsesUnsupported reports whether this channel is known to answer
+// 404/405 for /v1/responses.
+//
+// The fallback for an OpenAI-family upstream is native-first: the upstream may
+// well speak Responses natively, and native is lossless where the chat
+// translation drops server-side tools and refuses stored conversations. But for
+// a chat-only upstream that means every single request pays the probe — a
+// production channel served 44/44 Responses requests by uploading the whole
+// body to /v1/responses and getting a 404 first. Remembering the answer keeps
+// both properties: native where it exists, no wasted round-trip where it does
+// not.
+func (s *Service) nativeResponsesUnsupported(channelID int64) bool {
+	if channelID == 0 {
+		return false
+	}
+	s.nativeResponsesMu.Lock()
+	defer s.nativeResponsesMu.Unlock()
+	learnedAt, ok := s.nativeResponsesMiss[channelID]
+	if !ok {
+		return false
+	}
+	if time.Since(learnedAt) > responsesNativeMissTTL {
+		delete(s.nativeResponsesMiss, channelID)
+		return false
+	}
+	return true
+}
+
+func (s *Service) markNativeResponsesUnsupported(channelID int64) {
+	if channelID == 0 {
+		return
+	}
+	s.nativeResponsesMu.Lock()
+	defer s.nativeResponsesMu.Unlock()
+	if s.nativeResponsesMiss == nil {
+		s.nativeResponsesMiss = make(map[int64]time.Time)
+	}
+	s.nativeResponsesMiss[channelID] = time.Now()
+}
+
+// upstreamFor picks the client for one request path. Only the image family
+// switches: everything else keeps the tuned chat timeout.
+func (s *Service) upstreamFor(openAIPath string) Relay {
+	if s.slowRelay != nil && strings.HasPrefix(strings.Trim(openAIPath, "/"), "images/") {
+		return s.slowRelay
+	}
+	return s.relay
 }
 
 func New(selector Selector, upstream Relay, db *store.DB, enc *crypto.Encrypter, retryTimes int, cooldown time.Duration) *Service {
@@ -205,7 +368,6 @@ func New(selector Selector, upstream Relay, db *store.DB, enc *crypto.Encrypter,
 	service.retryTimes.Store(int64(retryTimes))
 	service.channelRetryTimes.Store(1)
 	service.crossChannelFailoverEnabled.Store(true)
-	service.keyPoolRotation.Store(true)
 	service.faultProtectionEnabled.Store(true)
 	service.cooldownNs.Store(int64(cooldown))
 	service.gate = NewChannelGate()
@@ -378,9 +540,13 @@ func (s *Service) SetAdapterRegistry(registry *adapters.Registry) {
 }
 
 // LiveTraceObserver receives per-round callbacks so the admin live-trace
-// console can show which channel each in-flight request is attacking.
+// console can show which channel each in-flight request is attacking, and how
+// each finished round ended (the failover chain).
 type LiveTraceObserver interface {
 	Attempt(requestID string, round int, channel, protocol, keyName string)
+	// RoundOutcome finalizes a round: ok reports whether the attempt
+	// succeeded, category carries the failure class ("" on success).
+	RoundOutcome(requestID string, round int, channel string, ok bool, category string)
 }
 
 // SetLiveTraceObserver installs the optional observer (nil disables).
@@ -431,11 +597,4 @@ func (s *Service) SetChannelRetryTimes(times int) {
 		times = 0
 	}
 	s.channelRetryTimes.Store(int64(times))
-}
-
-// SetKeyPoolRotation hot-applies whether the site key pool is rotated through
-// on failure. Off = only the channel's bound key (or the first pool key) is
-// used; the pool is never rotated.
-func (s *Service) SetKeyPoolRotation(enabled bool) {
-	s.keyPoolRotation.Store(enabled)
 }

@@ -1,31 +1,22 @@
 import { ArrowLeft, Plus, Trash2 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import {
-  Fragment,
-  useMemo,
-  useEffect,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { Fragment, useMemo, useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useAvailability } from "../hooks/useAvailability";
+import { AvailabilityIndicator } from "../components/AvailabilityIndicator";
 import { api } from "../api/client";
 import { useToast } from "../toast";
-import type {
-  Channel,
-  DiscoveredModel,
-  RouteMember,
-  RouteOverview,
-} from "../api/types";
+import type { Channel, DiscoveredModel, RouteMember, RouteOverview } from "../api/types";
 import { EntityState } from "../components/EntityState";
 import { TelemetryStrip } from "../components/TelemetryStrip";
-import { Button, ErrorState, Page, Panel, StatusBadge } from "../components/ui";
+import { Button, ConfirmDialog, ErrorState, Page, Panel } from "../components/ui";
 import { useAdminMutation } from "../hooks/useAdminMutation";
 import { useI18n } from "../i18n";
 import { useSession } from "../session";
 import { MODEL_GROUP_ORDER, autoModelGroup } from "./models/modelGroups";
 import { positiveId } from "../lib/positiveId";
 import type { ModelSyncMode } from "./channels/SyncModePicker";
+import { mappingRealName as mappingReal } from "../lib/alias";
 
 const INVALIDATE = [
   ["channel-overviews"],
@@ -73,13 +64,14 @@ export function ChannelModelsPanel({
     queryFn: ({ signal }) => service.routeOverviews(signal),
   });
 
-	const models = useMemo<DiscoveredModel[]>(
-		() => discovered.data ?? [],
-		[discovered.data],
-	);
+  const availability = useAvailability({ channelId });
+  const models = useMemo<DiscoveredModel[]>(() => discovered.data ?? [], [discovered.data]);
   const [customName, setCustomName] = useState("");
   const [aliasInputs, setAliasInputs] = useState<Record<number, string>>({});
   const [query, setQuery] = useState(initialQuery ?? "");
+  // Narrow the list by adoption state: enabled rows (member on and on),
+  // disabled rows (parked/never adopted), or everything.
+  const [statusFilter, setStatusFilter] = useState<"all" | "enabled" | "disabled">("all");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [bulkMode, setBulkMode] = useState(false);
   const selectAllRef = useRef<HTMLInputElement>(null);
@@ -99,17 +91,6 @@ export function ChannelModelsPanel({
     });
   const forcedOpen = query.trim() !== "" || bulkMode;
 
-  // mappingReal parses a {"real":"…"} mapping value; empty when absent.
-  const mappingReal = (raw: string | undefined): string => {
-    if (!raw) return "";
-    try {
-      const parsed = JSON.parse(raw) as { real?: string };
-      return parsed.real ?? "";
-    } catch {
-      return "";
-    }
-  };
-
   // aliasFor returns the alias binding for a real model on this channel:
   // the (route, member) pair whose member carries {"real": realModel}. New
   // aliases store the mapping on the member (shared aliases: several models/
@@ -119,6 +100,7 @@ export function ChannelModelsPanel({
     realModel: string,
   ): { overview: RouteOverview; member: RouteMember } | undefined => {
     for (const overview of routeOverviews.data ?? []) {
+      if (overview.route.model_pattern === realModel) continue;
       const mapped = (overview.members ?? []).find(
         (candidate) =>
           candidate.member.channel_id === channelId &&
@@ -127,9 +109,7 @@ export function ChannelModelsPanel({
       if (mapped) return { overview, member: mapped.member };
       if (
         mappingReal(overview.route.mapping_json) === realModel &&
-        (overview.members ?? []).some(
-          (candidate) => candidate.member.channel_id === channelId,
-        )
+        (overview.members ?? []).some((candidate) => candidate.member.channel_id === channelId)
       ) {
         const legacy = (overview.members ?? []).find(
           (candidate) => candidate.member.channel_id === channelId,
@@ -152,13 +132,42 @@ export function ChannelModelsPanel({
       (overview) => overview.route.model_pattern === realModel,
     );
     return route?.members.find(
-      (candidate) => candidate.member.channel_id === channelId,
+      (candidate) =>
+        candidate.member.channel_id === channelId &&
+        (!mappingReal(candidate.member.mapping_json) ||
+          mappingReal(candidate.member.mapping_json) === realModel),
     )?.member;
   };
 
+  // Shared route cleanup after a binding removal: a route only disappears
+  // when the deleted member was its last one.
+  const deleteMemberAndEmptyRoute = async (member: RouteMember) => {
+    await service.deleteMember(member.id);
+    const overview = (routeOverviews.data ?? []).find((e) =>
+      (e.members ?? []).some((c) => c.member.id === member.id),
+    );
+    const remaining = (overview?.members ?? []).filter((c) => c.member.id !== member.id);
+    if ((overview?.members ?? []).length > 0 && remaining.length === 0) {
+      await service.deleteRoute(overview!.route.id);
+    }
+  };
+
   const toggleMember = useAdminMutation({
-    mutationFn: (member: RouteMember) =>
-      service.updateMember(member.id, { ...member, enabled: !member.enabled }),
+    mutationFn: async (member: RouteMember) => {
+      // Manual-sync channels: unchecking removes the binding outright —
+      // the checklist IS the routing state, and parking would pile up
+      // disabled rows forever. Plain bindings only: alias mappings are
+      // deliberate configuration, they park like on auto channels
+      // (reconcile respects parked members; a deleted one would just be
+      // re-adopted on the next sync anyway).
+      if (channel?.model_sync_mode === "manual" && member.enabled && !member.mapping_json) {
+        await deleteMemberAndEmptyRoute(member);
+        return;
+      }
+      await service.updateMember(member.id, {
+        enabled: !member.enabled,
+      });
+    },
     invalidateKeys: [...INVALIDATE],
     pendingIdOf: (member) => member.id,
   });
@@ -175,8 +184,7 @@ export function ChannelModelsPanel({
     );
     const routeId =
       target?.route.id ??
-      (await service.createRoute({ model_pattern: realModel, enabled: true }))
-        .id;
+      (await service.createRoute({ model_pattern: realModel, enabled: true })).id;
     await service.createMember(routeId, {
       channel_id: channelId,
       priority: 0,
@@ -190,16 +198,17 @@ export function ChannelModelsPanel({
   const bulkToggle = useAdminMutation({
     mutationFn: async (input: {
       updates: { member: RouteMember; enabled: boolean }[];
+      removals?: RouteMember[];
       adoptions?: string[];
     }) => {
-      await Promise.all(
-        input.updates.map(({ member, enabled }) =>
+      await Promise.all([
+        ...input.updates.map(({ member, enabled }) =>
           service.updateMember(member.id, {
-            ...member,
             enabled,
           }),
         ),
-      );
+        ...(input.removals ?? []).map((member) => deleteMemberAndEmptyRoute(member)),
+      ]);
       for (const name of input.adoptions ?? []) {
         await adoptModel(name);
       }
@@ -210,6 +219,51 @@ export function ChannelModelsPanel({
   const adopt = useAdminMutation({
     mutationFn: adoptModel,
     invalidateKeys: [...INVALIDATE],
+  });
+
+  // Parked bindings: disabled members on this channel that carry no alias
+  // mapping. Cleanup removes them (and routes that become empty); alias
+  // bindings stay because they are deliberate operator configuration.
+  const parkedMembers = useMemo(() => {
+    const out: { member: RouteMember; routeId: number }[] = [];
+    for (const overview of routeOverviews.data ?? []) {
+      if (overview.route.mapping_json) continue;
+      for (const candidate of overview.members ?? []) {
+        if (candidate.member.channel_id !== channelId) continue;
+        if (candidate.member.enabled) continue;
+        if (candidate.member.mapping_json) continue;
+        out.push({ member: candidate.member, routeId: overview.route.id });
+      }
+    }
+    return out;
+  }, [routeOverviews.data, channelId]);
+
+  const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [cleanupNote, setCleanupNote] = useState("");
+  const cleanupParked = useAdminMutation({
+    mutationFn: async () => {
+      const targets = parkedMembers;
+      const deleted = new Set(targets.map((t) => t.member.id));
+      for (const { member } of targets) {
+        await service.deleteMember(member.id);
+      }
+      // A route only disappears when this cleanup emptied it; routes with
+      // any remaining member (other channels, aliases, enabled rows) stay.
+      let routes = 0;
+      for (const routeId of new Set(targets.map((t) => t.routeId))) {
+        const overview = (routeOverviews.data ?? []).find((e) => e.route.id === routeId);
+        const remaining = (overview?.members ?? []).filter((c) => !deleted.has(c.member.id));
+        if ((overview?.members ?? []).length > 0 && remaining.length === 0) {
+          await service.deleteRoute(routeId);
+          routes += 1;
+        }
+      }
+      return { members: targets.length, routes };
+    },
+    invalidateKeys: [...INVALIDATE],
+    onSuccess: ({ members, routes }) => {
+      setCleanupNote(t("channels.modelsCleanupDone", { members, routes }));
+    },
   });
 
   // Single-field PATCH: the admin API preserves every key the body omits, so
@@ -223,156 +277,14 @@ export function ChannelModelsPanel({
   const toast = useToast();
 
   const saveAlias = useAdminMutation({
-    mutationFn: async (input: { realModel: string; alias: string }) => {
-      const alias = input.alias.trim();
-      if (!alias || channelId == null) return;
-      const mapping = JSON.stringify({ real: input.realModel });
-      const existing = aliasFor(input.realModel);
-      // No existing alias and the alias equals the real name: nothing to do.
-      if (alias === input.realModel && !existing) return;
-      let aliasRouteId: number;
-
-      // The alias name changed: drop this channel's mapped member from the
-      // old route. The alias route may be shared by other channels/models, so
-      // only this member is removed (the route itself is deleted only when it
-      // has no members left).
-      if (existing && existing.overview.route.model_pattern !== alias) {
-        const remaining = (existing.overview.members ?? []).filter(
-          (candidate) => candidate.member.id !== existing.member.id,
-        );
-        await service.deleteMember(existing.member.id);
-        if (remaining.length === 0) {
-          await service.deleteRoute(existing.overview.route.id);
-        }
-      }
-
-      // Upsert this channel's alias member on the target route. The mapping
-      // lives on the member, so several real models/channels may share one
-      // alias name while the proxy rewrites to each member's own real model.
-      const upsertMember = async (routeId: number) => {
-        const overview = (routeOverviews.data ?? []).find(
-          (entry) => entry.route.id === routeId,
-        );
-        const mine = (overview?.members ?? []).find(
-          (candidate) =>
-            candidate.member.channel_id === channelId &&
-            mappingReal(candidate.member.mapping_json) === input.realModel,
-        );
-        if (mine) {
-          if (mine.member.mapping_json !== mapping) {
-            await service.updateMember(mine.member.id, {
-              ...mine.member,
-              mapping_json: mapping,
-            });
-          }
-        } else {
-          await service.createMember(routeId, {
-            channel_id: channelId,
-            priority: 0,
-            weight: 100,
-            enabled: true,
-            auto: true,
-            manual_override: true,
-            mapping_json: mapping,
-          });
-        }
-      };
-
-      const target = (routeOverviews.data ?? []).find(
-        (entry) => entry.route.model_pattern === alias,
-      );
-      if (target) {
-        // Reuse the existing route (custom model name, or another real
-        // model's alias): attach this channel as an additional member instead
-        // of hitting the global UNIQUE(model_pattern) constraint.
-        aliasRouteId = target.route.id;
-        await upsertMember(aliasRouteId);
-      } else {
-        const created = await service.createRoute({
-          model_pattern: alias,
-          enabled: true,
-        });
-        aliasRouteId = created.id;
-        await upsertMember(aliasRouteId);
-      }
-
-      // Retire the original model name for this channel: drop its member
-      // on the original route; delete the route if it became empty.
-      const original = (routeOverviews.data ?? []).find(
-        (overview) =>
-          overview.route.model_pattern === input.realModel &&
-          overview.route.id !== aliasRouteId,
-      );
-      if (original) {
-        const originalMember = original.members?.find(
-          (candidate) => candidate.member.channel_id === channelId,
-        );
-        if (originalMember) {
-          await service.deleteMember(originalMember.member.id);
-        }
-        const remaining = (original.members ?? []).filter(
-          (candidate) => candidate.member.channel_id !== channelId,
-        );
-        if (remaining.length === 0) {
-          await service.deleteRoute(original.route.id);
-        }
-      }
-    },
+    mutationFn: (input: { realModel: string; alias: string }) =>
+      service.setChannelModelAlias(channelId!, input.realModel, input.alias.trim()),
     invalidateKeys: [...INVALIDATE],
   });
 
   const removeAlias = useAdminMutation({
-    mutationFn: async (realModel: string) => {
-      const alias = aliasFor(realModel);
-      if (!alias || channelId == null) return;
-      const { overview, member } = alias;
-      // Remove only this channel's mapped member; the alias route stays when
-      // other channels/models still share the alias name, and disappears once
-      // it has no members left.
-      const remaining = (overview.members ?? []).filter(
-        (candidate) => candidate.member.id !== member.id,
-      );
-      await service.deleteMember(member.id);
-      if (remaining.length === 0) {
-        await service.deleteRoute(overview.route.id);
-      }
-      // Restore the real-name binding so the model stays reachable under its
-      // real name again (the original member was dropped when the alias was
-      // saved).
-      const originalRoute = (routeOverviews.data ?? []).find(
-        (entry) =>
-          entry.route.model_pattern === realModel &&
-          entry.route.id !== overview.route.id,
-      );
-      if (originalRoute) {
-        const existingMember = (originalRoute.members ?? []).find(
-          (candidate) => candidate.member.channel_id === channelId,
-        );
-        if (!existingMember) {
-          await service.createMember(originalRoute.route.id, {
-            channel_id: channelId,
-            priority: 0,
-            weight: 100,
-            enabled: true,
-            auto: true,
-            manual_override: true,
-          });
-        }
-      } else {
-        const created = await service.createRoute({
-          model_pattern: realModel,
-          enabled: true,
-        });
-        await service.createMember(created.id, {
-          channel_id: channelId,
-          priority: 0,
-          weight: 100,
-          enabled: true,
-          auto: true,
-          manual_override: true,
-        });
-      }
-    },
+    mutationFn: (realModel: string) =>
+      service.setChannelModelAlias(channelId!, realModel, realModel),
     invalidateKeys: [...INVALIDATE],
   });
 
@@ -424,7 +336,6 @@ export function ChannelModelsPanel({
         // tell the user it exists (no silent no-op).
         if (!existingMember.enabled) {
           await service.updateMember(existingMember.id, {
-            ...existingMember,
             enabled: true,
           });
           toast.push({
@@ -455,22 +366,6 @@ export function ChannelModelsPanel({
     invalidateKeys: [...INVALIDATE],
   });
 
-  const removeCustom = useAdminMutation({
-    mutationFn: async (input: { routeId: number; memberId: number }) => {
-      await service.deleteMember(input.memberId);
-      const overview = (routeOverviews.data ?? []).find(
-        (entry) => entry.route.id === input.routeId,
-      );
-      const remaining = (overview?.members ?? []).filter(
-        (c) => c.member.channel_id !== channelId,
-      );
-      if ((overview?.members ?? []).length > 0 && remaining.length === 0) {
-        await service.deleteRoute(input.routeId);
-      }
-    },
-    invalidateKeys: [...INVALIDATE],
-  });
-
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
     const base: { key: string; name: string }[] = models.map((m) => ({
@@ -484,22 +379,27 @@ export function ChannelModelsPanel({
         seen.add(custom.name);
       }
     }
-    if (!needle) return base;
-    return base.filter(
-      (item) =>
-        item.name.toLowerCase().includes(needle) ||
-        (aliasFor(item.name)?.overview.route.model_pattern ?? "")
-          .toLowerCase()
-          .includes(needle),
-    );
+    const byNeedle = !needle
+      ? base
+      : base.filter(
+          (item) =>
+            item.name.toLowerCase().includes(needle) ||
+            (aliasFor(item.name)?.overview.route.model_pattern ?? "")
+              .toLowerCase()
+              .includes(needle),
+        );
+    if (statusFilter === "all") return byNeedle;
+    return byNeedle.filter((item) => {
+      const member = memberFor(item.name);
+      const enabled = member ? member.enabled : false;
+      return statusFilter === "enabled" ? enabled : !enabled;
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [models, customModels, query, routeOverviews.data]);
+  }, [models, customModels, query, routeOverviews.data, statusFilter]);
 
   const selectable = filtered;
-  const allSelected =
-    selectable.length > 0 && selectable.every((m) => selectedIds.has(m.key));
-  const someSelected =
-    selectable.length > 0 && selectable.some((m) => selectedIds.has(m.key));
+  const allSelected = selectable.length > 0 && selectable.every((m) => selectedIds.has(m.key));
+  const someSelected = selectable.length > 0 && selectable.some((m) => selectedIds.has(m.key));
   useEffect(() => {
     if (selectAllRef.current) {
       selectAllRef.current.indeterminate = someSelected && !allSelected;
@@ -520,9 +420,7 @@ export function ChannelModelsPanel({
 
   const toggleSelectAll = () => {
     if (!bulkMode) setBulkMode(true);
-    setSelectedIds(
-      allSelected ? new Set() : new Set(selectable.map((item) => item.key)),
-    );
+    setSelectedIds(allSelected ? new Set() : new Set(selectable.map((item) => item.key)));
   };
 
   const enterBulkMode = () => {
@@ -537,56 +435,46 @@ export function ChannelModelsPanel({
     setSelectedIds(new Set());
   };
 
-
   const runBulk = (enabled: boolean) => {
-    // Enable-selected acts as a whitelist: checked rows are enabled (or
-    // adopted when not wired yet) and every other wired row is disabled in
-    // the same pass, so the saved state matches exactly what the operator
-    // checked. Disable-selected only touches wired, checked rows.
-    const updates = selectable
-      .map((item) => {
-        const member = memberFor(item.name);
-        if (!member) return null;
-        const isSelected = selectedIds.has(item.key);
-        const next = enabled
-          ? isSelected
-          : isSelected
-            ? false
-            : member.enabled;
-        return member.enabled === next ? null : { member, enabled: next };
-      })
-      .filter(
-        (u): u is { member: RouteMember; enabled: boolean } => u != null,
-      );
+    // Both operations act only on the selection. Enabling a subset is not
+    // permission to disable every other upstream model on the channel.
+    const manual = channel?.model_sync_mode === "manual";
+    const updates: { member: RouteMember; enabled: boolean }[] = [];
+    const removals: RouteMember[] = [];
+    selectable.forEach((item) => {
+      const member = memberFor(item.name);
+      if (!member) return;
+      const isSelected = selectedIds.has(item.key);
+      if (!isSelected) return;
+      const next = enabled;
+      if (member.enabled === next) return;
+      if (!next && manual && !member.mapping_json) {
+        removals.push(member);
+        return;
+      }
+      updates.push({ member, enabled: next });
+    });
     const adoptions = enabled
       ? selectable
-          .filter(
-            (item) => selectedIds.has(item.key) && memberFor(item.name) == null,
-          )
+          .filter((item) => selectedIds.has(item.key) && memberFor(item.name) == null)
           .map((item) => item.name)
       : [];
-    if (updates.length === 0 && adoptions.length === 0) return;
-    bulkToggle.mutate({ updates, adoptions });
+    if (updates.length === 0 && removals.length === 0 && adoptions.length === 0) return;
+    bulkToggle.mutate({ updates, removals, adoptions });
   };
 
-  const selectedCount = selectable.filter((item) =>
-    selectedIds.has(item.key),
-  ).length;
+  const selectedCount = selectable.filter((item) => selectedIds.has(item.key)).length;
 
   const enabledCount =
-    models.filter((model) => memberFor(model.model_name)?.enabled ?? false)
-      .length + customModels.filter((custom) => custom.member.enabled).length;
-  const aliasedCount = models.filter((model) =>
-    Boolean(aliasFor(model.model_name)),
-  ).length;
+    models.filter((model) => memberFor(model.model_name)?.enabled ?? false).length +
+    customModels.filter((custom) => custom.member.enabled).length;
+  const aliasedCount = models.filter((model) => Boolean(aliasFor(model.model_name))).length;
   // "Adopted" = wired into routing (enabled or parked); "enabled" = currently
   // serving. Splitting them is what makes manual mode readable: a fresh
   // channel shows N models / 0 adopted by design, not because sync failed.
   const adoptedCount =
-    models.filter((model) => memberFor(model.model_name) != null).length +
-    customModels.length;
-  const syncMode: ModelSyncMode =
-    channel?.model_sync_mode === "auto" ? "auto" : "manual";
+    models.filter((model) => memberFor(model.model_name) != null).length + customModels.length;
+  const syncMode: ModelSyncMode = channel?.model_sync_mode === "auto" ? "auto" : "manual";
 
   // Group the filtered rows by vendor family for scannable bulk selection;
   // known groups keep their defined order, anything else lands in "Other".
@@ -598,9 +486,10 @@ export function ChannelModelsPanel({
       if (bucket) bucket.push(item);
       else buckets.set(group, [item]);
     }
-    const known = MODEL_GROUP_ORDER.filter((group) => buckets.has(group)).map(
-      (group) => ({ group, items: buckets.get(group)! }),
-    );
+    const known = MODEL_GROUP_ORDER.filter((group) => buckets.has(group)).map((group) => ({
+      group,
+      items: buckets.get(group)!,
+    }));
     const extra = [...buckets.keys()]
       .filter((group) => !MODEL_GROUP_ORDER.includes(group))
       .map((group) => ({ group, items: buckets.get(group)! }));
@@ -641,15 +530,11 @@ export function ChannelModelsPanel({
               aria-pressed={syncMode === mode}
               disabled={setSyncMode.isPending || !channel}
               title={
-                mode === "auto"
-                  ? t("channels.syncModeAutoHint")
-                  : t("channels.syncModeManualHint")
+                mode === "auto" ? t("channels.syncModeAutoHint") : t("channels.syncModeManualHint")
               }
               onClick={() => setSyncMode.mutate(mode)}
             >
-              {mode === "auto"
-                ? t("channels.syncModeAuto")
-                : t("channels.syncModeManual")}
+              {mode === "auto" ? t("channels.syncModeAuto") : t("channels.syncModeManual")}
             </button>
           ))}
         </div>
@@ -678,6 +563,11 @@ export function ChannelModelsPanel({
           {t("channels.adoptHint")}
         </p>
       ) : null}
+      {cleanupNote ? (
+        <p className="detail-section-empty is-quiet" role="status">
+          {cleanupNote}
+        </p>
+      ) : null}
 
       <Panel className="ops-list-panel">
         <div className="models-simple-toolbar">
@@ -687,6 +577,35 @@ export function ChannelModelsPanel({
             onChange={(event) => setQuery(event.target.value)}
             placeholder={t("routing.searchPlaceholder")}
           />
+          <div
+            className="channel-model-status-filter"
+            role="radiogroup"
+            aria-label={t("channels.modelsFilterLabel")}
+          >
+            {(
+              [
+                ["all", t("channels.modelsFilterAll"), models.length + customModels.length],
+                ["enabled", t("channels.modelsFilterEnabled"), enabledCount],
+                [
+                  "disabled",
+                  t("channels.modelsFilterDisabled"),
+                  models.length + customModels.length - enabledCount,
+                ],
+              ] as const
+            ).map(([mode, label, count]) => (
+              <button
+                key={mode}
+                type="button"
+                className={statusFilter === mode ? "is-active" : ""}
+                aria-pressed={statusFilter === mode}
+                title={t("channels.modelsFilterHint")}
+                onClick={() => setStatusFilter(mode)}
+              >
+                {label}
+                <span className="channel-model-status-count">{count}</span>
+              </button>
+            ))}
+          </div>
           <div className="channel-model-add">
             <input
               value={customName}
@@ -711,11 +630,17 @@ export function ChannelModelsPanel({
               {t("channels.customModelAdd")}
             </Button>
           </div>
+          <Button
+            variant="secondary"
+            icon={<Trash2 size={14} />}
+            disabled={cleanupParked.isPending || parkedMembers.length === 0}
+            title={t("channels.modelsCleanupHint")}
+            onClick={() => setCleanupOpen(true)}
+          >
+            {t("channels.modelsCleanup", { n: parkedMembers.length })}
+          </Button>
           {bulkMode ? (
-            <label
-              className="channel-model-select-all"
-              title={t("channels.modelsBulkHint")}
-            >
+            <label className="channel-model-select-all" title={t("channels.modelsBulkHint")}>
               <input
                 ref={selectAllRef}
                 type="checkbox"
@@ -726,11 +651,7 @@ export function ChannelModelsPanel({
               <span>{t("channels.modelsSelectAll")}</span>
             </label>
           ) : (
-            <Button
-              variant="secondary"
-              className="channel-alias-save"
-               onClick={enterBulkMode}
-            >
+            <Button variant="secondary" className="channel-alias-save" onClick={enterBulkMode}>
               {t("channels.modelsBulkSelect")}
             </Button>
           )}
@@ -783,154 +704,155 @@ export function ChannelModelsPanel({
           isError={discovered.isError}
           error={discovered.error}
           isEmpty={models.length === 0 && customModels.length === 0}
-          empty={
-            <p className="detail-section-empty is-quiet">
-              {t("channels.modelsEmpty")}
-            </p>
-          }
+          empty={<p className="detail-section-empty is-quiet">{t("channels.modelsEmpty")}</p>}
           retry={() => discovered.refetch()}
         >
-          <ul className="channel-model-list is-page">
-            {grouped.map(({ group, items }) => {
-              const isCollapsed = !forcedOpen && collapsedGroups.has(group);
-              return (
-                <Fragment key={group}>
-                  <li
-                    className={`channel-model-group-head${isCollapsed ? " is-collapsed" : ""}`}
-                    onClick={() => toggleGroup(group)}
-                    title={isCollapsed ? t("channels.groupExpand") : t("channels.groupCollapse")}
-                  >
-                    <span className="channel-model-group-name">{group}</span>
-                    <span className="channel-model-group-count">
-                      {items.length}
-                    </span>
-                  </li>
-                  {!isCollapsed &&
-                    items.map((item) => {
-                  const discoveredModel = models.find(
-                    (m) => m.model_name === item.name,
-                  );
-                  const isCustom = !discoveredModel;
-                  const custom = isCustom
-                    ? customModels.find((c) => c.name === item.name)
-                    : undefined;
-                  const member = memberFor(item.name);
-                  const enabled = member ? member.enabled : false;
-                  const aliasInfo = aliasFor(item.name);
-                  const alias = aliasInfo?.overview.route.model_pattern ?? "";
-                  const inputValue = discoveredModel
-                    ? (aliasInputs[discoveredModel.id] ?? alias)
-                    : alias;
-                  return (
-                    <li key={item.key} className="channel-model-row is-alias">
-                      {bulkMode ? (
-                        <label
-                          className="channel-model-select"
-                          title={t("channels.modelsSelectAll")}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={selectedIds.has(item.key)}
-                            disabled={bulkToggle.isPending}
-                            onChange={() => toggleSelect(item.key)}
-                          />
-                        </label>
-                      ) : (
-                        <label
-                          className="channel-model-toggle"
-                          title={
-                            member
-                              ? t("channels.modelEnabledHint")
-                              : t("channels.modelAdoptHint")
-                          }
-                        >
-                          <input
-                            type="checkbox"
-                            checked={enabled}
-                            disabled={
-                              member
-                                ? toggleMember.pendingId === member.id
-                                : adopt.isPending
-                            }
-                            onChange={() => {
-                              if (member) toggleMember.mutate(member);
-                              else adopt.mutate(item.name);
-                            }}
-                          />
-                        </label>
-                      )}
-                      <span className="mono truncate" title={item.name}>
-                        {item.name}
-                      </span>
-                      <span className="channel-model-alias">
-                        {discoveredModel ? (
-                          <>
-                            <input
-                              value={inputValue}
-                              placeholder={t("channels.aliasPlaceholder")}
-                              onChange={(event) =>
-                                setAliasInputs((previous) => ({
-                                  ...previous,
-                                  [discoveredModel.id]: event.target.value,
-                                }))
-                              }
-                            />
-                            {aliasInfo && inputValue === alias ? (
-                              <button
-                                type="button"
-                                className="icon-button"
-                                aria-label={t("channels.aliasRemove")}
-                                title={t("channels.aliasRemove")}
-                                disabled={removeAlias.isPending}
-                                onClick={() => removeAlias.mutate(item.name)}
-                              >
-                                <Trash2 size={13} />
-                              </button>
-                            ) : inputValue.trim() !== alias ? (
-                              <Button
-                                variant="secondary"
-                                className="channel-alias-save"
-                                disabled={
-                                  saveAlias.isPending || !inputValue.trim()
-                                }
-                                onClick={() =>
-                                  saveAlias.mutate({
-                                    realModel: item.name,
-                                    alias: inputValue,
-                                  })
-                                }
-                              >
-                                {t("channels.aliasSave")}
-                              </Button>
-                            ) : null}
-                          </>
-                        ) : custom ? (
-                          <Button
-                            variant="quiet"
-                            className="channel-alias-save"
-                            icon={<Trash2 size={13} />}
-                            disabled={removeCustom.isPending}
-                            onClick={() =>
-                              removeCustom.mutate({
-                                routeId: custom.routeId,
-                                memberId: custom.member.id,
-                              })
-                            }
-                          >
-                            {t("channels.customModelRemove")}
-                          </Button>
-                        ) : null}
-                      </span>
-                      <StatusBadge value={enabled ? "enabled" : "disabled"} />
+          {filtered.length === 0 ? (
+            <p className="detail-section-empty is-quiet">{t("channels.modelsFilterEmpty")}</p>
+          ) : (
+            <ul className="channel-model-list is-page">
+              {grouped.map(({ group, items }) => {
+                const isCollapsed = !forcedOpen && collapsedGroups.has(group);
+                return (
+                  <Fragment key={group}>
+                    <li
+                      className={`channel-model-group-head${isCollapsed ? " is-collapsed" : ""}`}
+                      onClick={() => toggleGroup(group)}
+                      title={isCollapsed ? t("channels.groupExpand") : t("channels.groupCollapse")}
+                    >
+                      <span className="channel-model-group-name">{group}</span>
+                      <span className="channel-model-group-count">{items.length}</span>
                     </li>
-                  );
-                })}
-                </Fragment>
-              );
-            })}
-          </ul>
+                    {!isCollapsed &&
+                      items.map((item) => {
+                        const discoveredModel = models.find((m) => m.model_name === item.name);
+                        const member = memberFor(item.name);
+                        const enabled = member ? member.enabled : false;
+                        const aliasInfo = aliasFor(item.name);
+                        const alias = aliasInfo?.overview.route.model_pattern ?? "";
+                        const inputValue = discoveredModel
+                          ? (aliasInputs[discoveredModel.id] ?? alias)
+                          : alias;
+                        return (
+                          <li
+                            key={item.key}
+                            className="channel-model-row is-alias has-availability"
+                          >
+                            {bulkMode ? (
+                              <label
+                                className="channel-model-select"
+                                title={t("channels.modelsSelectAll")}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={selectedIds.has(item.key)}
+                                  disabled={bulkToggle.isPending}
+                                  onChange={() => toggleSelect(item.key)}
+                                />
+                              </label>
+                            ) : (
+                              <label
+                                className="channel-model-toggle"
+                                title={
+                                  member
+                                    ? t("channels.modelEnabledHint")
+                                    : t("channels.modelAdoptHint")
+                                }
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={enabled}
+                                  disabled={
+                                    member ? toggleMember.pendingId === member.id : adopt.isPending
+                                  }
+                                  onChange={() => {
+                                    if (member) toggleMember.mutate(member);
+                                    else adopt.mutate(item.name);
+                                  }}
+                                />
+                              </label>
+                            )}
+                            <span className="mono truncate" title={item.name}>
+                              {item.name}
+                            </span>
+                            <AvailabilityIndicator
+                              item={availability.data?.models.find(
+                                (model) => model.model === item.name,
+                              )}
+                              loading={availability.isPending}
+                              error={availability.isError}
+                            />
+                            <span className="channel-model-alias">
+                              {discoveredModel ? (
+                                <>
+                                  <input
+                                    value={inputValue}
+                                    placeholder={t("channels.aliasPlaceholder")}
+                                    onChange={(event) =>
+                                      setAliasInputs((previous) => ({
+                                        ...previous,
+                                        [discoveredModel.id]: event.target.value,
+                                      }))
+                                    }
+                                  />
+                                  {aliasInfo && inputValue === alias ? (
+                                    <button
+                                      type="button"
+                                      className="icon-button"
+                                      aria-label={t("channels.aliasRemove")}
+                                      title={t("channels.aliasRemove")}
+                                      disabled={removeAlias.isPending}
+                                      onClick={() => removeAlias.mutate(item.name)}
+                                    >
+                                      <Trash2 size={13} />
+                                    </button>
+                                  ) : inputValue.trim() !== alias ? (
+                                    <Button
+                                      variant="secondary"
+                                      className="channel-alias-save"
+                                      disabled={saveAlias.isPending || !inputValue.trim()}
+                                      onClick={() =>
+                                        saveAlias.mutate({
+                                          realModel: item.name,
+                                          alias: inputValue,
+                                        })
+                                      }
+                                    >
+                                      {t("channels.aliasSave")}
+                                    </Button>
+                                  ) : null}
+                                </>
+                              ) : null}
+                            </span>
+                          </li>
+                        );
+                      })}
+                  </Fragment>
+                );
+              })}
+            </ul>
+          )}
         </EntityState>
       </Panel>
+      {cleanupOpen ? (
+        <ConfirmDialog
+          title={t("channels.modelsCleanup", { n: parkedMembers.length })}
+          confirmLabel={t("channels.modelsCleanupConfirmLabel")}
+          message={t("channels.modelsCleanupConfirm", {
+            n: parkedMembers.length,
+          })}
+          onClose={() => {
+            if (!cleanupParked.isPending) setCleanupOpen(false);
+          }}
+          onConfirm={() =>
+            cleanupParked.mutate(undefined, {
+              onSuccess: () => setCleanupOpen(false),
+            })
+          }
+          pending={cleanupParked.isPending}
+          error={cleanupParked.error}
+        />
+      ) : null}
     </>
   );
 }
@@ -945,11 +867,7 @@ export function ChannelModels() {
 
   if (channelId == null) {
     return (
-      <Page
-        kicker={t("channels.detailKicker")}
-        title={t("channels.modelsSection")}
-        description=""
-      >
+      <Page title={t("channels.modelsSection")} description="">
         <ErrorState error={new Error("invalid channel id")} />
       </Page>
     );
@@ -957,15 +875,10 @@ export function ChannelModels() {
 
   return (
     <Page
-      kicker={t("channels.modelsSection")}
       title={t("channels.modelsSection")}
       description={t("channels.modelsManageHint")}
       actions={
-        <Button
-          variant="secondary"
-          icon={<ArrowLeft size={14} />}
-          onClick={() => navigate("/")}
-        >
+        <Button variant="secondary" icon={<ArrowLeft size={14} />} onClick={() => navigate("/")}>
           {t("channels.backToChannels")}
         </Button>
       }

@@ -1,0 +1,28 @@
+@import "../../styles/tokens.css";
+@import "../../styles/system.css";
+@import "../../styles/shell.css";
+@import "../../styles/workspaces.css";
+@import "../../styles/member.css";
+@import "../../styles/login.css";
+@import "../../styles/motion.css";
+
+.theme-modern > .console-topbar { margin-left: var(--nav-width); }
+.theme-modern > .console-main { min-height: calc(100dvh - 68px); }
+@media (max-width: 760px) { .theme-modern > .console-main { min-height: calc(100dvh - 58px); } }
+
+/* Runtime settings — modern: structure over chrome. The index and the pane drop
+   the card (no border, no radius, no shadow) and keep one hairline above each
+   section, so a page of settings reads as dense rows on the surface rather than
+   as a stack of boxes. */
+.theme-modern .runtime-cards-grid > .runtime-section {
+  padding: 20px 22px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: none;
+}
+.theme-modern .runtime-cards-grid > .runtime-section > .panel-header {
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line-light);
+}

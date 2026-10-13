@@ -1,8 +1,8 @@
-import { useState } from "react"
-import type { RouteMember } from "../../api/types"
-import { Button, Dialog, ErrorState, Field, InfoTip } from "../../components/ui"
-import { useI18n } from "../../i18n"
-import { memberRealName, serializeMemberMapping } from "../../lib/alias"
+import { useState } from "react";
+import type { RouteMember } from "../../api/types";
+import { Button, Dialog, ErrorState, Field, InfoTip } from "../../components/ui";
+import { useI18n } from "../../i18n";
+import { memberRealName, serializeMemberMapping } from "../../lib/alias";
 
 export function MemberDialog({
   value,
@@ -36,6 +36,7 @@ export function MemberDialog({
     <Dialog
       title={value.id ? t("routing.editMember") : t("routing.addMember")}
       onClose={onClose}
+      busy={pending}
       actions={
         <>
           <Button variant="secondary" onClick={onClose}>
@@ -43,12 +44,29 @@ export function MemberDialog({
           </Button>
           <Button
             disabled={pending || !form.channel_id}
-            onClick={() =>
-              onSave({
+            onClick={() => {
+              const next: Partial<RouteMember> = {
                 ...form,
-                manual_override: (form.manual_override ?? false) || valuesTouched,
-              })
-            }
+                ...(valuesTouched &&
+                (form.priority !== value.priority || form.weight !== value.weight)
+                  ? { manual_override: true }
+                  : {}),
+              };
+              if (!value.id) {
+                onSave(next);
+                return;
+              }
+              // Send intent, not the stale snapshot loaded when the editor opened.
+              onSave(
+                Object.fromEntries(
+                  Object.entries(next).filter(
+                    ([key, item]) =>
+                      key === "id" ||
+                      JSON.stringify(item) !== JSON.stringify(value[key as keyof RouteMember]),
+                  ),
+                ) as Partial<RouteMember>,
+              );
+            }}
           >
             {pending ? t("common.working") : t("common.save")}
           </Button>
@@ -75,9 +93,9 @@ export function MemberDialog({
           </select>
         </Field>
       ) : null}
-			<div className="ops-panel-context">
-				<span>{t("routing.memberDialogIntro")}</span>
-			</div>
+      <div className="ops-panel-context">
+        <span>{t("routing.memberDialogIntro")}</span>
+      </div>
       <div className="form-grid">
         <Field label={t("routing.priorityLabel")}>
           <input
@@ -102,19 +120,16 @@ export function MemberDialog({
           />
           <InfoTip label={t("routing.weightHint")} />
         </Field>
+        <p className="field-hint">{t("billing.priceLocation")}</p>
       </div>
       <Field label={t("routing.memberGroupLabel")}>
         <select
           value={form.group_name || "default"}
-          onChange={(event) =>
-            setForm({ ...form, group_name: event.target.value || "default" })
-          }
+          onChange={(event) => setForm({ ...form, group_name: event.target.value || "default" })}
         >
           {[...new Set(["default", ...groups])].map((group) => (
             <option key={group} value={group}>
-              {group === "default"
-                ? t("routing.groupDefault")
-                : group}
+              {group === "default" ? t("routing.groupDefault") : group}
             </option>
           ))}
         </select>
@@ -127,7 +142,6 @@ export function MemberDialog({
           onChange={(event) => {
             const next = event.target.value;
             setRealName(next);
-            markTouched();
             setForm({ ...form, mapping_json: serializeMemberMapping(next) });
           }}
         />
@@ -137,9 +151,7 @@ export function MemberDialog({
         <input
           type="checkbox"
           checked={form.enabled ?? true}
-          onChange={(event) =>
-            setForm({ ...form, enabled: event.target.checked })
-          }
+          onChange={(event) => setForm({ ...form, enabled: event.target.checked })}
         />
         <span>
           <strong>{t("routing.enabledLabel")}</strong>

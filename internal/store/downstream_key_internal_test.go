@@ -102,15 +102,23 @@ func TestUsageCacheSyncIsAbsoluteOrderedAndResetSafe(t *testing.T) {
 	db.DownstreamKey.mu.Lock()
 	db.DownstreamKey.byID[id].QuotaUsedTokens = 10
 	db.DownstreamKey.mu.Unlock()
-	db.DownstreamKey.setCachedUsageIfEpoch(id, 10, epoch)
+	db.DownstreamKey.setCachedUsageIfEpoch(id, 10, 0, epoch)
 	if got := db.DownstreamKey.byID[id].QuotaUsedTokens; got != 10 {
 		t.Fatalf("duplicate callback double-counted usage: %d", got)
 	}
 
+	// The spend budget is published the same way, and a lower absolute cost
+	// from an out-of-order callback must not regress it either.
+	db.DownstreamKey.setCachedUsageIfEpoch(id, 10, 0.5, epoch)
+	db.DownstreamKey.setCachedUsageIfEpoch(id, 10, 0.2, epoch)
+	if got := db.DownstreamKey.byID[id].QuotaUsedCost; got != 0.5 {
+		t.Fatalf("out-of-order callback regressed the spend counter: %v", got)
+	}
+
 	// Commit callbacks can be scheduled out of order; a lower absolute value
 	// must not overwrite a newer one.
-	db.DownstreamKey.setCachedUsageIfEpoch(id, 30, epoch)
-	db.DownstreamKey.setCachedUsageIfEpoch(id, 20, epoch)
+	db.DownstreamKey.setCachedUsageIfEpoch(id, 30, 0, epoch)
+	db.DownstreamKey.setCachedUsageIfEpoch(id, 20, 0, epoch)
 	if got := db.DownstreamKey.byID[id].QuotaUsedTokens; got != 30 {
 		t.Fatalf("out-of-order callback regressed usage: %d", got)
 	}
@@ -121,17 +129,15 @@ func TestUsageCacheSyncIsAbsoluteOrderedAndResetSafe(t *testing.T) {
 	if _, err := db.DownstreamKey.GetByHash(key.TokenHash); err != nil {
 		t.Fatal(err)
 	}
-	db.DownstreamKey.setCachedUsageIfEpoch(id, 40, epoch)
+	db.DownstreamKey.setCachedUsageIfEpoch(id, 40, 0, epoch)
 	if got := db.DownstreamKey.byID[id].QuotaUsedTokens; got != 0 {
 		t.Fatalf("callback from before reset restored old usage: %d", got)
 	}
 }
 
-// TestDownstreamKeyPriceCachePer1kPersists pins the full store round-trip for
-// the cache-token unit price: it was write-only for a whole feature cycle
-// (never selected, never inserted) so listings always showed 0 and partial
-// updates silently wiped the stored value.
-func TestDownstreamKeyPriceCachePer1kPersists(t *testing.T) {
+// TestDownstreamKeyFieldsPersistAcrossReadPaths pins the store round-trip for
+// the mutable key fields across every read path (by id, by hash, list).
+func TestDownstreamKeyFieldsPersistAcrossReadPaths(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir)
 	if err != nil {
@@ -140,13 +146,13 @@ func TestDownstreamKeyPriceCachePer1kPersists(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	key := &domain.DownstreamKey{
-		TokenHash:            "hash-price-cache",
-		Name:                 "priced",
-		Enabled:              true,
-		Scopes:               "relay",
-		PricePromptPer1k:     0.1,
-		PriceCompletionPer1k: 0.2,
-		PriceCachePer1k:      0.05,
+		TokenHash:        "hash-roundtrip",
+		Name:             "roundtrip",
+		Enabled:          true,
+		Scopes:           "relay",
+		QuotaTotalTokens: 5000,
+		ModelAllowlist:   "gpt-4o,claude-3",
+		RouteGroupName:   "vip",
 	}
 	id, err := db.DownstreamKey.Create(key)
 	if err != nil {
@@ -158,7 +164,7 @@ func TestDownstreamKeyPriceCachePer1kPersists(t *testing.T) {
 		case "by-id":
 			got, err = db.DownstreamKey.GetByID(id)
 		case "by-hash":
-			got, err = db.DownstreamKey.GetByHash("hash-price-cache")
+			got, err = db.DownstreamKey.GetByHash("hash-roundtrip")
 		case "list":
 			keys, listErr := db.DownstreamKey.List()
 			if listErr != nil {
@@ -173,8 +179,8 @@ func TestDownstreamKeyPriceCachePer1kPersists(t *testing.T) {
 		if err != nil || got == nil {
 			t.Fatalf("%s read: %+v err=%v", read, got, err)
 		}
-		if got.PriceCachePer1k != 0.05 {
-			t.Fatalf("%s read price_cache = %v, want 0.05", read, got.PriceCachePer1k)
+		if got.QuotaTotalTokens != 5000 || got.ModelAllowlist != "gpt-4o,claude-3" || got.RouteGroupName != "vip" {
+			t.Fatalf("%s read = %+v, want quota 5000 / allowlist gpt-4o,claude-3 / route group vip", read, got)
 		}
 	}
 }
@@ -189,7 +195,7 @@ func TestGroupGetReturnsCopy(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	if err := db.Group.Upsert("shared", 500, 0, 0); err != nil {
+	if err := db.Group.Upsert("shared", 500, 10, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	first, err := db.Group.Get("shared")

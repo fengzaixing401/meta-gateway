@@ -1,9 +1,15 @@
 services:
   meta-gateway:
-    build: .
     # Published image on Docker Hub; `docker compose pull` upgrades to it
-    # while `docker compose build` still builds locally.
-    image: zichuanlan/meta-gateway:latest
+    # while `docker compose build` still builds locally. Local builds report
+    # "dev" unless VERSION/COMMIT are supplied, e.g.
+    #   VERSION=v2.5.2 COMMIT=<sha> docker compose build
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+    image: zichuanlan/meta-gateway:${IMAGE_TAG:-latest}
     init: true
     ports:
       - "4100:4100"
@@ -16,8 +22,16 @@ services:
       HTTP_PROXY: "${HTTP_PROXY:-}"
       HTTPS_PROXY: "${HTTPS_PROXY:-}"
       NO_PROXY: "${NO_PROXY:-127.0.0.1,localhost}"
+      SELFUPDATE_TRACK_TAG: "${IMAGE_TAG:-latest}"
+      WATCHTOWER_TOKEN: "${WATCHTOWER_TOKEN:-meta-gateway-local-update}"
+      ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
       ADMIN_TOKEN: "${ADMIN_TOKEN:?ADMIN_TOKEN is required}"
       ADMIN_TOKENS: "${ADMIN_TOKENS:-}"
+      # The documented lock-out rescue (ADMIN_TOKEN_LOGIN=break-glass) was not
+      # wired into the container at all: the variable existed in the docs but had
+      # no way in, so a deployment that had claimed its owner account could not
+      # use the rescue it was told about.
+      ADMIN_TOKEN_LOGIN: "${ADMIN_TOKEN_LOGIN:-}"
       MASTER_KEY: "${MASTER_KEY:?MASTER_KEY is required}"
       METRICS_TOKEN: "${METRICS_TOKEN:?METRICS_TOKEN is required}"
       EXCHANGE_ALLOW_SECRET_EXPORT: "${EXCHANGE_ALLOW_SECRET_EXPORT:-true}"
@@ -27,6 +41,9 @@ services:
       OUTBOUND_CONNECT_TIMEOUT_SECONDS: "${OUTBOUND_CONNECT_TIMEOUT_SECONDS:-10}"
       OUTBOUND_TLS_TIMEOUT_SECONDS: "${OUTBOUND_TLS_TIMEOUT_SECONDS:-10}"
       OUTBOUND_HEADER_TIMEOUT_SECONDS: "${OUTBOUND_HEADER_TIMEOUT_SECONDS:-60}"
+      # 图像生成/编辑单独一个响应头上限：它们天生慢、而且绝不重试（重放=二次计费），
+      # 用聊天的 60s 会把「上游还在干活」变成 502。
+      OUTBOUND_IMAGE_HEADER_TIMEOUT_SECONDS: "${OUTBOUND_IMAGE_HEADER_TIMEOUT_SECONDS:-300}"
       TRUSTED_PROXY_CIDRS: "${TRUSTED_PROXY_CIDRS:-}"
       RELAY_RATE_PER_MINUTE: "${RELAY_RATE_PER_MINUTE:-600}"
       RELAY_RATE_BURST: "${RELAY_RATE_BURST:-100}"
@@ -36,6 +53,10 @@ services:
       ADMIN_RATE_BURST: "${ADMIN_RATE_BURST:-50}"
       MAX_HEADER_BYTES: "${MAX_HEADER_BYTES:-1048576}"
       MAX_ADMIN_BODY_BYTES: "${MAX_ADMIN_BODY_BYTES:-2097152}"
+      # /v1 请求体上限（MB）。聊天请求内联 base64 截图是常态，10MB 的旧上限会让这类请求
+      # 反复收到 body too large；图像/编辑/转写走另一个更大的上限。
+      RELAY_MAX_BODY_MB: "${RELAY_MAX_BODY_MB:-32}"
+      RELAY_MAX_IMAGE_MB: "${RELAY_MAX_IMAGE_MB:-64}"
       SERVER_READ_HEADER_TIMEOUT_SECONDS: "${SERVER_READ_HEADER_TIMEOUT_SECONDS:-10}"
       SERVER_READ_TIMEOUT_SECONDS: "${SERVER_READ_TIMEOUT_SECONDS:-30}"
       SERVER_IDLE_TIMEOUT_SECONDS: "${SERVER_IDLE_TIMEOUT_SECONDS:-120}"
@@ -43,9 +64,32 @@ services:
       READINESS_TIMEOUT_SECONDS: "${READINESS_TIMEOUT_SECONDS:-2}"
       AUDIT_RETENTION_DAYS: "${AUDIT_RETENTION_DAYS:-90}"
       AUDIT_RETENTION_ROWS: "${AUDIT_RETENTION_ROWS:-100000}"
+      # Model-change ledger upkeep: finished entries older than the retention
+      # window are pruned daily; pending removals with no route impact can be
+      # auto-ignored after N days (0 = keep reminding until handled manually).
+      MODEL_CHANGE_RETENTION_DAYS: "${MODEL_CHANGE_RETENTION_DAYS:-90}"
+      MODEL_CHANGE_AUTO_IGNORE_DAYS: "${MODEL_CHANGE_AUTO_IGNORE_DAYS:-0}"
+      # External site-probe history (one row per monitored model per site per
+      # round) is pruned daily; 0 disables the pruner.
+      SITE_PROBE_RETENTION_DAYS: "${SITE_PROBE_RETENTION_DAYS:-7}"
+      SITE_PROBE_INTERVAL_SECONDS: "${SITE_PROBE_INTERVAL_SECONDS:-900}"
+      SITE_PROBE_JITTER_SECONDS: "${SITE_PROBE_JITTER_SECONDS:-120}"
+      # Upstream notice-board reader (dashboard "站点消息"). Env bootstrap for the
+      # hot-reloadable runtime setting, which the console may also set to 0 to
+      # turn the scheduled read off entirely.
+      SITE_NEWS_INTERVAL_SECONDS: "${SITE_NEWS_INTERVAL_SECONDS:-300}"
+      # Keepalive: the env bootstrap for the hot-reloadable runtime settings
+      # (round cadence and the fallback window). The per-site window itself is
+      # data — 15 days here and 30 there is the site's rule — and the master
+      # switch lives in the console and defaults to off.
+      KEEPALIVE_CHECK_INTERVAL_SECONDS: "${KEEPALIVE_CHECK_INTERVAL_SECONDS:-3600}"
+      KEEPALIVE_DEFAULT_IDLE_DAYS: "${KEEPALIVE_DEFAULT_IDLE_DAYS:-15}"
+      # Third-party monitoring directory the scheduled health snapshot is read
+      # from. Empty keeps the shipped default; set it when that host is not
+      # reachable from this network (e.g. an internal mirror).
+      SITE_PROBE_CATALOG_URL: "${SITE_PROBE_CATALOG_URL:-}"
       RETRY_TIMES: "${RETRY_TIMES:-2}"
       CHANNEL_RETRY_TIMES: "${CHANNEL_RETRY_TIMES:-1}"
-      KEY_POOL_ROTATION: "${KEY_POOL_ROTATION:-true}"
       CROSS_CHANNEL_FAILOVER_ENABLED: "${CROSS_CHANNEL_FAILOVER_ENABLED:-true}"
       COOLDOWN_SECONDS: "${COOLDOWN_SECONDS:-30}"
       FAULT_PROTECTION_ENABLED: "${FAULT_PROTECTION_ENABLED:-true}"
@@ -80,8 +124,64 @@ services:
       ALERT_DAILY_SUMMARY_INTERVAL_SECONDS: "${ALERT_DAILY_SUMMARY_INTERVAL_SECONDS:-0}"
       # Proactive health sweep interval in seconds (0 = off; e.g. 900 = every 15m).
       ALERT_SWEEP_INTERVAL_SECONDS: "${ALERT_SWEEP_INTERVAL_SECONDS:-0}"
+      # ---- 下面这些变量 internal/config 会读，但此前 compose 从未传给容器：写在 .env 里
+      # 也不生效（而 docker compose 只把这里列出的变量传进容器）。默认值与代码默认值
+      # 一致，所以不设置它们时行为不变。
+      # 纯环境变量，改完重建即生效：
+      SQLITE_MAX_OPEN_CONNS: "${SQLITE_MAX_OPEN_CONNS:-4}"
+      OUTBOUND_MAX_IDLE_CONNS: "${OUTBOUND_MAX_IDLE_CONNS:-512}"
+      OUTBOUND_MAX_IDLE_CONNS_PER_HOST: "${OUTBOUND_MAX_IDLE_CONNS_PER_HOST:-64}"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-}"
+      BACKUP_RETENTION_COUNT: "${BACKUP_RETENTION_COUNT:-30}"
+      BALANCE_HISTORY_RETENTION_DAYS: "${BALANCE_HISTORY_RETENTION_DAYS:-90}"
+      DECISION_SNAPSHOT_RETENTION_DAYS: "${DECISION_SNAPSHOT_RETENTION_DAYS:-7}"
+      HEALTH_HISTORY_RETENTION_DAYS: "${HEALTH_HISTORY_RETENTION_DAYS:-90}"
+      WEBHOOK_URL: "${WEBHOOK_URL:-}"
+      WEBHOOK_THROTTLE_SECONDS: "${WEBHOOK_THROTTLE_SECONDS:-300}"
+      PLUGIN_CATALOG_URL: "${PLUGIN_CATALOG_URL:-}"
+      # 运行设置的初始值：只在库里还没有对应行时作为种子，之后由控制台管理。
+      UPDATE_CHECK_ENABLED: "${UPDATE_CHECK_ENABLED:-true}"
+      HEALTH_SWEEP_ENABLED: "${HEALTH_SWEEP_ENABLED:-true}"
+      HEALTH_SWEEP_INTERVAL_SECONDS: "${HEALTH_SWEEP_INTERVAL_SECONDS:-300}"
+      HEALTH_SWEEP_JITTER_SECONDS: "${HEALTH_SWEEP_JITTER_SECONDS:-30}"
+      HEALTH_SWEEP_CONCURRENCY: "${HEALTH_SWEEP_CONCURRENCY:-4}"
+      HEALTH_SWEEP_TIMEOUT_SECONDS: "${HEALTH_SWEEP_TIMEOUT_SECONDS:-15}"
+      HEALTH_SWEEP_DEGRADED_MS: "${HEALTH_SWEEP_DEGRADED_MS:-2000}"
+      RECOVERY_PROBE_ENABLED: "${RECOVERY_PROBE_ENABLED:-true}"
+      RECOVERY_PROBE_INTERVAL_SECONDS: "${RECOVERY_PROBE_INTERVAL_SECONDS:-600}"
+      CHANNEL_AUTO_DISABLE_THRESHOLD: "${CHANNEL_AUTO_DISABLE_THRESHOLD:-5}"
+      MODEL_CATALOG_SOURCES: "${MODEL_CATALOG_SOURCES:-}"
+      MODEL_CATALOG_SYNC_INTERVAL_HOURS: "${MODEL_CATALOG_SYNC_INTERVAL_HOURS:-24}"
+      MODEL_CATALOG_SYNC_PRICES: "${MODEL_CATALOG_SYNC_PRICES:-true}"
+      STABLE_FIRST_ENABLED: "${STABLE_FIRST_ENABLED:-false}"
+      STABLE_FIRST_PROMOTE_REQUESTS: "${STABLE_FIRST_PROMOTE_REQUESTS:-100}"
+      STABLE_FIRST_DENOMINATOR: "${STABLE_FIRST_DENOMINATOR:-25}"
+      ROUTING_LATENCY_AWARE: "${ROUTING_LATENCY_AWARE:-true}"
+      ROUTING_ERROR_AWARE: "${ROUTING_ERROR_AWARE:-true}"
+      ROUTING_CONCURRENCY_AWARE: "${ROUTING_CONCURRENCY_AWARE:-true}"
+      ROUTING_CONCURRENCY_LIMIT: "${ROUTING_CONCURRENCY_LIMIT:-64}"
+      WEBDAV_UPLOAD_ENABLED: "${WEBDAV_UPLOAD_ENABLED:-false}"
     volumes:
       - meta-gateway-data:/data
+      # 一键更新的状态卷：与 compose-updater 共享。网关只写 request.json、读
+      # result.json；套接字在侧车那边，不在网关。
+      - meta-gateway-update:/update
+      # 一键更新（可选，另一种做法）：取消注释后由网关自己持有套接字。
+      # 注意：Docker 套接字约等于宿主机 root 权限，仅在可信环境启用；默认路径是
+      # 用下面的 compose-updater 侧车（网关看不到套接字）。
+      #
+      # 取消注释后**还必须同时配 group_add**（见下方），否则套接字挂进来了也打不开：
+      # 容器以 uid 10001 运行，而 socket 属于宿主机的 docker 组，不在该组就是 EACCES，
+      # 表现为「一键更新点下去就没了」、而 /admin/self-update 里写着 permission denied。
+      # GID 用 stat -c '%g' /var/run/docker.sock 取（常见 998/999/988）。
+      # - /var/run/docker.sock:/var/run/docker.sock
+    # group_add: ["${DOCKER_GID:-999}"]  # 仅在启用 socket 一键更新时打开
+    # 这个标签是给 **watchtower** 的（旧部署可能还在跑它）。新部署用的是 compose-updater
+    # 侧车，不读它；但一个只重建了本服务、没停 watchtower 的部署，重建后容器会丢掉这个
+    # 标签，watchtower 就变成“扫到 0 个容器”，点更新悄无声息地什么都不做
+    # （2026-10-07 实测：watchtower 日志 Scanned=0 Updated=0）。留着它没坏处。
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:4100/readyz"]
       interval: 10s
@@ -91,5 +191,48 @@ services:
     stop_grace_period: 20s
     restart: unless-stopped
 
+  # 一键更新的执行器。持有 Docker 套接字与 compose 工程目录，点更新时在宿主机上跑：
+  #
+  #   docker compose pull meta-gateway
+  #   docker compose up -d --no-build --no-deps meta-gateway
+  #
+  # 也就是操作员本来要手敲的两条命令。**重新读部署文件是重点**：`.env` 的值会被重新
+  # 插值，所以改环境变量会和换镜像一起生效，不必再等谁来敲一次命令。
+  #
+  # 为什么不用 watchtower：它按**旧容器的 inspect 数据**重建容器，`environment:`/
+  # `.env` 的变更永远进不了新容器（containrrr/watchtower#233：“it can't use
+  # docker-compose variables”），于是每次改环境变量都要手动 compose up。
+  #
+  # 网关自己看不到套接字；两者只共享 meta-gateway-update 卷（request.json /
+  # result.json / .ready）。不做定时自动更新：只在控制台点「一键更新」时执行。
+  # 移除它：docker compose stop compose-updater && docker compose rm compose-updater
+  # （移除后网关会退回 watchtower / socket 模式，或显示「不可用」）。
+  #
+  # ⚠️ 工程目录挂到 /work（不是宿主机上的原路径），两点代价都要知道：
+  #   1. compose 用**运行目录的名字**推导工程名，所以 update.sh 必须用 `-p` 显式钉住真正的
+  #      工程名（从侧车自己的 com.docker.compose.project 标签读）。不钉的话 `up` 会把整套栈
+  #      当成一个叫 work 的新项目：新网络、**新建的空数据卷**、第二个网关容器。2026-10-07
+  #      生产实测撞上，只因真容器占着 4100 才没起来——端口空着的时候操作员会得到一个
+  #      空库网关，看起来就是「更新把我的配置全清了」。
+  #   2. 相对宿主路径（`./certs:/certs` 这类）在侧车里会解析成 /work/…，而守护进程按
+  #      宿主机解释——那是个宿主机上不存在的路径。要加这类挂载，就把本服务也改成挂到与
+  #      宿主机相同的绝对路径，并同步改 PROJECT_DIR 与 entrypoint。
+  compose-updater:
+    image: docker:27-cli
+    container_name: meta-gateway-compose-updater
+    working_dir: /work
+    entrypoint: ["/bin/sh", "/work/tools/compose-updater/update.sh"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 工程目录（只读够用：compose 只读 docker-compose.yml 与 .env）
+      - ./:/work:ro
+      - meta-gateway-update:/update
+    environment:
+      PROJECT_DIR: "/work"
+      SERVICE: "meta-gateway"
+      STATE_DIR: "/update"
+    restart: unless-stopped
+
 volumes:
   meta-gateway-data:
+  meta-gateway-update:

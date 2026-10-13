@@ -1,11 +1,12 @@
-import { useQuery } from "@tanstack/react-query"
-import { useState } from "react"
-import { api } from "../../api/client"
-import type { AlertRule } from "../../api/types"
-import { useAdminMutation } from "../../hooks/useAdminMutation"
-import { useI18n } from "../../i18n"
-import { useSession } from "../../session"
-import { Button, Dialog, Field, Panel } from "../../components/ui"
+import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { api } from "../../api/client";
+import type { AlertRule } from "../../api/types";
+import { useAdminMutation } from "../../hooks/useAdminMutation";
+import { useI18n } from "../../i18n";
+import { useSession } from "../../session";
+import { ConfirmDialog, Dialog, Field, InfoTip } from "../../components/ui";
+import { RuleEditorFooter } from "./RuleEditorFooter";
 
 export // Alert rules: metric/operator/threshold/window/sustained → webhook.
 function AlertRulesPanel() {
@@ -17,11 +18,12 @@ function AlertRulesPanel() {
     queryFn: ({ signal }) => service.alertRules(signal),
   });
   const [draft, setDraft] = useState<Partial<AlertRule> | null>(null);
+  // Irreversible, and it was firing straight from the click while every other
+  // delete in the console asks first.
+  const [confirmDelete, setConfirmDelete] = useState<AlertRule | null>(null);
   const save = useAdminMutation({
     mutationFn: (value: AlertRule) =>
-      value.id
-        ? service.updateAlertRule(value.id, value)
-        : service.createAlertRule(value),
+      value.id ? service.updateAlertRule(value.id, value) : service.createAlertRule(value),
     invalidateKeys: [["alert-rules"]],
   });
   const remove = useAdminMutation({
@@ -31,12 +33,10 @@ function AlertRulesPanel() {
   const items = query.data?.items ?? [];
   const metrics = query.data?.metrics ?? {};
   return (
-    <Panel
-      className="runtime-card runtime-tool-alert-rules"
-      id="runtime-alert-rules"
-    >
+    <section className="panel runtime-section runtime-tool-alert-rules" id="runtime-alert-rules">
       <div className="panel-header">
         <strong>{t("ops.alertRules.title")}</strong>
+        <InfoTip label={t("ops.alertRules.hint")} />
         <button
           type="button"
           className="icon-button"
@@ -58,13 +58,9 @@ function AlertRulesPanel() {
           +
         </button>
       </div>
-      <p className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
-        {t("ops.alertRules.hint")}
-      </p>
+      <p className="muted panel-lede">{t("ops.alertRules.lede")}</p>
       {items.length === 0 ? (
-        <p className="is-quiet" style={{ fontSize: 12 }}>
-          {t("ops.alertRules.empty")}
-        </p>
+        <p className="is-quiet panel-note">{t("ops.alertRules.empty")}</p>
       ) : (
         <div className="error-rules-list">
           {items.map((rule) => (
@@ -93,7 +89,7 @@ function AlertRulesPanel() {
               <button
                 type="button"
                 className="error-rule-del"
-                onClick={() => remove.mutate(rule.id!)}
+                onClick={() => setConfirmDelete(rule)}
               >
                 {t("common.delete")}
               </button>
@@ -105,16 +101,29 @@ function AlertRulesPanel() {
         <AlertRuleEditor
           value={draft}
           metrics={metrics}
-		  pending={save.isPending}
-		  error={save.error instanceof Error ? save.error : null}
-		  onClose={() => setDraft(null)}
+          pending={save.isPending}
+          error={save.error instanceof Error ? save.error : null}
+          onClose={() => setDraft(null)}
           onSave={(value) => {
             save.mutate(value as AlertRule);
             setDraft(null);
           }}
         />
       ) : null}
-    </Panel>
+      {confirmDelete ? (
+        <ConfirmDialog
+          title={t("ops.alertRules.deleteTitle")}
+          message={t("ops.alertRules.deleteConfirm")}
+          pending={remove.isPending}
+          error={remove.error}
+          onConfirm={() => {
+            remove.mutate(confirmDelete.id!);
+            setConfirmDelete(null);
+          }}
+          onClose={() => setConfirmDelete(null)}
+        />
+      ) : null}
+    </section>
   );
 }
 
@@ -135,12 +144,12 @@ function AlertRuleEditor({
 }) {
   const { t } = useI18n();
   const [form, setForm] = useState<Partial<AlertRule>>(value);
-  const patch = (p: Partial<AlertRule>) =>
-    setForm((current) => ({ ...current, ...p }));
+  const patch = (p: Partial<AlertRule>) => setForm((current) => ({ ...current, ...p }));
   return (
     <Dialog
       title={form.id ? t("ops.alertRules.edit") : t("ops.alertRules.add")}
       onClose={onClose}
+      busy={pending}
     >
       <div className="meta-form">
         <Field label={t("ops.alertRules.name")}>
@@ -186,9 +195,7 @@ function AlertRuleEditor({
               type="number"
               step={0.05}
               value={form.threshold ?? 0}
-              onChange={(e) =>
-                patch({ threshold: Number(e.target.value) || 0 })
-              }
+              onChange={(e) => patch({ threshold: Number(e.target.value) || 0 })}
               disabled={pending}
             />
           </Field>
@@ -199,9 +206,7 @@ function AlertRuleEditor({
               type="number"
               min={60}
               value={form.window_seconds ?? 3600}
-              onChange={(e) =>
-                patch({ window_seconds: Number(e.target.value) || 3600 })
-              }
+              onChange={(e) => patch({ window_seconds: Number(e.target.value) || 3600 })}
               disabled={pending}
             />
           </Field>
@@ -210,9 +215,7 @@ function AlertRuleEditor({
               type="number"
               min={0}
               value={form.sustained_seconds ?? 0}
-              onChange={(e) =>
-                patch({ sustained_seconds: Number(e.target.value) || 0 })
-              }
+              onChange={(e) => patch({ sustained_seconds: Number(e.target.value) || 0 })}
               disabled={pending}
             />
           </Field>
@@ -221,9 +224,7 @@ function AlertRuleEditor({
               type="number"
               min={60}
               value={form.cooldown_seconds ?? 900}
-              onChange={(e) =>
-                patch({ cooldown_seconds: Number(e.target.value) || 900 })
-              }
+              onChange={(e) => patch({ cooldown_seconds: Number(e.target.value) || 900 })}
               disabled={pending}
             />
           </Field>
@@ -238,16 +239,12 @@ function AlertRuleEditor({
           <span>{t("common.enabled")}</span>
         </label>
       </div>
-      {error ? <div className="inline-error">{error.message}</div> : null}
-      <div className="dialog-actions">
-        <span className="flex-spacer" />
-        <Button variant="secondary" disabled={pending} onClick={onClose}>
-          {t("common.cancel")}
-        </Button>
-        <Button disabled={pending} onClick={() => onSave(form)}>
-          {pending ? t("common.working") : t("common.save")}
-        </Button>
-      </div>
+      <RuleEditorFooter
+        pending={pending}
+        error={error}
+        onCancel={onClose}
+        onSave={() => onSave(form)}
+      />
     </Dialog>
   );
 }

@@ -1,0 +1,156 @@
+/* One readout shared by site observations, channel models and route members. */
+.connection-view-tabs { display: flex; gap: 22px; margin: 0 0 20px; border-bottom: 1px solid var(--line-strong); }
+.connection-view-tabs > button { color: var(--muted-strong); font: inherit; font-size: 13px; border: 0; border-bottom: 2px solid transparent; padding: 10px 0; background: none; cursor: pointer; }
+.connection-view-tabs > button[aria-pressed="true"] { color: var(--primary-ink); border-bottom-color: var(--primary); font-weight: 650; }
+.availability-indicator { display: inline-flex; align-items: center; gap: 4px; border: 0; padding: 4px 0; border-radius: 4px; background: transparent; color: var(--ink); text-align: left; font: inherit; font-size: 12px; cursor: pointer; min-width: 0; }
+.availability-indicator:hover:not(:disabled) .availability-readout > strong { color: var(--primary-ink); }
+.availability-indicator:focus-visible { outline: 2px solid var(--focus); outline-offset: 5px; }
+.availability-indicator:disabled { cursor: default; }
+.availability-readout { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+.availability-readout > strong { font-size: 11px; font-variant-numeric: tabular-nums; min-width: 34px; font-weight: 600; }
+.availability-bars { display: inline-flex; gap: 1px; height: 14px; align-items: center; flex: none; }
+.availability-bar { display: block; width: 2px; height: 14px; background: var(--line-strong); border-radius: 1px; }
+.availability-bar.is-ok { background: var(--success); }
+.availability-bar.is-failed { background: var(--danger); }
+.availability-bar.is-mixed { background: var(--warning); }
+.availability-gauge { position: relative; display: block; width: 4px; height: 14px; border-radius: 2px; background: var(--line-strong); overflow: hidden; flex: none; }
+.availability-gauge > i { position: absolute; bottom: 0; left: 0; width: 100%; border-radius: 2px; background: var(--success); }
+.availability-gauge.is-mixed > i { background: var(--warning); }
+.availability-gauge.is-failed > i { background: var(--danger); }
+.availability-readout > strong.is-ok { color: var(--success); }
+.availability-readout > strong.is-mixed { color: var(--warning); }
+.availability-readout > strong.is-failed { color: var(--danger); }
+.availability-indicator.is-compact { gap: 3px; margin-top: 6px; }
+.availability-indicator.is-compact .availability-bars { height: 12px; gap: 1px; }
+.availability-indicator.is-compact .availability-bar { width: 2px; height: 12px; }
+.availability-indicator.is-error .availability-readout > strong { color: var(--danger); }
+.availability-evidence { display: grid; gap: 22px; }
+.availability-source { padding: 14px 0; border-top: 1px solid var(--line); }
+.availability-source > header { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; font-size: 13px; }
+.availability-source > header > span { font-variant-numeric: tabular-nums; }
+.availability-source > small { display: block; margin-top: 5px; color: var(--muted-strong); }
+.availability-source > p, .availability-explanation { color: var(--muted-strong); font-size: 12px; line-height: 1.6; }
+.availability-stale { color: var(--warning); }
+.availability-history { margin-top: 12px; font-size: 12px; }
+.availability-history > summary { cursor: pointer; color: var(--muted-strong); }
+/* Where the route's availability chip sits now: with the status badge in the
+   detail head, so the board below starts one row earlier. */
+.detail-head-status { display: flex; align-items: center; gap: 8px; }
+.member-row.has-availability { grid-template-columns: auto minmax(120px,1fr) 124px auto; column-gap: 16px; }
+.member-row.has-availability .member-row-main > strong { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+.member-row.has-availability .member-origin-badge { margin-left: 0; }
+.member-availability { min-width: 0; }
+.channel-model-row.is-alias.has-availability { display: grid; grid-template-columns: auto minmax(100px,1fr) 124px minmax(130px,1fr); gap: 12px; }
+.channel-model-row.is-alias.has-availability > .mono { min-width: 0; }
+.site-observation-workspace { min-width: 0; }
+.observation-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+.observation-search { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); padding: 0 10px; height: 36px; flex: 1; min-width: 180px; color: var(--muted-strong); }
+.observation-search input { border: 0; background: none; outline: none; padding: 0; min-width: 0; width: 100%; color: var(--ink); font: inherit; font-size: 13px; }
+.observation-search:focus-within { outline: 2px solid var(--focus); outline-offset: 2px; }
+.observation-period, .observation-site-filters { display: flex; align-items: center; gap: 4px; }
+.observation-period button, .observation-site-filters button { padding: 7px 10px; font: inherit; font-size: 12px; background: none; border: 1px solid transparent; border-radius: var(--radius-sm); color: var(--muted-strong); cursor: pointer; white-space: nowrap; }
+.observation-period button[aria-pressed="true"], .observation-site-filters button[aria-pressed="true"] { background: var(--surface-subtle); border-color: var(--line-strong); color: var(--ink); }
+.observation-cadence { font-size: 11px; color: var(--muted-strong); margin: 8px 0 22px; }
+.observation-cadence a { margin-left: 8px; }
+/* Both panes of the observation board follow the console's fixed-height
+   convention (the same shape as `.models-split > .model-directory`: a capped
+   box with an inner scroll region). 195 collected models used to stretch the
+   whole page and drag the site column along with it; now the page stops at the
+   viewport and each pane scrolls on its own. The constant is this page's own
+   chrome — 338px above the board (title, view tabs, toolbar, cadence line) plus
+   137px below it (page foot and padding), measured at 1440px — so the board
+   fills the screen exactly. `min-height: 0` is what lets a grid item shrink;
+   without it a tall list resizes its row instead of scrolling. */
+.observation-layout { display: grid; grid-template-columns: 218px minmax(0,1fr); height: calc(100dvh - 475px); min-height: 430px; border-top: 1px solid var(--line); }
+.observation-sites { display: flex; flex-direction: column; border-right: 1px solid var(--line); padding: 14px 12px 0 0; min-width: 0; min-height: 0; overflow: hidden; }
+/* The filter row keeps its place at the top of the pane and only the list below
+   it scrolls: a row can never end up half-hidden behind the filters, which is
+   what a sticky filter row always does at the fold. */
+.observation-site-filters { flex: 0 0 auto; margin: 0 0 8px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+.observation-site-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollbar-width: thin; }
+.observation-site-filters button { padding: 5px 9px; font-size: 11px; }
+.observation-site { position: relative; display: flex; flex-direction: column; gap: 6px; width: 100%; padding: 12px; margin: 2px 0; border: 1px solid transparent; border-radius: var(--radius-sm); background: none; color: var(--ink); font: inherit; text-align: left; cursor: pointer; }
+.observation-site strong { padding-right: 10px; font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.observation-site span { font-size: 11px; color: var(--muted-strong); }
+.observation-site:hover { background: var(--surface-hover); }
+.observation-site.is-selected { background: var(--surface-subtle); border-color: var(--line-strong); }
+.observation-site i { position: absolute; top: 17px; right: 12px; width: 6px; height: 6px; border-radius: 50%; background: var(--muted-dark); }
+.observation-site i.is-enabled { background: var(--success); }
+.observation-site i.is-failed { background: var(--danger); }
+.observation-detail { min-width: 0; min-height: 0; padding: 20px 0 20px 26px; overflow-y: auto; scrollbar-width: thin; }
+.observation-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.observation-detail-head h2 { margin: 0 0 7px; font-size: 20px; font-weight: 650; }
+.observation-detail-head p { margin: 0; font-size: 11px; color: var(--muted-strong); }
+.observation-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.observation-switches { display: flex; flex-wrap: wrap; align-items: center; gap: 18px; margin: 20px 0; }
+.observation-switches .check { font-size: 12px; }
+.observation-catalogue > summary { padding: 12px 0; font-size: 13px; font-weight: 600; cursor: pointer; }
+.observation-list-hint { font-size: 11px; color: var(--muted-strong); line-height: 1.6; margin: 2px 0 16px; }
+/* The list's own toolbar: the hint about what the columns mean, then the bulk
+   switch. The hint used to be a paragraph of its own with nothing beside it. */
+.observation-table-bar { display: flex; align-items: center; gap: 10px; margin: 2px 0 10px; }
+.observation-table-bar .observation-list-hint { margin: 0; }
+/* Only three of the four columns exist when no site publishes a reading; the
+   grid has to follow, or the price would land in the availability slot. */
+.observation-table[data-columns="3"] .observation-model { grid-template-columns: minmax(145px,1fr) minmax(100px,.7fr) minmax(80px,.6fr); }
+.observation-table[data-bulk="1"] .observation-model-name { gap: 8px; }
+.observation-model-name { display: flex; align-items: flex-start; gap: 8px; }
+.observation-model-name > div { min-width: 0; }
+.observation-model.is-selected { background: var(--surface-subtle); }
+.observation-routed-elsewhere { font-size: 11px; color: var(--muted-strong); }
+/* "0 collected" with a reason: quiet, but the first thing under the count. */
+.observation-zero-reason { margin: 2px 0 10px; font-size: 12px; line-height: 1.6; color: var(--muted-strong); }
+.observation-model { display: grid; grid-template-columns: minmax(145px,1fr) 124px minmax(100px,.7fr) minmax(80px,.6fr); gap: 16px; align-items: center; min-width: 0; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.observation-model.is-header { position: sticky; top: 0; z-index: 2; background: var(--surface-subtle); border-bottom: 1px solid var(--line-strong); font-size: 11px; color: var(--muted-strong); padding-top: 9px; padding-bottom: 9px; }
+.observation-model-name { min-width: 0; }
+.observation-model-name code { display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.observation-model-name small, .observation-price small { display: block; margin-top: 5px; font-size: 11px; color: var(--muted-strong); }
+.observation-price { font-size: 12px; font-variant-numeric: tabular-nums; min-width: 0; }
+.observation-model-links { display: flex; gap: 7px; flex-direction: column; align-items: flex-start; font-size: 11px; min-width: 0; overflow-wrap: anywhere; }
+.observation-model-links .button { font-size: 11px; min-height: 26px; padding: 4px 0; }
+.observation-policy, .observation-maintenance { border-top: 1px solid var(--line); padding-top: 14px; margin-top: 24px; font-size: 12px; }
+.observation-policy > summary, .observation-maintenance > summary { cursor: pointer; color: var(--muted-strong); }
+.observation-policy-fields { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 14px; margin: 18px 0; }
+.observation-policy-fields .field > span { font-size: 12px; }
+.observation-policy-fields input { min-width: 0; }
+.observation-source-url { display: flex; gap: 12px; align-items: flex-end; }
+.observation-source-url .field { flex: 1; }
+.observation-impact-results p { border-bottom: 1px solid var(--line); padding: 12px 0; }
+.observation-impact-results small { display: block; margin-top: 6px; color: var(--muted-strong); }
+.observation-collection-error { padding: 10px 12px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); color: var(--warning); font-size: 12px; line-height: 1.6; }
+:root[data-appearance="classic"] .member-row.has-availability { grid-template-columns: auto minmax(120px,1fr) 124px auto; }
+@media (max-width: 1200px) {
+  .member-row.has-availability, :root[data-appearance="classic"] .member-row.has-availability { grid-template-columns: auto minmax(0,1fr) auto; }
+  .member-availability { grid-column: 2; grid-row: 2; }
+  .member-row.has-availability .member-controls { grid-column: 3; grid-row: 1 / span 2; }
+  .observation-model { grid-template-columns: minmax(140px,1fr) 124px minmax(80px,.65fr); }
+  .observation-table[data-columns="3"] .observation-model { grid-template-columns: minmax(140px,1fr) minmax(80px,.65fr); }
+  .observation-model-links { grid-column: 1 / -1; flex-direction: row; flex-wrap: wrap; }
+  .observation-model.is-header > :last-child { display: none; }
+}
+@media (max-width: 760px) {
+  /* One column on a phone: the page scrolls, the panes do not. */
+  .observation-layout { grid-template-columns: 1fr; height: auto; min-height: 0; }
+  .observation-sites { flex-direction: row; align-items: center; flex-wrap: nowrap; border-right: 0; padding: 8px 0 12px; border-bottom: 1px solid var(--line); overflow-x: auto; overflow-y: visible; }
+  .observation-site-filters { display: none; }
+  .observation-site-list { display: flex; gap: 6px; flex: 0 0 auto; overflow: visible; }
+  .observation-site { flex: 0 0 150px; margin: 0; }
+  .observation-detail { padding: 20px 0 0; overflow-y: visible; }
+  .observation-model.is-header { position: static; }
+  .observation-detail-head { flex-wrap: wrap; }
+  .observation-model { grid-template-columns: minmax(0,1fr) 124px; gap: 10px; }
+  .observation-model.is-header > :nth-child(n+3) { display: none; }
+  .observation-price { grid-column: 1; }
+  .observation-model-links { grid-column: 2; flex-direction: column; align-items: flex-start; }
+  .observation-policy-fields { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .channel-model-row.is-alias.has-availability { grid-template-columns: auto minmax(0,1fr); }
+  .channel-model-row.is-alias.has-availability .availability-indicator, .channel-model-row.is-alias.has-availability .channel-model-alias { grid-column: 2; }
+  .route-availability-summary { flex-wrap: wrap; gap: 8px; }
+}
+@media (max-width: 520px) {
+  .member-row.has-availability .member-controls { flex-wrap: wrap; max-width: 124px; }
+  .observation-toolbar > .button { flex: 1; }
+  .observation-period { flex: 1; }
+  .availability-readout { gap: 6px; }
+  .availability-readout > strong { min-width: 34px; }
+}

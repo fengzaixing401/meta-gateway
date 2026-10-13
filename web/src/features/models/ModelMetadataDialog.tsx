@@ -1,7 +1,7 @@
-import { useState } from "react"
-import type { ModelMetadata } from "../../api/types"
-import { Button, Dialog, Field } from "../../components/ui"
-import { useI18n } from "../../i18n"
+import { useState } from "react";
+import type { ModelMetadata } from "../../api/types";
+import { Button, Dialog, Field } from "../../components/ui";
+import { useI18n } from "../../i18n";
 
 export // Compact token-count rendering for metadata badges (128000 → 128K).
 // Capability annotation editor for one canonical model name (context window,
@@ -25,6 +25,17 @@ function ModelMetadataDialog({
   const [form, setForm] = useState<ModelMetadata>(value);
   const patch = (partial: Partial<ModelMetadata>) =>
     setForm((current) => ({ ...current, ...partial }));
+  // Capability edits preserve legacy rates. Pricing is managed by BillingRulePanel.
+  const submit = () =>
+    onSave({
+      model_name: form.model_name,
+      context_window: form.context_window,
+      input_modalities: form.input_modalities,
+      output_modalities: form.output_modalities,
+      supports_thinking: form.supports_thinking,
+      vendor: form.vendor,
+      notes: form.notes,
+    });
   const thinkingOptions = [
     { value: -1, label: t("modelsPage.metaThinkingUnknown") },
     { value: 1, label: t("modelsPage.metaThinkingYes") },
@@ -34,6 +45,7 @@ function ModelMetadataDialog({
     <Dialog
       title={t("modelsPage.metaTitle", { name: value.model_name })}
       onClose={onClose}
+      busy={pending}
     >
       <div className="meta-form">
         <Field label={t("modelsPage.metaCtx")}>
@@ -42,9 +54,7 @@ function ModelMetadataDialog({
             min={0}
             step={1000}
             value={form.context_window}
-            onChange={(e) =>
-              patch({ context_window: Math.max(0, Number(e.target.value) || 0) })
-            }
+            onChange={(e) => patch({ context_window: Math.max(0, Number(e.target.value) || 0) })}
             disabled={pending}
           />
         </Field>
@@ -67,9 +77,7 @@ function ModelMetadataDialog({
         <Field label={t("modelsPage.metaThinking")}>
           <select
             value={form.supports_thinking}
-            onChange={(e) =>
-              patch({ supports_thinking: Number(e.target.value) })
-            }
+            onChange={(e) => patch({ supports_thinking: Number(e.target.value) })}
             disabled={pending}
           >
             {thinkingOptions.map((option) => (
@@ -94,8 +102,9 @@ function ModelMetadataDialog({
             disabled={pending}
           />
         </Field>
+        <p className="field-hint">{t("billing.priceLocation")}</p>
       </div>
-	  {error ? <div className="inline-error">{String(error)}</div> : null}
+      {error ? <div className="inline-error">{String(error)}</div> : null}
       <div className="dialog-actions">
         {onDelete ? (
           <Button
@@ -103,7 +112,6 @@ function ModelMetadataDialog({
             disabled={pending}
             onClick={() => {
               onDelete();
-              onClose();
             }}
           >
             {t("common.delete")}
@@ -113,7 +121,7 @@ function ModelMetadataDialog({
         <Button variant="secondary" disabled={pending} onClick={onClose}>
           {t("common.cancel")}
         </Button>
-        <Button disabled={pending} onClick={() => onSave(form)}>
+        <Button disabled={pending} onClick={submit}>
           {pending ? t("common.working") : t("common.save")}
         </Button>
       </div>

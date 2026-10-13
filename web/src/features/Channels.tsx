@@ -1,62 +1,49 @@
-import {
-  ExternalLink,
-  KeyRound,
-  Pencil,
-  Play,
-  Plus,
-  Power,
-  RefreshCw,
-  Copy,
-  Search,
-  CalendarCheck,
-  Trash2,
-  UserCheck,
-} from "lucide-react";
+import { HeartPulse, Plus, RefreshCw, UserCheck } from "lucide-react";
+import { useEffect, useCallback, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
 import type { Channel, ChannelOverview, Site } from "../api/types";
-import { ChannelModelsPanel } from "./ChannelModels";
-import { ChannelKeysDrawer } from "./ChannelKeys";
-import { ActionMenu, type ActionMenuItem } from "../components/ActionMenu";
-import { Drawer } from "../components/Drawer";
-import { EmptyHero } from "../components/EmptyHero";
-import { ListShell } from "../components/ListShell";
-import { PaginationBar } from "../components/PaginationBar";
-import { EntityState } from "../components/EntityState";
+import type { ActionMenuItem } from "../components/ActionMenu";
+import { ThemeDetails } from "../themes/ThemeDetails";
 import { ResultStrip } from "../components/ResultStrip";
 import { TelemetryStrip } from "../components/TelemetryStrip";
-import {
-  Button,
-  ConfirmDialog,
-  DataTable,
-  Page,
-  Panel,
-} from "../components/ui";
+import { Button, Page } from "../components/ui";
 import { useAdminMutation } from "../hooks/useAdminMutation";
+import { useAutomationMaster } from "../hooks/useAutomationMaster";
 import { useClientPagination } from "../hooks/useClientPagination";
 import { useI18n } from "../i18n";
 import { useToast } from "../toast";
 import { formatErrorMessage } from "../formatError";
 import { useSession } from "../session";
-import { useModules } from "../hooks/useModules";
+
 import { channelNeedsAttention, isChannelReady } from "./channelHealth";
-import { AddChannelDialog } from "./channels/AddChannelDialog";
-import { CreateKeyDialog } from "./channels/CreateKeyDialog";
-import { EditChannelDialog } from "./channels/EditChannelDialog";
 import { ChannelDetail } from "./channels/ChannelDetail";
-import { ChannelStatusBadges } from "./channels/badges";
 import {
-  capabilityFlags,
   isMissingAPIKey,
-  needsVerify,
   normalizeBase,
   SECRET_MASK,
-  type ConnectionHealthFilter,
   type CreateConnectionInput,
 } from "./channels/helpers";
-import { positiveId } from "../lib/positiveId";
+import { channelActions, type ChannelActionDeps } from "./channels/channelActions";
+import { readChannelTab, writeChannelTab } from "./channels/tabState";
+import { useChannelFilters } from "./channels/useChannelFilters";
+import {
+  credentialPatch as buildCredentialPatch,
+  credentialShouldBeRemoved,
+} from "./channels/credentialPatch";
+import { ChannelDialogs } from "./channels/ChannelDialogs";
+import { SiteObservationWorkspace } from "./channels/SiteObservationWorkspace";
+import { KeepaliveDialog } from "./channels/KeepaliveDialog";
+import { useChannelBoard } from "./channels/useChannelBoard";
+import {
+  relayCredentialFor as pickRelayCredential,
+  userCredentialFor as pickUserCredential,
+} from "./channels/channelCredentials";
+import { useListSelection } from "../lib/useListSelection";
+import { useChannelBulk } from "./channels/useChannelBulk";
+import { ChannelDirectory } from "./channels/ChannelDirectory";
+import { parseCredentialMeta } from "./credentialMeta";
 export { channelReadiness } from "./channelHealth";
 
 const INVALIDATE = [
@@ -68,173 +55,59 @@ const INVALIDATE = [
   ["route-overviews"],
   ["discovered-models"],
 ] as const;
-
-// Tab-scoped persistence. The sidebar navigates to bare /channels (no query
-// string), so URL-only filters are lost on page switches; these helpers keep
-// the current tab's search and filters across navigation.
-function readChannelTab<T>(key: string, fallback: T): T {
-  try {
-    const raw = sessionStorage.getItem(`channels.${key}`);
-    return raw != null ? (JSON.parse(raw) as T) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function writeChannelTab<T>(key: string, value: T) {
-  try {
-    sessionStorage.setItem(`channels.${key}`, JSON.stringify(value));
-  } catch {
-    // Storage unavailable; state stays in memory for this render.
-  }
-}
-
 export function Channels() {
   const { client } = useSession();
-  const { checkinEnabled } = useModules();
   const { t } = useI18n();
   const toast = useToast();
   const service = api(client!);
   const [params, setParams] = useSearchParams();
-  const searchParam = params.get("search") ?? "";
   const navigate = useNavigate();
-  const overviews = useQuery({
-    queryKey: ["channel-overviews"],
-    queryFn: ({ signal }) => service.channelOverviews(signal),
-  });
-  const sites = useQuery({
-    queryKey: ["sites"],
-    queryFn: ({ signal }) => service.sites(signal),
-  });
-  const routeOverviewsQuery = useQuery({
-    queryKey: ["route-overviews"],
-    queryFn: ({ signal }) => service.routeOverviews(signal),
-  });
-  const [addOpen, setAddOpen] = useState(false);
-  const [remove, setRemove] = useState<Channel | null>(null);
-  const [edit, setEdit] = useState<Channel | null>(null);
-  const [modelsChannel, setModelsChannel] = useState<Channel | null>(null);
-  const [keysChannel, setKeysChannel] = useState<Channel | null>(null);
-  const [createKeyChannel, setCreateKeyChannel] = useState<Channel | null>(
-    null,
-  );
-  // Synchronous lock for the create-key dialog (see onCreate re-entry guard).
-  const createKeyLocked = useRef(false);
-  // Channel id the deep-link effect already popped the models drawer for.
-  // setModelsChannel(null) commits before the router's transition-wrapped
-  // param updates, so the effect re-runs with the stale ?channel= URL right
-  // after a close — without this marker it would re-open the drawer and the
-  // user would have to close it twice.
-  const deepLinkOpened = useRef<number | null>(null);
-  const [contextMenu, setContextMenu] = useState<{
-    channelId: number;
-    top: number;
-    left: number;
-  } | null>(null);
-  const [query, setQuery] = useState(
-    () => searchParam || readChannelTab("query", ""),
-  );
-  const healthParam = params.get("health") as ConnectionHealthFilter | null;
-  const [healthFilter, setHealthFilter] = useState<ConnectionHealthFilter>(
-    () =>
-      healthParam === "ready" ||
-      healthParam === "missing_key" ||
-      healthParam === "attention"
-        ? healthParam
-        : readChannelTab<ConnectionHealthFilter>("health", "all"),
-  );
-  const [typeFilter, setTypeFilter] = useState(() => {
-    const v = params.get("type");
-    return v && v !== "all" ? v : readChannelTab("type", "all");
-  });
-  const [groupFilter, setGroupFilter] = useState(() => {
-    const v = params.get("group");
-    return v && v !== "all" ? v : readChannelTab("group", "all");
-  });
-  const [stageMessage, setStageMessage] = useState<{
-    kind: "created" | "created_and_verified" | "verify_failed";
-    name: string;
-    channelId: number;
-    models?: number;
-  } | null>(null);
-  const selectedId = positiveId(params.get("id"));
-  // URL wins over tab state; only overwrite when the URL actually carries a value
-  // so a bare-path navigation never clears the tab-restored state.
-  useEffect(() => {
-    if (searchParam) setQuery(searchParam);
-  }, [searchParam]);
-  // Deep-link from the models page (?channel=<id>): pop that channel's model
-  // management drawer open so the user lands directly on the right tab.
-  useEffect(() => {
-    const target = positiveId(params.get("channel"));
-    if (!target || modelsChannel?.id === target) return;
-    // One-shot per navigation: re-running with the same target (a close
-    // committing before the router's param transition) must not re-open.
-    if (deepLinkOpened.current === target) return;
-    const overview = (overviews.data ?? []).find(
-      (entry) => entry.channel.id === target,
-    )?.channel;
-    if (overview) {
-      deepLinkOpened.current = target;
-      setModelsChannel(overview);
-      const next = new URLSearchParams(params);
-      next.delete("channel");
-      setParams(next, { replace: true });
-    }
-  }, [params, overviews.data, modelsChannel, setParams]);
-  // Closing strips the deep-link ?channel= param too: the auto-select effects
-  // below run in the same commit that opens the drawer and re-add the param
-  // from the stale searchParams snapshot, and a surviving param would make the
-  // deep-link effect re-open the drawer right after this close.
-  const closeModelsDrawer = () => {
-    setModelsChannel(null);
-    if (params.has("channel")) {
-      const next = new URLSearchParams(params);
-      next.delete("channel");
-      setParams(next, { replace: true });
-    }
-  };
-  useEffect(() => {
-    const next = params.get("health") as ConnectionHealthFilter | null;
-    if (next === "ready" || next === "missing_key" || next === "attention") {
-      setHealthFilter(next);
-    }
-  }, [params]);
-  useEffect(() => {
-    const next = params.get("type");
-    if (next && next !== "all") setTypeFilter(next);
-  }, [params]);
-  useEffect(() => {
-    const next = params.get("group");
-    if (next && next !== "all") setGroupFilter(next);
-  }, [params]);
-
-  useEffect(() => writeChannelTab("query", query), [query]);
-  useEffect(() => writeChannelTab("health", healthFilter), [healthFilter]);
-  useEffect(() => writeChannelTab("type", typeFilter), [typeFilter]);
-  useEffect(() => writeChannelTab("group", groupFilter), [groupFilter]);
-  // Load site credentials for the channel being edited, selected, or opened via ⋯/context menu.
-  const credentialSiteId =
-    edit?.site_id ??
-    (selectedId != null
-      ? (overviews.data ?? []).find((row) => row.channel.id === selectedId)
-          ?.channel.site_id
-      : undefined) ??
-    (contextMenu != null
-      ? (overviews.data ?? []).find(
-          (row) => row.channel.id === contextMenu.channelId,
-        )?.channel.site_id
-      : undefined);
-  const credentials = useQuery({
-    queryKey: ["credentials", credentialSiteId],
-    queryFn: ({ signal }) =>
-      service.credentials(credentialSiteId as number, signal),
-    enabled: typeof credentialSiteId === "number" && credentialSiteId > 0,
-  });
+  // The board's own state (queries, dialogs, deep links, selection) lives in
+  // channels/useChannelBoard; local names are destructured to keep the rest of the
+  // page reading as before.
+  const board = useChannelBoard({ service, params, setParams });
+  const {
+    overviews,
+    sites,
+    routeOverviewsQuery,
+    credentials,
+    addOpen,
+    setAddOpen,
+    remove,
+    setRemove,
+    edit,
+    setEdit,
+    modelsChannel,
+    setModelsChannel,
+    keysChannel,
+    setKeysChannel,
+    createKeyChannel,
+    setCreateKeyChannel,
+    createKeyLocked,
+    closeModelsDrawer,
+    selectedId,
+    inspectorOpen,
+    setInspectorOpen,
+    contextMenu,
+    setContextMenu,
+    stageMessage,
+    setStageMessage,
+  } = board;
+  const filters = useChannelFilters(params, setParams);
+  const {
+    query,
+    setQuery,
+    healthFilter,
+    setHealthFilter,
+    typeFilter,
+    setTypeFilter,
+    groupFilter,
+    setGroupFilter,
+    updateFilterParam,
+    toggleHealthFilter,
+  } = filters;
   const verifyAfterCreate = useRef(false);
-  const runVerifyRef = useRef<(channelId: number, name: string) => void>(
-    () => undefined,
-  );
+  const runVerifyRef = useRef<(channelId: number, name: string) => void>(() => undefined);
 
   const refresh = useAdminMutation({
     mutationFn: (id: number) => service.refreshChannel(id),
@@ -250,7 +123,7 @@ export function Channels() {
           kind: "created_and_verified",
           name,
           channelId,
-          models: refreshResult.models.length,
+          models: (refreshResult.models ?? []).length,
         });
       },
       onError: () => {
@@ -266,19 +139,34 @@ export function Channels() {
   // Health probing is driven by the backend health sweep (default on) and by
   // the explicit per-channel actions below; entering this page does not fire
   // network pings for every enabled connection anymore.
+  // The keepalive workspace is a dialog rather than a tab: it reads and writes
+  // the same sites the rest of this page manages, and an operator opens it when
+  // a window is approaching, not on every visit.
+  const [keepaliveOpen, setKeepaliveOpen] = useState(false);
+
   const createConnection = useAdminMutation({
-    mutationFn: (input: CreateConnectionInput) =>
-      service.createConnection({
+    // The advanced fields the dialog collects go through the same update path an
+    // existing channel uses, and they go BEFORE the verify step: 调用策略 decides
+    // whether this site may be probed at all, so a create-then-verify that ran the
+    // probe first would knock on a door the operator just declared off limits.
+    mutationFn: async (input: CreateConnectionInput) => {
+      const created = await service.createConnection({
         name: input.name.trim(),
         base_url: normalizeBase(input.base_url),
         secret: input.secret.trim(),
         type_hint: input.type_hint || "openai-compatible",
         group_name: input.group_name?.trim() || "default",
         status: "enabled",
+        ...(input.models_csv !== undefined ? { models_csv: input.models_csv } : {}),
         // Explicit choice from the dialog; undefined would silently inherit
         // the system default, which is exactly what used to confuse people.
         model_sync_mode: input.model_sync_mode,
-      }),
+      });
+      if (input.advanced && Object.keys(input.advanced).length > 0) {
+        await service.updateChannel(created.channel.id, input.advanced);
+      }
+      return created;
+    },
     invalidateKeys: [...INVALIDATE],
     toastOnError: false,
     onSuccess: (result) => {
@@ -305,6 +193,31 @@ export function Channels() {
     mutationFn: () => service.refreshAll(),
     invalidateKeys: [...INVALIDATE],
   });
+
+  // Bulk selection over the connections table (current-page checkboxes).
+  // Owned by lib/useListSelection (shared with the models board); the local names
+  // stay so the rest of this page reads as before.
+  const selection = useListSelection();
+  const bulkSelected = selection.selected;
+  const bulkMode = selection.mode;
+  const setBulkSelected = selection.setSelected;
+  const setBulkMode = selection.setMode;
+  const exitBulkMode = selection.exit;
+  const toggleBulkSelected = selection.toggle;
+  // Bulk operations: owned by channels/useChannelBulk (both share one rule — after
+  // a run the selection is exactly the failures). Local names kept.
+  const bulk = useChannelBulk({
+    service,
+    overviews: overviews.data ?? [],
+    invalidateKeys: INVALIDATE,
+    toast,
+    t,
+    setSelected: selection.setSelected,
+  });
+  const bulkFailures = bulk.failures;
+  const bulkSync = bulk.sync;
+  const bulkStatus = bulk.status;
+  const bulkBusy = bulk.busy;
 
   const probe = useAdminMutation({
     mutationFn: (id: number) => service.probeChannel(id),
@@ -353,8 +266,7 @@ export function Channels() {
   });
   const toggle = useAdminMutation({
     mutationFn: async (overview: ChannelOverview) => {
-      const next =
-        overview.channel.status === "enabled" ? "disabled" : "enabled";
+      const next = overview.channel.status === "enabled" ? "disabled" : "enabled";
       return service.updateChannel(overview.channel.id, {
         ...overview.channel,
         status: next,
@@ -374,6 +286,7 @@ export function Channels() {
         has_secret: boolean;
         has_cookie?: boolean;
         checkin_enabled: boolean;
+        meta_json?: string;
       };
       relayCredential?: {
         id: number;
@@ -397,9 +310,20 @@ export function Channels() {
       system_prompt?: string;
       retry_config?: string;
       model_sync_mode?: "auto" | "manual";
+      upstream_path_override?: string;
+      upstream_path_map?: string;
+      upstream_request_map?: string;
+      upstream_response_map?: string;
       stable_first?: boolean;
+      call_policy?: "" | "allow_probe" | "real_calls_only";
+      /** Cumulative spend / token ceilings (0 = none); see the drawer's
+       *  「累计成本上限」. The counters and the hit marker are the store's. */
+      usage_limit_cost?: number;
+      usage_limit_tokens?: number;
       userToken: string;
       userCookie: string;
+      /** New-API family numeric user id (`New-Api-User`). Empty = unknown. */
+      userID: string;
       apiKey: string;
     }) => {
       const name = input.name.trim() || input.channel.name;
@@ -424,8 +348,7 @@ export function Channels() {
       const userCookieKept = userCookieRaw === SECRET_MASK;
       const userCookie = userCookieKept ? "" : userCookieRaw;
       const userAuthMode = userCookieKept
-        ? input.userCredential?.auth_mode ||
-          (userToken ? "access_token" : "cookie")
+        ? input.userCredential?.auth_mode || (userToken ? "access_token" : "cookie")
         : userCookie
           ? userToken
             ? "auto"
@@ -434,68 +357,59 @@ export function Channels() {
       const apiKey = input.apiKey.trim();
       const userCred = input.userCredential;
       const relayCred = input.relayCredential;
-      if (userToken && input.site) {
+      // The New-API numeric user id lives in credential meta_json
+      // ({"platform_user_id":1544}). An empty field means "unknown": the
+      // gateway keeps resolving it from /api/user/self at check-in time, so
+      // only write when the operator typed something or cleared a stored id.
+      const userIDRaw = input.userID.trim();
+      const storedUserID = parseCredentialMeta(userCred?.meta_json).platform_user_id;
+      const userID = /^[0-9]+$/.test(userIDRaw) ? Number(userIDRaw) : undefined;
+      const metaChanged = userID !== storedUserID;
+      // The mask means "keep the stored value". An empty field means "remove"
+      // only when something was actually stored; otherwise every save of an
+      // untouched dialog would fire a pointless credential write.
+      const cookieChanged = !userCookieKept && (userCookie !== "" || Boolean(userCred?.has_cookie));
+      const secretChanged = !userTokenKept && (userToken !== "" || Boolean(userCred?.has_secret));
+      // Both auth materials were explicitly cleared → remove the credential.
+      const clearCredential = credentialShouldBeRemoved({
+        userCred,
+        userToken,
+        userCookie,
+        secretChanged,
+        cookieChanged,
+      });
+      /** Only the fields that actually changed are sent; see channels/credentialPatch.ts. */
+      const credentialPatch = () =>
+        buildCredentialPatch({
+          userCred,
+          userToken,
+          userCookie,
+          userID,
+          userAuthMode,
+          secretChanged,
+          cookieChanged,
+          metaChanged,
+        });
+      if (input.site) {
         if (userCred?.id) {
-          const kind =
-            userCred.kind === "session" || userCred.kind === "access_token"
-              ? userCred.kind
-              : "access_token";
-          await service.updateCredential(userCred.id, {
-            kind,
-            secret: userToken,
-            ...(userCookieKept
-              ? {}
-              : userCookie
-                ? { cookie: userCookie }
-                : { clear_cookie: true }),
-            auth_mode: userAuthMode,
-            status: "enabled",
-          });
-        } else {
+          if (clearCredential) {
+            await service.deleteCredential(userCred.id);
+          } else {
+            const patch = credentialPatch();
+            if (Object.keys(patch).length > 0) {
+              await service.updateCredential(userCred.id, patch);
+            }
+          }
+        } else if (userToken || userCookie) {
           await service.createCredential(input.site.id, {
             kind: "access_token",
-            secret: userToken,
+            ...(userToken ? { secret: userToken } : {}),
             ...(userCookie ? { cookie: userCookie } : {}),
+            ...(userID ? { meta_json: JSON.stringify({ platform_user_id: userID }) } : {}),
             auth_mode: userAuthMode,
             status: "enabled",
           });
         }
-      } else if (
-        userCred?.id &&
-        input.site &&
-        !userTokenKept &&
-        !userCookieKept &&
-        !userToken &&
-        !userCookie
-      ) {
-        // Both auth materials were explicitly cleared → remove the user credential.
-        await service.deleteCredential(userCred.id);
-      } else if (
-        userCred?.id &&
-        input.site &&
-        (!userCookieKept || !userTokenKept)
-      ) {
-        await service.updateCredential(userCred.id, {
-          auth_mode: userAuthMode,
-          ...(userCookieKept
-            ? {}
-            : userCookie
-              ? { cookie: userCookie }
-              : { clear_cookie: true }),
-          ...(userTokenKept
-            ? {}
-            : userToken
-              ? { secret: userToken }
-              : { clear_secret: true }),
-          status: "enabled",
-        });
-      } else if (!userCred?.id && input.site && userCookie) {
-        await service.createCredential(input.site.id, {
-          kind: "access_token",
-          cookie: userCookie,
-          auth_mode: "cookie",
-          status: "enabled",
-        });
       }
       if (apiKey && input.site) {
         if (relayCred?.id && relayCred.kind === "api_key") {
@@ -513,20 +427,18 @@ export function Channels() {
           });
           relayCredentialId = created.id;
         }
-      } else if (
-        relayCred?.id &&
-        relayCred.kind === "api_key" &&
-        relayCred.has_secret
-      ) {
+      } else if (relayCred?.id && relayCred.kind === "api_key" && relayCred.has_secret) {
         // Keep existing relay key bound when operator only edits other fields.
         relayCredentialId = relayCred.id;
       }
-      const channelBase = input.channel.base_url.trim()
-        ? base
-        : input.channel.base_url;
+      const channelBase = input.channel.base_url.trim() ? base : input.channel.base_url;
       const siteId = input.channel.site_id ?? input.site?.id;
+      // Sync mode is intentionally absent from the spread: the drawer may
+      // have changed it since this dialog opened, and only an explicit
+      // picker change (below) may touch it.
+      const { model_sync_mode: _snapshotSyncMode, ...channelFields } = input.channel;
       return service.updateChannel(input.channel.id, {
-        ...input.channel,
+        ...channelFields,
         name,
         base_url: channelBase,
         type_hint: typeHint,
@@ -540,8 +452,19 @@ export function Channels() {
         header_override: input.header_override ?? "",
         system_prompt: input.system_prompt ?? "",
         retry_config: input.retry_config ?? "",
-        model_sync_mode: input.model_sync_mode,
+        upstream_path_override: input.upstream_path_override ?? "",
+        upstream_path_map: input.upstream_path_map ?? "",
+        upstream_request_map: input.upstream_request_map ?? "",
+        upstream_response_map: input.upstream_response_map ?? "",
+        ...(input.model_sync_mode ? { model_sync_mode: input.model_sync_mode } : {}),
         stable_first: input.stable_first ?? false,
+        // "" is a value here, not a missing one: it hands the policy back to the
+        // site, which is how the operator undoes a per-channel override.
+        call_policy: input.call_policy ?? input.channel.call_policy ?? "",
+        // The budget travels with the save; the counters and the hit marker do
+        // not (the store re-derives them from the ledger when a limit changes).
+        usage_limit_cost: input.usage_limit_cost ?? input.channel.usage_limit_cost ?? 0,
+        usage_limit_tokens: input.usage_limit_tokens ?? input.channel.usage_limit_tokens ?? 0,
         site_id: siteId,
         credential_id: relayCredentialId,
       });
@@ -552,10 +475,7 @@ export function Channels() {
   });
 
   const setCredentialStatus = useAdminMutation({
-    mutationFn: async (input: {
-      id: number;
-      status: "enabled" | "disabled";
-    }) => {
+    mutationFn: async (input: { id: number; status: "enabled" | "disabled" }) => {
       const list = credentials.data ?? [];
       const current = list.find((item) => item.id === input.id);
       return service.updateCredential(input.id, {
@@ -578,8 +498,23 @@ export function Channels() {
     invalidateKeys: [...INVALIDATE, ["credentials"]],
   });
 
+  // Pool tier of one key. Single-field write on purpose: the credential PUT
+  // preserves every key the body omits, so a tier change cannot disturb the
+  // allowlist, the status, or the secret.
+  const updateKeyPriority = useAdminMutation({
+    mutationFn: async (input: { id: number; priority: number }) => {
+      const list = credentials.data ?? [];
+      const current = list.find((item) => item.id === input.id);
+      return service.updateCredential(input.id, {
+        kind: current?.kind || "api_key",
+        priority: input.priority,
+      });
+    },
+    invalidateKeys: [...INVALIDATE, ["credentials"]],
+  });
+
   const addApiKeyCredential = useAdminMutation({
-    mutationFn: async (input: { siteId: number; secret: string }) => {
+    mutationFn: async (input: { siteId: number; secret: string; name?: string }) => {
       const secret = input.secret.trim();
       if (!secret) {
         throw new Error("api key is required");
@@ -589,15 +524,17 @@ export function Channels() {
         kind: "api_key",
         secret,
         status: "enabled",
-        meta_json: JSON.stringify({ name: "manual", group: "default" }),
+        meta_json: JSON.stringify({
+          name: input.name?.trim() || "manual",
+          group: "default",
+        }),
       });
     },
     invalidateKeys: [...INVALIDATE, ["credentials"]],
   });
 
   const deleteApiKeyCredential = useAdminMutation({
-    mutationFn: (credentialId: number) =>
-      service.deleteCredential(credentialId),
+    mutationFn: (credentialId: number) => service.deleteCredential(credentialId),
     invalidateKeys: [...INVALIDATE, ["credentials"]],
   });
 
@@ -617,10 +554,19 @@ export function Channels() {
     },
   });
 
+  const checkinMaster = useAutomationMaster("checkin_enabled");
   const setCheckin = useAdminMutation({
-    mutationFn: (input: { credentialId: number; enabled: boolean }) =>
-      service.setCheckin(input.credentialId, input.enabled),
-    invalidateKeys: [["credentials"], ["channel-overviews"]],
+    mutationFn: async (input: { credentialId: number; enabled: boolean }) => {
+      const result = await service.setCheckin(input.credentialId, input.enabled);
+      // An account that is "scheduled" while the console's scheduler is off would
+      // never be checked in, which reads as a broken switch; turn the master on
+      // and say so rather than leave the two switches disagreeing.
+      if (input.enabled && (await checkinMaster.enable())) {
+        toast.push({ tone: "success", message: t("channels.checkinMasterAutoOn") });
+      }
+      return result;
+    },
+    invalidateKeys: [["credentials"], ["channel-overviews"], ["runtime-settings"]],
     pendingIdOf: (input) => input.credentialId,
   });
   const runCheckin = useAdminMutation({
@@ -637,74 +583,120 @@ export function Channels() {
 
   const filterOptions = useMemo(() => {
     const list = overviews.data ?? [];
-    const types = [
-      ...new Set(list.map((item) => item.channel.type_hint).filter(Boolean)),
-    ].sort();
-    const groups = [
-      ...new Set(list.map((item) => item.channel.group_name).filter(Boolean)),
-    ].sort();
+    const types = [...new Set(list.map((item) => item.channel.type_hint).filter(Boolean))].sort();
+    const groups = [...new Set(list.map((item) => item.channel.group_name).filter(Boolean))].sort();
     return { types, groups };
   }, [overviews.data]);
+  // The filters an overview has to pass whatever the search says. Kept in one
+  // place because the model group below has to obey them too.
+  const passesFilters = useCallback(
+    (overview: ChannelOverview) => {
+      const ch = overview.channel;
+      if (typeFilter !== "all" && ch.type_hint !== typeFilter) return false;
+      if (groupFilter !== "all" && ch.group_name !== groupFilter) return false;
+      if (healthFilter === "ready" && !isChannelReady(overview)) return false;
+      if (healthFilter === "missing_key" && !isMissingAPIKey(overview)) return false;
+      if (healthFilter === "attention" && !channelNeedsAttention(overview)) return false;
+      return true;
+    },
+    [typeFilter, groupFilter, healthFilter],
+  );
   const rows = useMemo(() => {
     const list = overviews.data ?? [];
     const term = query.trim().toLowerCase();
     return list.filter((overview) => {
       const ch = overview.channel;
-      if (typeFilter !== "all" && ch.type_hint !== typeFilter) return false;
-      if (groupFilter !== "all" && ch.group_name !== groupFilter) return false;
-      if (healthFilter === "ready" && !isChannelReady(overview)) {
-        return false;
-      }
-      if (healthFilter === "missing_key" && !isMissingAPIKey(overview)) {
-        return false;
-      }
-      if (healthFilter === "attention" && !channelNeedsAttention(overview)) {
-        return false;
-      }
+      if (!passesFilters(overview)) return false;
       if (!term) return true;
       const site = ch.site_id != null ? siteById.get(ch.site_id) : undefined;
       const base = (ch.base_url || site?.base_url || "").toLowerCase();
       return (
-        ch.name.toLowerCase().includes(term) ||
-        base.includes(term) ||
-        String(ch.id).includes(term)
+        ch.name.toLowerCase().includes(term) || base.includes(term) || String(ch.id).includes(term)
       );
     });
-  }, [overviews.data, query, siteById, healthFilter, typeFilter, groupFilter]);
+  }, [overviews.data, query, siteById, passesFilters]);
+
+  // The same term also searches MODELS, and that answer needs the catalog rather
+  // than the loaded page: it arrives debounced and lands in its own group below
+  // the name matches. A name match stays instant, because it is the one the
+  // operator is usually typing towards.
+  const [modelTerm, setModelTerm] = useState("");
+  useEffect(() => {
+    const handle = setTimeout(() => setModelTerm(query.trim()), 250);
+    return () => clearTimeout(handle);
+  }, [query]);
+  const modelSearch = useQuery({
+    queryKey: ["model-channels", modelTerm, "contains"],
+    queryFn: ({ signal }) => service.modelChannels(modelTerm, "contains", signal),
+    enabled: modelTerm.length >= 2,
+  });
+  const modelMatches = useMemo(() => {
+    if (modelTerm.length < 2) return [];
+    const shown = new Set(rows.map((overview) => overview.channel.id));
+    const byId = new Map((overviews.data ?? []).map((overview) => [overview.channel.id, overview]));
+    const out: Array<{ channelId: number; name: string; model: string; source: string }> = [];
+    for (const match of modelSearch.data?.items ?? []) {
+      // A channel already listed above is not listed twice.
+      if (shown.has(match.channel_id)) continue;
+      const overview = byId.get(match.channel_id);
+      if (!overview || !passesFilters(overview)) continue;
+      out.push({
+        channelId: match.channel_id,
+        name: overview.channel.name,
+        model: match.model ?? "",
+        source: match.source,
+      });
+    }
+    return out;
+  }, [modelSearch.data, modelTerm, rows, overviews.data, passesFilters]);
 
   const pagination = useClientPagination(rows, 20, "channels");
   const pageRows = pagination.pageItems;
+  const pageAllSelected =
+    pageRows.length > 0 && pageRows.every((o) => bulkSelected.has(o.channel.id));
+  const selectAllPage = () => {
+    setBulkSelected((prev) => {
+      const next = new Set(prev);
+      if (pageAllSelected) {
+        pageRows.forEach((o) => next.delete(o.channel.id));
+      } else {
+        pageRows.forEach((o) => next.add(o.channel.id));
+      }
+      return next;
+    });
+  };
+  const bulkHeader = (
+    <input
+      type="checkbox"
+      aria-label={t("channels.bulkSelectPage")}
+      checked={pageAllSelected}
+      onChange={selectAllPage}
+    />
+  );
 
-  // Restore the previously selected channel from tab state when the URL has
-  // no id (bare sidebar navigation drops the query string).
+  // Selection for a URL that carries no usable ?id — in priority order: the
+  // channel a deep-link is landing on, the selection this tab had last (a bare
+  // sidebar navigation drops the query string), then the first row. This used
+  // to be two effects, and the first-row one ran second: it overwrote both the
+  // stored selection and the deep-link that opened the drawer.
   useEffect(() => {
     if (selectedId) return;
+    // The ?channel=/?keys= effects above own the selection while their target is
+    // still unread from the URL (they commit the id in this same render pass).
+    if (params.get("channel") || params.get("keys")) return;
     if (!rows.length) return;
     const saved = readChannelTab<number | null>("selected", null);
-    if (!saved || !rows.some((r) => r.channel.id === saved)) return;
+    const target =
+      saved != null && rows.some((r) => r.channel.id === saved) ? saved : rows[0]!.channel.id;
     setParams(
       (prev) => {
         const next = new URLSearchParams(prev);
-        next.set("id", String(saved));
+        next.set("id", String(target));
         return next;
       },
       { replace: true },
     );
-  }, [rows, selectedId, setParams]);
-
-  useEffect(() => {
-    if (!rows.length) return;
-    if (selectedId && rows.some((r) => r.channel.id === selectedId)) return;
-    if (selectedId) return;
-    setParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        next.set("id", String(rows[0]!.channel.id));
-        return next;
-      },
-      { replace: true },
-    );
-  }, [rows, selectedId, setParams]);
+  }, [rows, selectedId, params, setParams]);
 
   const selected =
     rows.find((r) => r.channel.id === selectedId) ??
@@ -712,25 +704,10 @@ export function Channels() {
     null;
 
   const readyCount = (overviews.data ?? []).filter(isChannelReady).length;
-  const missingKeyCount = (overviews.data ?? []).filter((o) =>
-    isMissingAPIKey(o),
-  ).length;
+  const missingKeyCount = (overviews.data ?? []).filter((o) => isMissingAPIKey(o)).length;
   const attentionCount = (overviews.data ?? []).filter((o) => {
     return channelNeedsAttention(o);
   }).length;
-
-  const updateFilterParam = (key: string, value: string) => {
-    const next = new URLSearchParams(params);
-    if (!value || value === "all") next.delete(key);
-    else next.set(key, value);
-    next.delete("id");
-    setParams(next, { replace: true });
-  };
-  const toggleHealthFilter = (next: ConnectionHealthFilter) => {
-    const value = healthFilter === next ? "all" : next;
-    setHealthFilter(value);
-    updateFilterParam("health", value);
-  };
 
   const selectRow = (id: number) => {
     writeChannelTab("selected", id);
@@ -739,262 +716,47 @@ export function Channels() {
     setParams(next, { replace: true });
   };
 
-  /** User token for check-in on a site. Prefer the scheduled credential when overview says on. */
-  const userCredentialFor = (overview?: ChannelOverview) => {
-    const list = credentials.data ?? [];
-    const siteId = overview?.channel.site_id;
-    const onSite = list.filter((item) => {
-      if (siteId != null && item.site_id !== siteId) return false;
-      return (
-        (item.kind === "access_token" || item.kind === "session") &&
-        item.status === "enabled"
-      );
-    });
-    if (!onSite.length) return undefined;
-    // Match backend pickUserCredential: prefer the credential this channel is bound to,
-    // so editing/deleting the token operates on the same credential that checks use.
-    const boundId = overview?.channel.credential_id;
-    if (boundId) {
-      const bound = onSite.find((item) => item.id === boundId);
-      if (bound) return bound;
-    }
-    // Match badge: when schedule is on, operate on a credential that is actually scheduled.
-    if (overview?.checkin_enabled) {
-      const scheduled = onSite.find((item) => item.checkin_enabled);
-      if (scheduled) return scheduled;
-    }
-    // When schedule is off, prefer a token that is not scheduled yet (first off, else any).
-    const notScheduled = onSite.find((item) => !item.checkin_enabled);
-    return notScheduled ?? onSite[0];
-  };
-  const relayCredentialFor = (overview: ChannelOverview) => {
-    const list = credentials.data ?? [];
-    const id = overview.channel.credential_id;
-    if (id) {
-      const hit = list.find((item) => item.id === id);
-      if (hit && hit.kind === "api_key") return hit;
-    }
-    return list.find(
-      (item) => item.kind === "api_key" && item.status === "enabled",
-    );
+  /** User token for check-in on a site; see channels/channelCredentials.ts. */
+  const userCredentialFor = (overview?: ChannelOverview) =>
+    pickUserCredential(overview, credentials.data ?? []);
+  const relayCredentialFor = (overview: ChannelOverview) =>
+    pickRelayCredential(overview, credentials.data ?? []);
+
+  // Everything the action menu needs, in one explicit hand-off: the menu itself
+  // lives in channels/channelActions.tsx (pure mapping, unit-testable), and this
+  // is the board's half of the contract.
+  const channelActionDeps: ChannelActionDeps = {
+    t,
+    navigate,
+    pushError: (error) => toast.pushError(error),
+    userCredentialFor,
+    selectRow,
+    setContextMenu,
+    setBulkMode,
+    setBulkSelected,
+    setEdit,
+    setCreateKeyChannel,
+    setRemove,
+    setInspectorOpen,
+    mutations: {
+      refresh,
+      probe,
+      accountProbe,
+      syncKeys,
+      toggle,
+      del,
+      duplicate,
+      createUpstreamKey,
+      setCheckin,
+      runCheckin,
+      saveEdit,
+    },
   };
 
   const connectionActions = (
     overview: ChannelOverview,
     options?: { closeContext?: boolean },
-  ): ActionMenuItem[] => {
-    const ch = overview.channel;
-    const caps = capabilityFlags(overview);
-    const busy =
-      refresh.pendingId === ch.id ||
-      probe.pendingId === ch.id ||
-      accountProbe.pendingId === ch.id ||
-      syncKeys.pendingId === ch.id ||
-      toggle.pendingId === ch.id ||
-      del.pendingId === ch.id;
-    const close = () => {
-      if (options?.closeContext) setContextMenu(null);
-    };
-    const items: ActionMenuItem[] = [
-      {
-        key: "edit",
-        label: t("common.edit"),
-        icon: <Pencil size={14} />,
-        disabled: busy,
-        onSelect: () => {
-          close();
-          saveEdit.reset();
-          setEdit(ch);
-        },
-      },
-    ];
-    if (caps.accountSupported && caps.hasUser) {
-      items.push({
-        key: "check-account",
-        label: t("channels.checkAccount"),
-        icon: <UserCheck size={14} />,
-        disabled: busy,
-        onSelect: () => {
-          close();
-          selectRow(ch.id);
-          accountProbe.reset();
-          accountProbe.mutate(ch.id, {
-            onError: (err) => toast.pushError(err),
-          });
-        },
-      });
-    }
-    if (caps.accountSupported && caps.hasUser && caps.needsKeyForRelay) {
-      items.push({
-        key: "sync-keys",
-        label: t("channels.syncKeys"),
-        icon: <KeyRound size={14} />,
-        disabled: busy,
-        onSelect: () => {
-          close();
-          selectRow(ch.id);
-          syncKeys.reset();
-          syncKeys.mutate(ch.id);
-        },
-      });
-    }
-    // Only offer key creation when the account token is known-good (last
-    // probe succeeded for this channel). A dead/blocked token should never
-    // show a create button that can only fail. Keys can be created even when
-    // the site already has keys — group-scoped upstreams (New API groups)
-    // typically need one key per group.
-    const canCreateKey =
-      caps.accountSupported &&
-      caps.hasUser &&
-      Boolean(overview.last_probe_at) &&
-      overview.last_probe_ok === true;
-    if (canCreateKey) {
-      items.push({
-        key: "create-key",
-        label: t("channels.createKey"),
-        icon: <Plus size={14} />,
-        disabled: busy,
-        onSelect: () => {
-          close();
-          selectRow(ch.id);
-          createUpstreamKey.reset();
-          setCreateKeyChannel(ch);
-        },
-      });
-    }
-    if (caps.hasAPIKey && !needsVerify(overview)) {
-      items.push({
-        key: "test",
-        label: t("channels.test"),
-        icon: <Play size={14} />,
-        disabled: busy,
-        onSelect: () => {
-          close();
-          selectRow(ch.id);
-          probe.reset();
-          probe.mutate(ch.id);
-        },
-      });
-    }
-    items.push({
-      key: "duplicate",
-      label: t("channels.duplicate"),
-      icon: <Copy size={14} />,
-      disabled: busy,
-      onSelect: () => {
-        close();
-        duplicate.reset();
-        duplicate.mutate(ch.id);
-      },
-    });
-    items.push(
-      {
-        key: "sync",
-        label: t("channels.fetchModels"),
-        icon: <RefreshCw size={14} />,
-        disabled: busy,
-        onSelect: () => {
-          close();
-          selectRow(ch.id);
-          refresh.reset();
-          refresh.mutate(ch.id);
-          // Model import doubles as an availability check; also refresh the
-          // access-token status while we are at it.
-          if (caps.accountSupported && caps.hasUser) {
-            accountProbe.reset();
-            accountProbe.mutate(ch.id);
-          }
-        },
-      },
-      {
-        key: "toggle",
-        label:
-          ch.status === "enabled"
-            ? t("common.disableAction")
-            : t("common.enableAction"),
-        icon: <Power size={14} />,
-        disabled: busy,
-        onSelect: () => {
-          close();
-          toggle.mutate(overview);
-        },
-      },
-      {
-        key: "models",
-        label: t("channels.openModels"),
-        icon: <ExternalLink size={14} />,
-        onSelect: () => {
-          close();
-          navigate(`/models?channel_id=${ch.id}`);
-        },
-      },
-      {
-        key: "logs",
-        label: t("channels.openLogs"),
-        icon: <ExternalLink size={14} />,
-        onSelect: () => {
-          close();
-          navigate(`/logs?channel_id=${ch.id}`);
-        },
-      },
-      ...(() => {
-        if (!checkinEnabled) return [];
-        // Label must follow overview badge (site-level schedule), not an arbitrary first token.
-        const scheduleOn = Boolean(overview.checkin_enabled);
-        const checkinCred = userCredentialFor(overview);
-        if (!checkinCred && !caps.hasUser) return [];
-        // Has user token on overview but credentials list not loaded yet: still show correct label.
-        const canToggle = Boolean(checkinCred);
-        return [
-          {
-            key: "checkin-toggle",
-            label: scheduleOn
-              ? t("channels.checkinDisable")
-              : t("channels.checkinEnable"),
-            icon: <CalendarCheck size={14} />,
-            disabled:
-              busy ||
-              !canToggle ||
-              (checkinCred != null && setCheckin.pendingId === checkinCred.id),
-            onSelect: () => {
-              close();
-              if (!checkinCred) return;
-              setCheckin.mutate({
-                credentialId: checkinCred.id,
-                enabled: !scheduleOn,
-              });
-            },
-          },
-          {
-            key: "checkin-run",
-            label: t("channels.checkinRun"),
-            icon: <CalendarCheck size={14} />,
-            disabled:
-              busy ||
-              !canToggle ||
-              (checkinCred != null && runCheckin.pendingId === checkinCred.id),
-            onSelect: () => {
-              close();
-              if (!checkinCred) return;
-              runCheckin.mutate(checkinCred.id);
-            },
-          },
-        ];
-      })(),
-      {
-        key: "delete",
-        label: t("common.delete"),
-        icon: <Trash2 size={14} />,
-        danger: true,
-        disabled: busy,
-        onSelect: () => {
-          close();
-          setRemove(ch);
-        },
-      },
-    );
-    return items;
-  };
+  ): ActionMenuItem[] => channelActions(overview, channelActionDeps, options);
 
   const openAdd = () => {
     createConnection.reset();
@@ -1002,10 +764,7 @@ export function Channels() {
     setAddOpen(true);
   };
 
-  const submitCreate = (
-    value: CreateConnectionInput,
-    options: { verify: boolean },
-  ) => {
+  const submitCreate = (value: CreateConnectionInput, options: { verify: boolean }) => {
     verifyAfterCreate.current = options.verify;
     createConnection.mutate(value);
   };
@@ -1015,70 +774,45 @@ export function Channels() {
     runVerifyRef.current(channelId, name);
   };
 
+  const observationView = params.get("view") === "observations";
+  const connectionViews = (
+    <div className="connection-view-tabs" role="group" aria-label={t("observation.views")}>
+      {[false, true].map((value) => (
+        <button
+          type="button"
+          key={String(value)}
+          aria-pressed={observationView === value}
+          onClick={() => {
+            const next = new URLSearchParams(params);
+            if (value) next.set("view", "observations");
+            else next.delete("view");
+            setParams(next);
+          }}
+        >
+          {t(value ? "observation.title" : "observation.connections")}
+        </button>
+      ))}
+    </div>
+  );
+  if (observationView)
+    return (
+      <Page title={t("channels.title")} description={t("observation.description")}>
+        {connectionViews}
+        <SiteObservationWorkspace
+          initialSiteId={Number(params.get("site")) || undefined}
+          initialModel={params.get("model") || ""}
+        />
+      </Page>
+    );
   return (
     <Page
-      kicker={t("channels.kicker")}
       title={t("channels.title")}
       description={t("channels.description")}
       actions={
         <>
-          <label className="directory-search">
-            <Search size={14} aria-hidden="true" />
-            <input
-              value={query}
-              onChange={(e) => {
-                const value = e.target.value;
-                setQuery(value);
-                const next = new URLSearchParams(params);
-                if (value) next.set("search", value);
-                else next.delete("search");
-                next.delete("id");
-                setParams(next, { replace: true });
-              }}
-              placeholder={t("channels.searchPlaceholder")}
-              aria-label={t("channels.searchPlaceholder")}
-            />
-          </label>
-          <select
-            aria-label={t("channels.filterType")}
-            value={typeFilter}
-            onChange={(event) => {
-              const v = event.target.value;
-              setTypeFilter(v);
-              updateFilterParam("type", v);
-            }}
-          >
-            <option value="all">{t("channels.allTypes")}</option>
-            {filterOptions.types.map((type) => (
-              <option key={type} value={type}>
-                {type}
-              </option>
-            ))}
-          </select>
-          <select
-            aria-label={t("channels.filterGroup")}
-            value={groupFilter}
-            onChange={(event) => {
-              const v = event.target.value;
-              setGroupFilter(v);
-              updateFilterParam("group", v);
-            }}
-          >
-            <option value="all">{t("channels.allGroups")}</option>
-            {filterOptions.groups.map((group) => (
-              <option key={group} value={group}>
-                {group}
-              </option>
-            ))}
-          </select>
           <Button
             variant="secondary"
-            icon={
-              <RefreshCw
-                size={16}
-                className={refreshAll.isPending ? "spin" : ""}
-              />
-            }
+            icon={<RefreshCw size={16} className={refreshAll.isPending ? "spin" : ""} />}
             disabled={refreshAll.isPending || !rows.length}
             onClick={() => {
               refreshAll.reset();
@@ -1089,12 +823,7 @@ export function Channels() {
           </Button>
           <Button
             variant="secondary"
-            icon={
-              <UserCheck
-                size={16}
-                className={checkAllTokens.isPending ? "spin" : ""}
-              />
-            }
+            icon={<UserCheck size={16} className={checkAllTokens.isPending ? "spin" : ""} />}
             disabled={checkAllTokens.isPending || !rows.length}
             onClick={() => {
               checkAllTokens.reset();
@@ -1103,13 +832,31 @@ export function Channels() {
           >
             {t("channels.checkAllTokens")}
           </Button>
+          <Button
+            variant="secondary"
+            icon={<HeartPulse size={16} />}
+            disabled={!rows.length}
+            onClick={() => setKeepaliveOpen(true)}
+          >
+            {t("channels.keepalive.open")}
+          </Button>
           <Button icon={<Plus size={16} />} onClick={openAdd}>
             {t("channels.add")}
           </Button>
         </>
       }
     >
+      {connectionViews}
       <div className="ops-canvas">
+        {bulkFailures.length > 0 ? (
+          <div role="alert" className="inline-error">
+            {bulkFailures.map((failure) => (
+              <p key={failure.item}>
+                #{failure.item}: {formatErrorMessage(failure.error, t)}
+              </p>
+            ))}
+          </div>
+        ) : null}
         <TelemetryStrip
           items={[
             {
@@ -1162,9 +909,7 @@ export function Channels() {
         ) : null}
         {stageMessage?.kind === "verify_failed" ? (
           <ResultStrip status="error">
-            <span>
-              {t("channels.verifyFailed", { name: stageMessage.name })}
-            </span>
+            <span>{t("channels.verifyFailed", { name: stageMessage.name })}</span>
             <Button
               variant="secondary"
               disabled={refresh.isPending}
@@ -1175,9 +920,7 @@ export function Channels() {
           </ResultStrip>
         ) : null}
         {refreshAll.data ? (
-          <ResultStrip
-            status={refreshAll.data.failure_count > 0 ? "error" : "success"}
-          >
+          <ResultStrip status={refreshAll.data.failure_count > 0 ? "error" : "success"}>
             {t("ops.refreshSummary", {
               success: refreshAll.data.success_count,
               failure: refreshAll.data.failure_count,
@@ -1186,17 +929,11 @@ export function Channels() {
         ) : null}
         {checkAllTokens.data ? (
           <ResultStrip
-            status={
-              checkAllTokens.data.items.some((item) => !item.ok)
-                ? "error"
-                : "success"
-            }
+            status={checkAllTokens.data.items.some((item) => !item.ok) ? "error" : "success"}
           >
             {t("channels.checkAllTokensSummary", {
-              success: checkAllTokens.data.items.filter((item) => item.ok)
-                .length,
-              failure: checkAllTokens.data.items.filter((item) => !item.ok)
-                .length,
+              success: checkAllTokens.data.items.filter((item) => item.ok).length,
+              failure: checkAllTokens.data.items.filter((item) => !item.ok).length,
             })}
           </ResultStrip>
         ) : null}
@@ -1204,7 +941,7 @@ export function Channels() {
           <ResultStrip status="success">
             {t("channels.refreshResult", {
               id: refresh.data.channel_id,
-              models: refresh.data.models.length,
+              models: (refresh.data.models ?? []).length,
             })}
           </ResultStrip>
         ) : null}
@@ -1212,7 +949,7 @@ export function Channels() {
           <ResultStrip status="success">
             {t("channels.probeResult", {
               id: probe.data.channel_id,
-              models: probe.data.models.length,
+              models: (probe.data.models ?? []).length,
               latency: probe.data.latency_ms,
             })}
           </ResultStrip>
@@ -1228,9 +965,7 @@ export function Channels() {
         {syncKeys.data ? (
           <ResultStrip
             status={
-              syncKeys.data.created_credentials +
-                syncKeys.data.reused_credentials >
-              0
+              syncKeys.data.created_credentials + syncKeys.data.reused_credentials > 0
                 ? "success"
                 : syncKeys.data.skipped_masked > 0 || syncKeys.data.empty_list
                   ? "error"
@@ -1244,8 +979,7 @@ export function Channels() {
                 masked: syncKeys.data.skipped_masked,
                 deleted: syncKeys.data.deleted_credentials ?? 0,
               })}
-              {(syncKeys.data.created_channels ||
-                syncKeys.data.updated_channels) &&
+              {(syncKeys.data.created_channels || syncKeys.data.updated_channels) &&
                 ` ${t("channels.syncKeysGroups", {
                   created: syncKeys.data.created_channels ?? 0,
                   updated: syncKeys.data.updated_channels ?? 0,
@@ -1255,497 +989,148 @@ export function Channels() {
                 : syncKeys.data.empty_list
                   ? ` — ${t("channels.syncKeysEmpty")}`
                   : syncKeys.data.skipped_masked > 0 &&
-                      syncKeys.data.created_credentials +
-                        syncKeys.data.reused_credentials ===
-                        0
+                      syncKeys.data.created_credentials + syncKeys.data.reused_credentials === 0
                     ? ` — ${t("channels.syncKeysMasked")}`
                     : ""}
             </span>
           </ResultStrip>
         ) : null}
 
-        <div className="split">
-          <Panel className="ops-list-panel">
-            <EntityState
-              isLoading={overviews.isPending}
-              isError={overviews.isError}
-              error={overviews.error}
-              isEmpty={!rows.length}
-              empty={
-                <EmptyHero
-                  kicker={
-                    healthFilter === "missing_key"
-                      ? t("channels.filter.missingKeyKicker")
-                      : t("channels.emptyKicker")
-                  }
-                  title={
-                    healthFilter === "missing_key"
-                      ? t("channels.filter.missingKeyTitle")
-                      : healthFilter === "attention"
-                        ? t("channels.filter.attentionTitle")
-                        : healthFilter === "ready"
-                          ? t("channels.filter.readyTitle")
-                          : t("channels.emptyTitle")
-                  }
-                  body={
-                    healthFilter === "all"
-                      ? t("channels.empty")
-                      : t("channels.filter.clearHint")
-                  }
-                  actions={
-                    healthFilter === "all" ? (
-                      <Button icon={<Plus size={16} />} onClick={openAdd}>
-                        {t("channels.add")}
-                      </Button>
-                    ) : (
-                      <Button
-                        variant="secondary"
-                        onClick={() => setHealthFilter("all")}
-                      >
-                        {t("common.clearFilters")}
-                      </Button>
-                    )
-                  }
-                />
-              }
-              retry={() => overviews.refetch()}
-            >
-              <ListShell
-                footer={
-                  <PaginationBar
-                    page={pagination.page}
-                    totalPages={pagination.totalPages}
-                    total={pagination.total}
-                    pageSize={pagination.pageSize}
-                    rangeStart={pagination.rangeStart}
-                    rangeEnd={pagination.rangeEnd}
-                    hasPrev={pagination.hasPrev}
-                    hasNext={pagination.hasNext}
-                    onPageChange={pagination.setPage}
-                    onPageSizeChange={pagination.setPageSize}
-                  />
-                }
-              >
-                <DataTable
-                  headers={[
-                    t("common.name"),
-                    t("common.status"),
-                    t("common.models"),
-                    t("channels.modelsSelectedCol"),
-                    t("common.latency"),
-                    t("common.actions"),
-                  ]}
-                >
-                  {pageRows.map((overview) => {
-                    const ch = overview.channel;
-                    const site =
-                      ch.site_id != null ? siteById.get(ch.site_id) : undefined;
-                    const displayBase = ch.base_url || site?.base_url || "";
-                    const caps = capabilityFlags(overview);
-                    const active = selected?.channel.id === ch.id;
-                    const rowBusy =
-                      refresh.pendingId === ch.id ||
-                      probe.pendingId === ch.id ||
-                      accountProbe.pendingId === ch.id ||
-                      syncKeys.pendingId === ch.id ||
-                      toggle.pendingId === ch.id ||
-                      del.pendingId === ch.id;
-                    return (
-                      <tr
-                        key={ch.id}
-                        className={`is-clickable${active ? " is-selected" : ""}`}
-                        onClick={() => selectRow(ch.id)}
-                        onContextMenu={(event) => {
-                          event.preventDefault();
-                          selectRow(ch.id);
-                          setContextMenu({
-                            channelId: ch.id,
-                            top: event.clientY,
-                            left: event.clientX,
-                          });
-                        }}
-                      >
-                        <td>
-                          <strong>{ch.name}</strong>
-                          {ch.group_name ? (
-                            <span className="capability-chip is-group">
-                              {ch.group_name}
-                            </span>
-                          ) : null}
-                          {displayBase ? (
-                            <a
-                              className="mono truncate base-url-link"
-                              href={displayBase}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              title={displayBase}
-                              onClick={(event) => event.stopPropagation()}
-                            >
-                              {displayBase}
-                            </a>
-                          ) : (
-                            <small className="mono truncate">
-                              {t("channels.inheritsSite")}
-                            </small>
-                          )}
-                        </td>
-                        <td className="status-col">
-                          <div className="capability-stack is-compact">
-                            <ChannelStatusBadges overview={overview} />
-                            {caps.tokenProblem ? (
-                              <span className="capability-chip is-warn">
-                                {t("channels.badge.tokenProblem")}
-                              </span>
-                            ) : null}
-                            {caps.checkinScheduled ? (
-                              <span className="capability-chip is-checkin">
-                                {t("channels.badge.checkinOn")}
-                              </span>
-                            ) : caps.checkinNeedsUserID ? (
-                              <span className="capability-chip is-warn">
-                                {t("channels.badge.needsUserId")}
-                              </span>
-                            ) : null}
-                            {caps.modelsReady ? (
-                              <span className="capability-chip is-models">
-                                {t("channels.badge.models")}
-                              </span>
-                            ) : null}
-                          </div>
-                        </td>
-                        <td
-                          title={t("channels.modelsTotalHint")}
-                        >
-                          {overview.last_checked_at ? (
-                            overview.discovered_model_count > 0 ? (
-                              <strong>{overview.discovered_model_count}</strong>
-                            ) : (
-                              <span className="muted">0</span>
-                            )
-                          ) : (
-                            <span className="muted">—</span>
-                          )}
-                        </td>
-                        <td
-                          title={
-                            overview.model_count > 0
-                              ? t("channels.modelsAdoptedHint")
-                              : t("channels.modelsNoneAdoptedHint")
-                          }
-                        >
-                          {overview.model_count > 0 ? (
-                            <strong>{overview.model_count}</strong>
-                          ) : (
-                            <span className="muted">0</span>
-                          )}
-                        </td>
-                        <td>
-                          {overview.last_checked_at
-                            ? t("common.ms", { n: overview.last_latency_ms })
-                            : "—"}
-                        </td>
-                        <td
-                          className="actions row-actions"
-                          onClick={(event) => event.stopPropagation()}
-                        >
-                          <ActionMenu
-                            compact
-                            label={t("common.moreActions")}
-                            disabled={rowBusy}
-                            onOpenChange={(open) => {
-                              // Ensure credentials for this row's site are loaded so check-in
-                              // toggle label matches the overview badge.
-                              if (open) selectRow(ch.id);
-                            }}
-                            items={connectionActions(overview)}
-                          />
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </DataTable>
-              </ListShell>
-              {contextMenu
-                ? (() => {
-                    const overview =
-                      rows.find(
-                        (row) => row.channel.id === contextMenu.channelId,
-                      ) ??
-                      (overviews.data ?? []).find(
-                        (row) => row.channel.id === contextMenu.channelId,
-                      );
-                    if (!overview) return null;
-                    return (
-                      <ActionMenu
-                        label={t("common.moreActions")}
-                        open
-                        onOpenChange={(open) => {
-                          if (!open) setContextMenu(null);
-                        }}
-                        position={{
-                          top: contextMenu.top,
-                          left: contextMenu.left,
-                        }}
-                        items={connectionActions(overview, {
-                          closeContext: true,
-                        })}
-                      />
-                    );
-                  })()
-                : null}
-            </EntityState>
-          </Panel>
+        <div className="channels-workspace">
+          <ChannelDirectory
+            t={t}
+            query={query}
+            setQuery={setQuery}
+            params={params}
+            setParams={setParams}
+            typeFilter={typeFilter}
+            setTypeFilter={setTypeFilter}
+            groupFilter={groupFilter}
+            setGroupFilter={setGroupFilter}
+            updateFilterParam={updateFilterParam}
+            filterOptions={filterOptions}
+            healthFilter={healthFilter}
+            setHealthFilter={setHealthFilter}
+            overviews={overviews}
+            rows={rows}
+            modelMatches={modelMatches}
+            pageRows={pageRows}
+            siteById={siteById}
+            selected={selected}
+            pagination={pagination}
+            bulkMode={bulkMode}
+            bulkSelected={bulkSelected}
+            toggleBulkSelected={toggleBulkSelected}
+            setBulkSelected={setBulkSelected}
+            exitBulkMode={exitBulkMode}
+            bulkBusy={bulkBusy}
+            bulkSync={bulkSync}
+            bulkStatus={bulkStatus}
+            bulkHeader={bulkHeader}
+            openAdd={openAdd}
+            selectRow={selectRow}
+            setInspectorOpen={setInspectorOpen}
+            setContextMenu={setContextMenu}
+            contextMenu={contextMenu}
+            connectionActions={connectionActions}
+            pending={{ refresh, probe, accountProbe, syncKeys, toggle, del }}
+          />
 
-          <div className="detail-card ops-detail-card is-compact">
-            {!selected ? (
-              <div className="detail-empty">{t("channels.selectHint")}</div>
-            ) : (
-              <ChannelDetail
-                overview={selected}
-                site={
-                  selected.channel.site_id != null
-                    ? siteById.get(selected.channel.site_id)
-                    : undefined
-                }
-                accountData={
-                  accountProbe.data?.channel_id === selected.channel.id
-                    ? accountProbe.data
-                    : null
-                }
-                busy={
-                  refresh.pendingId === selected.channel.id ||
-                  probe.pendingId === selected.channel.id ||
-                  accountProbe.pendingId === selected.channel.id ||
-                  syncKeys.pendingId === selected.channel.id ||
-                  toggle.pendingId === selected.channel.id ||
-                  del.pendingId === selected.channel.id ||
-                  ping.pendingId === selected.channel.id
-                }
-                onCheckAccount={() => {
-                  accountProbe.reset();
-                  accountProbe.mutate(selected.channel.id);
-                }}
-                onPing={() => {
-                  ping.reset();
-                  ping.mutate(selected.channel.id);
-                }}
-                pingPending={ping.pendingId === selected.channel.id}
-                pingResult={
-                  ping.data?.channel_id === selected.channel.id
-                    ? ping.data
-                    : null
-                }
-                onRefresh={() => {
-                  refresh.reset();
-                  refresh.mutate(selected.channel.id);
-                }}
-                onEdit={() => {
-                  saveEdit.reset();
-                  setEdit(selected.channel);
-                }}
-              />
-            )}
-          </div>
+          <ThemeDetails
+            open={inspectorOpen}
+            title={t("channels.details")}
+            onClose={() => setInspectorOpen(false)}
+          >
+            <div className="detail-card ops-detail-card is-compact">
+              {!selected ? (
+                <div className="detail-empty">{t("channels.selectHint")}</div>
+              ) : (
+                <ChannelDetail
+                  overview={selected}
+                  site={
+                    selected.channel.site_id != null
+                      ? siteById.get(selected.channel.site_id)
+                      : undefined
+                  }
+                  accountData={
+                    accountProbe.data?.channel_id === selected.channel.id ? accountProbe.data : null
+                  }
+                  busy={
+                    refresh.pendingId === selected.channel.id ||
+                    probe.pendingId === selected.channel.id ||
+                    accountProbe.pendingId === selected.channel.id ||
+                    syncKeys.pendingId === selected.channel.id ||
+                    toggle.pendingId === selected.channel.id ||
+                    del.pendingId === selected.channel.id ||
+                    ping.pendingId === selected.channel.id
+                  }
+                  onCheckAccount={() => {
+                    accountProbe.reset();
+                    accountProbe.mutate(selected.channel.id);
+                  }}
+                  onPing={() => {
+                    ping.reset();
+                    ping.mutate(selected.channel.id);
+                  }}
+                  pingPending={ping.pendingId === selected.channel.id}
+                  pingResult={ping.data?.channel_id === selected.channel.id ? ping.data : null}
+                  onRefresh={() => {
+                    refresh.reset();
+                    refresh.mutate(selected.channel.id);
+                  }}
+                  onEdit={() => {
+                    saveEdit.reset();
+                    setEdit(selected.channel);
+                  }}
+                />
+              )}
+            </div>
+          </ThemeDetails>
         </div>
       </div>
 
-      {addOpen ? (
-        <AddChannelDialog
-          pending={createConnection.isPending}
-          error={createConnection.error}
-          onClose={() => {
-            if (createConnection.isPending) return;
-            setAddOpen(false);
-          }}
-          onSave={(value, options) => submitCreate(value, options)}
-        />
-      ) : null}
-      {edit ? (
-        <EditChannelDialog
-          // Remount per channel: every field seeds from `value`, so reusing
-          // the instance across rows would leave the previous channel's
-          // values (notably the sync mode radio) in the form.
-          key={edit.id}
-          value={edit}
-          routeOverviews={routeOverviewsQuery.data}
-          site={edit.site_id != null ? siteById.get(edit.site_id) : undefined}
-          credentials={credentials.data ?? []}
-          credential={(() => {
-            const overview =
-              (overviews.data ?? []).find(
-                (row) => row.channel.id === edit.id,
-              ) ?? null;
-            return overview ? relayCredentialFor(overview) : undefined;
-          })()}
-							userCredential={(() => {
-								const overview =
-									(overviews.data ?? []).find(
-										(row) => row.channel.id === edit.id,
-									) ?? null;
-								return overview ? userCredentialFor(overview) : undefined;
-							})()}
-							checkinSupported={
-								(() => {
-									const overview =
-										(overviews.data ?? []).find(
-											(row) => row.channel.id === edit.id,
-										) ?? null;
-									return overview?.checkin_supported ?? false;
-								})()
-							}
-							checkinModuleOn={checkinEnabled}
-          pending={
-            saveEdit.isPending ||
-            setCredentialStatus.isPending ||
-            addApiKeyCredential.isPending ||
-            deleteApiKeyCredential.isPending
-          }
-          error={
-            saveEdit.error ??
-            setCredentialStatus.error ??
-            addApiKeyCredential.error ??
-            deleteApiKeyCredential.error
-          }
-          onClose={() => {
-            setEdit(null);
-            setModelsChannel(null);
-            setKeysChannel(null);
-          }}
-          onSave={(value) => saveEdit.mutate(value)}
-          onManageModels={() => {
-            setKeysChannel(null);
-            setModelsChannel(edit);
-          }}
-          onManageKeys={() => {
-            setModelsChannel(null);
-            setKeysChannel(edit);
-          }}
-          onRefreshModels={() => {
-            refresh.reset();
-            refresh.mutate(edit.id);
-          }}
-          refreshingModels={refresh.pendingId === edit.id}
-        />
-      ) : null}
-      {createKeyChannel ? (
-        <CreateKeyDialog
-          channelName={createKeyChannel.name}
-          channelId={createKeyChannel.id}
-          pending={createUpstreamKey.isPending}
-          error={createUpstreamKey.error}
-          onClose={() => {
-            if (createUpstreamKey.isPending) return;
-            createUpstreamKey.reset();
-            setCreateKeyChannel(null);
-          }}
-          onCreate={(group) => {
-            // Synchronous re-entry guard: the disabled={pending} button only
-            // takes effect after re-render, so rapid double-clicks could
-            // otherwise create several upstream tokens.
-            if (createKeyLocked.current) return;
-            createKeyLocked.current = true;
-            const input = {
-              id: createKeyChannel.id,
-              name: `gateway-${group || "default"}`,
-              group,
-            };
-            createUpstreamKey.mutate(input, {
-              onSuccess: () => {
-                // Close immediately so the operator cannot click again;
-                // the toast is the success signal.
-                createUpstreamKey.reset();
-                setCreateKeyChannel(null);
-                toast.push({
-                  tone: "success",
-                  message: t("channels.createKeySuccess", {
-                    name: createKeyChannel.name,
-                  }),
-                });
-              },
-              onSettled: () => {
-                createKeyLocked.current = false;
-              },
-            });
-          }}
-          // If the upstream masks the fresh key, offer a one-click sync
-          // import inside the dialog instead of forcing a manual paste.
-          syncPending={syncKeys.isPending}
-          onSync={() => {
-            createUpstreamKey.reset();
-            syncKeys.reset();
-            syncKeys.mutate(createKeyChannel.id);
-          }}
-        />
-      ) : null}
-      {modelsChannel ? (
-        <Drawer
-          title={t("channels.modelsSection")}
-          width={780}
-          onClose={closeModelsDrawer}
-          footer={
-            <Button variant="secondary" onClick={closeModelsDrawer}>
-              {t("common.close")}
-            </Button>
-          }
-        >
-          <ChannelModelsPanel
-            channelId={modelsChannel.id}
-            header={
-              <div className="channel-models-panel-head">
-                <div>
-                  <p className="page-kicker">{modelsChannel.name}</p>
-                  <p className="detail-section-empty is-quiet">
-                    {t("channels.modelsManageHint")}
-                  </p>
-                </div>
-              </div>
-            }
-          />
-        </Drawer>
-      ) : null}
-      {keysChannel ? (
-        <ChannelKeysDrawer
-          channel={keysChannel}
-          apiKeys={(credentials.data ?? []).filter(
-            (item) => item.kind === "api_key",
-          )}
-          pending={
-            setCredentialStatus.isPending || deleteApiKeyCredential.isPending
-          }
-          addApiKeyPending={addApiKeyCredential.isPending}
-          syncKeysPending={syncKeys.isPending}
-          onToggleKey={(id, enabled) =>
-            setCredentialStatus.mutate({
-              id,
-              status: enabled ? "enabled" : "disabled",
-            })
-          }
-          onUpdateKeyModels={(id, modelsCsv) =>
-            updateKeyModels.mutate({ id, modelsCsv })
-          }
-          onDeleteKey={(id) => deleteApiKeyCredential.mutate(id)}
-          onAddApiKey={(secret) => {
-            const siteId = keysChannel.site_id;
-            if (!siteId) return;
-            addApiKeyCredential.mutate({ siteId, secret });
-          }}
-          onSyncKeys={() => {
-            syncKeys.reset();
-            syncKeys.mutate(keysChannel.id);
-          }}
-          onClose={() => setKeysChannel(null)}
-        />
-      ) : null}
-      {remove ? (
-        <ConfirmDialog
-          title={t("channels.deleteTitle")}
-          message={t("channels.deleteMsg", { name: remove.name })}
-          pending={del.isPending}
-          error={del.error}
-          onClose={() => setRemove(null)}
-          onConfirm={() => del.mutate(remove.id)}
-        />
-      ) : null}
+      {keepaliveOpen ? <KeepaliveDialog onClose={() => setKeepaliveOpen(false)} /> : null}
+
+      <ChannelDialogs
+        t={t}
+        toast={toast}
+        params={params}
+        setParams={setParams}
+        siteById={siteById}
+        overviews={overviews.data ?? []}
+        routeOverviews={routeOverviewsQuery.data}
+        credentials={credentials.data ?? []}
+        userCredentialFor={userCredentialFor}
+        relayCredentialFor={relayCredentialFor}
+        addOpen={addOpen}
+        setAddOpen={setAddOpen}
+        edit={edit}
+        setEdit={setEdit}
+        modelsChannel={modelsChannel}
+        setModelsChannel={setModelsChannel}
+        keysChannel={keysChannel}
+        setKeysChannel={setKeysChannel}
+        createKeyChannel={createKeyChannel}
+        setCreateKeyChannel={setCreateKeyChannel}
+        remove={remove}
+        setRemove={setRemove}
+        createKeyLocked={createKeyLocked}
+        closeModelsDrawer={closeModelsDrawer}
+        submitCreate={submitCreate}
+        mutations={{
+          createConnection,
+          saveEdit,
+          setCredentialStatus,
+          addApiKeyCredential,
+          deleteApiKeyCredential,
+          createUpstreamKey,
+          syncKeys,
+          updateKeyModels,
+          updateKeyPriority,
+          refresh,
+          del,
+        }}
+      />
     </Page>
   );
 }

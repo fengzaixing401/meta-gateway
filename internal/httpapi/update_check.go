@@ -51,9 +51,11 @@ func (h *UpdateCheckHandler) write(w http.ResponseWriter, enabled bool, status u
 		"enabled":     enabled,
 		"current":     buildinfo.Version,
 		"latest":      status.Latest,
-		"has_update":  status.HasUpdate,
+		"has_update":  enabled && status.Err == "" && status.HasUpdate,
 		"release_url": status.URL,
 		"checked_at":  status.CheckedAt,
 		"error":       status.Err,
+		"notes":       status.Notes,
+		"channel":     status.Channel,
 	})
 }

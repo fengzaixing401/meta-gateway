@@ -1,10 +1,12 @@
 package store_test
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/lan/meta-gateway/internal/domain"
 	"github.com/lan/meta-gateway/internal/store"
@@ -41,8 +43,18 @@ func TestModelChangesSnapshotLifecycle(t *testing.T) {
 	}
 	reconcile(t, db, a, "new")
 	repeated, _ := db.ModelChanges()
-	if !reflect.DeepEqual(got, repeated) {
-		t.Fatalf("repeat changed log")
+	// The repeat must not spawn rows, but the pending removal's sustained-
+	// absence counter advances once per complete snapshot.
+	if len(repeated.Items) != len(got.Items) {
+		t.Fatalf("repeat changed row count: %+v", repeated)
+	}
+	for i := range repeated.Items {
+		if repeated.Items[i].ID != got.Items[i].ID || repeated.Items[i].Kind != got.Items[i].Kind || repeated.Items[i].Status != got.Items[i].Status {
+			t.Fatalf("repeat changed log: %+v vs %+v", repeated.Items[i], got.Items[i])
+		}
+		if repeated.Items[i].Kind == "removed" && repeated.Items[i].MissCount != 1 {
+			t.Fatalf("miss count not advanced: %+v", repeated.Items[i])
+		}
 	}
 	// Duplicate snapshot rows force the entire reconcile transaction to fail.
 	_, err = db.DiscoveredModel.Reconcile(t.Context(), store.ReconcileInput{ChannelID: a, Models: []string{"broken", "broken"}})
@@ -50,7 +62,7 @@ func TestModelChangesSnapshotLifecycle(t *testing.T) {
 		t.Fatal("expected snapshot failure")
 	}
 	failed, _ := db.ModelChanges()
-	if !reflect.DeepEqual(got, failed) {
+	if !reflect.DeepEqual(repeated, failed) {
 		t.Fatal("failure changed log")
 	}
 	reconcile(t, db, a, "old", "new")
@@ -195,5 +207,327 @@ func TestModelChangesBulkApplyRollsBack(t *testing.T) {
 	}
 	if n, err := db.ApplyModelChanges(req); err != nil || n != 2 {
 		t.Fatalf("bulk: %d %v", n, err)
+	}
+}
+
+func findRemoved(t *testing.T, items []store.ModelChange, model string) store.ModelChange {
+	t.Helper()
+	for _, x := range items {
+		if x.Kind == "removed" && x.ModelName == model {
+			return x
+		}
+	}
+	t.Fatalf("removed row for %q not found", model)
+	return store.ModelChange{}
+}
+
+func TestModelChangesConfirmationSignals(t *testing.T) {
+	db := openTestDB(t)
+	a := syncModeFixture(t, db, "conf", domain.ModelSyncModeManual)
+	reconcile(t, db, a, "gone")
+	reconcile(t, db, a)
+	removed := findRemoved(t, mustChanges(t, db).Items, "gone")
+	if removed.Confirmed || removed.MissCount != 0 {
+		t.Fatalf("detection round: %+v", removed)
+	}
+
+	// Each complete sync without the model advances the counter; the row is
+	// confirmed once it reaches the threshold.
+	for i := 0; i < store.ModelChangeConfirmSynces; i++ {
+		reconcile(t, db, a)
+	}
+	removed = findRemoved(t, mustChanges(t, db).Items, "gone")
+	if !removed.Confirmed || removed.MissCount != store.ModelChangeConfirmSynces {
+		t.Fatalf("after %d syncs: %+v", store.ModelChangeConfirmSynces, removed)
+	}
+
+	// A partial snapshot (some keys silent) is unreliable evidence: flagged on
+	// fresh removals, and it must not advance the confirmation counter.
+	if _, err := db.DiscoveredModel.Reconcile(context.Background(), store.ReconcileInput{
+		ChannelID: a, Source: "test", CheckedAt: time.Now(), PartialDiscovery: true,
+	}); err != nil {
+		t.Fatalf("partial reconcile: %v", err)
+	}
+	removed = findRemoved(t, mustChanges(t, db).Items, "gone")
+	if !removed.Confirmed || removed.MissCount != store.ModelChangeConfirmSynces {
+		t.Fatalf("partial sync advanced counter: %+v", removed)
+	}
+
+	// The relay-reported model-not-found blacklist surfaces on the row.
+	if err := db.BlockModel(a, "gone", "model_not_found"); err != nil {
+		t.Fatal(err)
+	}
+	removed = findRemoved(t, mustChanges(t, db).Items, "gone")
+	if !removed.RuntimeBlocked || removed.BlockedAt == "" {
+		t.Fatalf("runtime block not surfaced: %+v", removed)
+	}
+
+	// Return, then vanish again inside the flap window: the fresh removal
+	// carries the churn counter instead of reading as a first-time event.
+	if _, err := db.Exec(`DELETE FROM channel_model_blocks WHERE channel_id=?`, a); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, db, a, "gone")
+	reconcile(t, db, a)
+	removed = findRemoved(t, mustChanges(t, db).Items, "gone")
+	if removed.FlapCount != 1 {
+		t.Fatalf("flap count: %+v", removed)
+	}
+}
+
+func TestModelChangesPruneAndAutoIgnore(t *testing.T) {
+	db := openTestDB(t)
+	a := syncModeFixture(t, db, "sweep", domain.ModelSyncModeManual)
+	reconcile(t, db, a, "gone-impact", "stale-harmless")
+	// "gone-impact" has a live member, so its removal is NOT harmless.
+	route, err := db.Route.Create(&domain.Route{ModelPattern: "gone-impact", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RouteMember.Create(&domain.RouteMember{RouteID: route, ChannelID: a, Weight: 100, Enabled: true, Auto: true}); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, db, a, "stale-harmless", "brand-new")
+	reconcile(t, db, a, "brand-new")
+	changes := mustChanges(t, db)
+	if changes.Summary.Removed != 2 {
+		t.Fatalf("setup: %+v", changes.Summary)
+	}
+
+	stale := time.Now().UTC().AddDate(0, 0, -30).Format(time.RFC3339Nano)
+	if _, err := db.Exec(`UPDATE model_changes SET detected_at=? WHERE kind='removed'`, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	// Auto-ignore flips only the member-free removal; "gone-impact" keeps
+	// reminding because a route member still binds the model.
+	n, err := db.AutoIgnoreHarmlessModelChanges(7)
+	if err != nil || n != 1 {
+		t.Fatalf("auto ignore: %d %v", n, err)
+	}
+	changes = mustChanges(t, db)
+	if got := findRemoved(t, changes.Items, "stale-harmless"); got.Status != "ignored" {
+		t.Fatalf("harmless not ignored: %+v", got)
+	}
+	if got := findRemoved(t, changes.Items, "gone-impact"); got.Status != "pending" {
+		t.Fatalf("impacted removal ignored: %+v", got)
+	}
+
+	// Prune deletes finished rows past the window; pending ones survive.
+	if _, err := db.Exec(`UPDATE model_changes SET detected_at=?, status='resolved' WHERE model_name='stale-harmless'`, stale); err != nil {
+		t.Fatal(err)
+	}
+	pruned, err := db.PruneModelChanges(7)
+	if err != nil || pruned != 1 {
+		t.Fatalf("prune: %d %v", pruned, err)
+	}
+	changes = mustChanges(t, db)
+	for _, x := range changes.Items {
+		if x.ModelName == "stale-harmless" {
+			t.Fatalf("pruned row survived: %+v", x)
+		}
+	}
+}
+
+func mustChanges(t *testing.T, db *store.DB) store.ModelChanges {
+	t.Helper()
+	changes, err := db.ModelChanges()
+	if err != nil {
+		t.Fatalf("model changes: %v", err)
+	}
+	return changes
+}
+
+// Discarding a removal deletes the dead binding instead of repointing it, and
+// takes the route with it when that binding was the route's last member.
+func TestModelChangesDiscardDeletesLastMemberRoute(t *testing.T) {
+	db := openTestDB(t)
+	a := syncModeFixture(t, db, "a", domain.ModelSyncModeManual)
+	b := syncModeFixture(t, db, "b", domain.ModelSyncModeManual)
+	reconcile(t, db, a, "old")
+	reconcile(t, db, b, "old")
+
+	last, err := db.Route.Create(&domain.Route{ModelPattern: "public-one", Enabled: true, Notes: "keep"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastMember, err := db.RouteMember.Create(&domain.RouteMember{RouteID: last, ChannelID: a, MappingJSON: `{"real":"old"}`, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second route keeps a member on another channel: its own binding goes,
+	// the route stays.
+	shared, err := db.Route.Create(&domain.Route{ModelPattern: "public-two", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedA, err := db.RouteMember.Create(&domain.RouteMember{RouteID: shared, ChannelID: a, MappingJSON: `{"real":"old"}`, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RouteMember.Create(&domain.RouteMember{RouteID: shared, ChannelID: b, MappingJSON: `{"real":"old"}`, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	// A wildcard binding without a constant rewrite answers for every model,
+	// so it must never be deletable through a removal.
+	wildcard, err := db.Route.Create(&domain.Route{ModelPattern: "*", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wildMember, err := db.RouteMember.Create(&domain.RouteMember{RouteID: wildcard, ChannelID: a, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reconcile(t, db, a, "new")
+	changes, err := db.ModelChanges()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var removed store.ModelChange
+	for _, x := range changes.Items {
+		if x.Kind == "removed" {
+			removed = x
+		}
+	}
+	if len(removed.Members) != 3 {
+		t.Fatalf("impact: %+v", removed.Members)
+	}
+	for _, member := range removed.Members {
+		want := member.MemberID != wildMember
+		if member.Deletable != want {
+			t.Fatalf("deletable for member %d: %+v", member.MemberID, member)
+		}
+	}
+
+	req := store.ModelChangeDiscardRequest{ChangeIDs: []int64{removed.ID}, MemberIDs: []int64{wildMember}}
+	if _, err := db.PreviewModelDiscard(req); !errors.Is(err, store.ErrModelChangeConflict) {
+		t.Fatalf("wildcard discard accepted: %v", err)
+	}
+
+	req.MemberIDs = []int64{lastMember, sharedA}
+	preview, err := db.PreviewModelDiscard(req)
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if preview.Routes != 1 || len(preview.Items) != 2 {
+		t.Fatalf("preview: %+v", preview)
+	}
+	for _, item := range preview.Items {
+		if item.MemberID == lastMember && !item.RouteDeleted {
+			t.Fatalf("last member not flagged for route deletion: %+v", item)
+		}
+		if item.MemberID == sharedA && item.RouteDeleted {
+			t.Fatalf("shared route flagged for deletion: %+v", item)
+		}
+	}
+	// A member added after the preview would be deleted silently by a route
+	// wipe, so the token has to change.
+	if _, err := db.RouteMember.Create(&domain.RouteMember{RouteID: shared, ChannelID: b, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	req.PreviewToken = preview.PreviewToken
+	if _, err := db.ApplyModelDiscard(req); !errors.Is(err, store.ErrModelChangeConflict) {
+		t.Fatalf("stale discard applied: %v", err)
+	}
+	if member, err := db.RouteMember.GetByID(lastMember); err != nil || member == nil {
+		t.Fatalf("member deleted by a rejected discard: %+v %v", member, err)
+	}
+
+	if preview, err = db.PreviewModelDiscard(req); err != nil {
+		t.Fatal(err)
+	}
+	req.PreviewToken = preview.PreviewToken
+	result, err := db.ApplyModelDiscard(req)
+	if err != nil {
+		t.Fatalf("discard: %v", err)
+	}
+	if result.Removed != 2 || result.Routes != 1 {
+		t.Fatalf("result: %+v", result)
+	}
+	if route, err := db.Route.GetByID(last); err != nil || route != nil {
+		t.Fatalf("emptied route kept: %+v %v", route, err)
+	}
+	if members, err := db.RouteMember.ListByRoute(last); err != nil || len(members) != 0 {
+		t.Fatalf("last route members: %+v %v", members, err)
+	}
+	route, err := db.Route.GetByID(shared)
+	if err != nil || route == nil {
+		t.Fatalf("shared route deleted: %v", err)
+	}
+	if members, err := db.RouteMember.ListByRoute(shared); err != nil || len(members) != 2 {
+		t.Fatalf("shared route members: %+v %v", members, err)
+	}
+	after, err := db.ModelChanges()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range after.Items {
+		if x.ID != removed.ID {
+			continue
+		}
+		// The wildcard binding is still wired to channel a, so the removal keeps
+		// its impact and stays actionable — discarding two of three bindings
+		// must not close the reminder.
+		if x.Status != "pending" || len(x.Members) != 1 || x.Members[0].MemberID != wildMember {
+			t.Fatalf("removal after discard: %+v", x)
+		}
+	}
+}
+
+// Discarding the last binding of a removal closes the reminder: nothing is
+// bound to the vanished model any more, so there is nothing left to repair.
+func TestModelChangesDiscardClosesFullyUnboundRemoval(t *testing.T) {
+	db := openTestDB(t)
+	c := syncModeFixture(t, db, "c", domain.ModelSyncModeManual)
+	reconcile(t, db, c, "old")
+	route, err := db.Route.Create(&domain.Route{ModelPattern: "public-three", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := db.RouteMember.Create(&domain.RouteMember{RouteID: route, ChannelID: c, MappingJSON: `{"real":"old"}`, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, db, c, "new")
+	changes, err := db.ModelChanges()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var removed store.ModelChange
+	for _, x := range changes.Items {
+		if x.Kind == "removed" {
+			removed = x
+		}
+	}
+	if len(removed.Members) != 1 {
+		t.Fatalf("impact: %+v", removed.Members)
+	}
+	req := store.ModelChangeDiscardRequest{ChangeIDs: []int64{removed.ID}, MemberIDs: []int64{member}}
+	preview, err := db.PreviewModelDiscard(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.PreviewToken = preview.PreviewToken
+	result, err := db.ApplyModelDiscard(req)
+	if err != nil {
+		t.Fatalf("discard: %v", err)
+	}
+	if result.Removed != 1 || result.Routes != 1 {
+		t.Fatalf("result: %+v", result)
+	}
+	after, err := db.ModelChanges()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range after.Items {
+		if x.ID == removed.ID && x.Status != "applied" {
+			t.Fatalf("removal still pending: %+v", x)
+		}
+	}
+	// A second apply of the same token is refused rather than deleting
+	// whatever now holds that member id.
+	if _, err := db.ApplyModelDiscard(req); !errors.Is(err, store.ErrModelChangeConflict) {
+		t.Fatalf("replayed discard: %v", err)
 	}
 }

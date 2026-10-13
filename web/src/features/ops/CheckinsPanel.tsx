@@ -1,17 +1,30 @@
-import { Play } from "lucide-react"
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { useEffect, useMemo, useState } from "react"
-import { api } from "../../api/client"
-import { useAdminMutation } from "../../hooks/useAdminMutation"
-import { useClientPagination } from "../../hooks/useClientPagination"
-import { useI18n } from "../../i18n"
-import { useSession } from "../../session"
-import { useModules } from "../../hooks/useModules"
-import { useToast } from "../../toast"
-import { SCHEDULE_PRESETS, scheduleFromSettings, settingsFromSchedule, type SchedulePresetId } from "../../lib/schedulePresets"
-import { PaginationBar } from "../../components/PaginationBar"
-import { Button, ConfirmDialog, DataTable, ErrorState, Loading, Panel, StatusBadge, formatDate } from "../../components/ui"
-import { CheckinTimePicker } from "./CheckinTimePicker"
+import { Play } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
+import { api } from "../../api/client";
+import { useAdminMutation } from "../../hooks/useAdminMutation";
+import { useClientPagination } from "../../hooks/useClientPagination";
+import { useI18n } from "../../i18n";
+import { useSession } from "../../session";
+import { useToast } from "../../toast";
+import {
+  SCHEDULE_PRESETS,
+  scheduleFromSettings,
+  settingsFromSchedule,
+  type SchedulePresetId,
+} from "../../lib/schedulePresets";
+import { PaginationBar } from "../../components/PaginationBar";
+import {
+  Button,
+  ConfirmDialog,
+  DataTable,
+  ErrorState,
+  Loading,
+  Panel,
+  StatusBadge,
+  formatDate,
+} from "../../components/ui";
+import { CheckinTimePicker } from "./CheckinTimePicker";
 
 /** Human-readable check-in category; falls back to the raw code. */
 function checkinCategoryLabel(
@@ -50,10 +63,7 @@ function siteDisplayName(
       subtitle: "",
     };
   }
-  const name =
-    site.name.trim() ||
-    site.base_url.trim() ||
-    t("common.siteId", { id: siteId });
+  const name = site.name.trim() || site.base_url.trim() || t("common.siteId", { id: siteId });
   let host = "";
   try {
     host = site.base_url ? new URL(site.base_url).host : "";
@@ -72,7 +82,6 @@ export function CheckinsPanel({ children }: { children?: React.ReactNode }) {
   const { client } = useSession();
   const { t } = useI18n();
   const toast = useToast();
-  const { checkinEnabled, ready: modulesReady } = useModules();
   const s = api(client!);
   const qc = useQueryClient();
   const [status, setStatus] = useState("");
@@ -80,7 +89,6 @@ export function CheckinsPanel({ children }: { children?: React.ReactNode }) {
   const runtime = useQuery({
     queryKey: ["runtime-settings"],
     queryFn: ({ signal }) => s.runtimeSettings(signal),
-    enabled: modulesReady && checkinEnabled,
   });
   const [scheduleDraft, setScheduleDraft] = useState<{
     preset: SchedulePresetId;
@@ -115,7 +123,6 @@ export function CheckinsPanel({ children }: { children?: React.ReactNode }) {
     queryKey: ["checkin-logs", status],
     queryFn: ({ signal }) =>
       s.checkinLogs(`?limit=100${status ? `&status=${status}` : ""}`, signal),
-    enabled: modulesReady && checkinEnabled,
     retry: (failureCount, error) => {
       const message = error instanceof Error ? error.message : String(error);
       if (/plugin_disabled/i.test(message)) return false;
@@ -127,7 +134,6 @@ export function CheckinsPanel({ children }: { children?: React.ReactNode }) {
   const sites = useQuery({
     queryKey: ["sites"],
     queryFn: ({ signal }) => s.sites(signal),
-    enabled: modulesReady && checkinEnabled,
   });
   const sitesById = useMemo(() => {
     const map = new Map<number, { name: string; base_url: string }>();
@@ -149,14 +155,6 @@ export function CheckinsPanel({ children }: { children?: React.ReactNode }) {
   const checkinRows = logs.data ?? [];
   const checkinPagination = useClientPagination(checkinRows, 15);
 
-  if (modulesReady && !checkinEnabled) {
-    return (
-      <Panel>
-        <p className="detail-empty">{t("ops.checkinModuleOff")}</p>
-      </Panel>
-    );
-  }
-
   const schedule = scheduleDraft ?? { preset: "off" as const, cron: "" };
   const scheduleDirty =
     runtime.data != null &&
@@ -170,12 +168,12 @@ export function CheckinsPanel({ children }: { children?: React.ReactNode }) {
     <>
       <Panel
         title={t("ops.checkin.scheduleTitle")}
+        lede={t("ops.checkin.scheduleLede")}
         titleHelp={t("ops.checkin.scheduleHint")}
       >
-        <label
-          className="check"
-        >
+        <label className="check">
           <input
+            className="switch"
             type="checkbox"
             disabled={saveSchedule.isPending || scheduleDraft == null}
             checked={schedule.preset !== "off"}
@@ -191,7 +189,7 @@ export function CheckinsPanel({ children }: { children?: React.ReactNode }) {
           <span>{t("ops.checkin.scheduleEnabled")}</span>
         </label>
         {schedule.preset !== "off" ? (
-          <div className="form-grid" style={{ marginTop: 12 }}>
+          <div className="form-grid is-spaced">
             <label className="field">
               <span>{t("ops.checkin.schedulePreset")}</span>
               <select
@@ -200,9 +198,7 @@ export function CheckinsPanel({ children }: { children?: React.ReactNode }) {
                 onChange={(e) => {
                   const preset = e.target.value as SchedulePresetId;
                   if (!scheduleDraft) return;
-                  const known = SCHEDULE_PRESETS.find(
-                    (item) => item.id === preset,
-                  );
+                  const known = SCHEDULE_PRESETS.find((item) => item.id === preset);
                   setScheduleDraft({
                     preset,
                     cron:
@@ -212,13 +208,11 @@ export function CheckinsPanel({ children }: { children?: React.ReactNode }) {
                   });
                 }}
               >
-                {SCHEDULE_PRESETS.filter((item) => item.id !== "off").map(
-                  (item) => (
-                    <option key={item.id} value={item.id}>
-                      {t(`ops.schedule.preset.${item.id}`)}
-                    </option>
-                  ),
-                )}
+                {SCHEDULE_PRESETS.filter((item) => item.id !== "off").map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {t(`ops.schedule.preset.${item.id}`)}
+                  </option>
+                ))}
               </select>
             </label>
             {schedule.preset === "custom" || schedule.preset === "daily" ? (
@@ -227,39 +221,45 @@ export function CheckinsPanel({ children }: { children?: React.ReactNode }) {
                 <CheckinTimePicker
                   value={schedule.cron}
                   disabled={saveSchedule.isPending}
-                  onChange={(cron) =>
-                    setScheduleDraft({ preset: "custom", cron })
-                  }
+                  onChange={(cron) => setScheduleDraft({ preset: "custom", cron })}
                 />
               </label>
             ) : (
               <div className="field">
                 <span>{t("ops.checkin.scheduleCron")}</span>
-                <input
-                  className="mono"
-                  disabled
-                  value={schedule.cron}
-                  readOnly
-                />
+                <input className="mono" disabled value={schedule.cron} readOnly />
               </div>
             )}
           </div>
         ) : null}
-        <div style={{ marginTop: 4 }}>
+        <div className="stack-tight">
           <Button
             variant="secondary"
-            disabled={
-              !scheduleDirty || saveSchedule.isPending || scheduleDraft == null
-            }
-            onClick={() =>
-              saveSchedule.mutate(settingsFromSchedule(scheduleDraft!))
-            }
+            disabled={!scheduleDirty || saveSchedule.isPending || scheduleDraft == null}
+            onClick={() => saveSchedule.mutate(settingsFromSchedule(scheduleDraft!))}
           >
-            {saveSchedule.isPending
-              ? t("common.working")
-              : t("ops.checkin.scheduleSave")}
-			</Button>
-		</div>
+            {saveSchedule.isPending ? t("common.working") : t("ops.checkin.scheduleSave")}
+          </Button>
+        </div>
+        {/* Where the schedule comes from decides whether a container rebuild
+            keeps it: an admin override lives in the database, the environment
+            does not. One short line, in the same type as everything else — the
+            mechanics behind it are in the panel's (i) rather than repeated here
+            as a paragraph the reader has to skip. */}
+        {runtime.data ? (
+          <p className="ops-panel-context">
+            <span>
+              {t("ops.checkin.scheduleSource", {
+                source: t(
+                  runtime.data.source === "admin_override"
+                    ? "ops.runtime.sourceAdmin"
+                    : "ops.runtime.sourceEnvironment",
+                ),
+              })}
+              {runtime.data.has_override ? "" : ` ${t("ops.checkin.scheduleEnvHint")}`}
+            </span>
+          </p>
+        ) : null}
       </Panel>
 
       {children}
@@ -279,20 +279,18 @@ export function CheckinsPanel({ children }: { children?: React.ReactNode }) {
             </select>
             <Button
               icon={<Play size={16} />}
-              disabled={run.isPending || !checkinEnabled}
+              disabled={run.isPending}
               onClick={() => setConfirmRun(true)}
             >
               {run.isPending ? t("ops.running") : t("ops.runEnabled")}
             </Button>
           </>
-		}
+        }
       >
         {run.error && <ErrorState error={run.error} />}
         {run.data && (
           <div className="result-strip">
-            <StatusBadge
-              value={run.data.failure_count > 0 ? "failed" : "success"}
-            />
+            <StatusBadge value={run.data.failure_count > 0 ? "failed" : "success"} />
             <span>
               {t("ops.checkinSummary", {
                 success: run.data.success_count,
@@ -327,9 +325,7 @@ export function CheckinsPanel({ children }: { children?: React.ReactNode }) {
                       const display = siteDisplayName(l.site_id, sitesById, t);
                       return (
                         <>
-                          <strong title={display.subtitle || undefined}>
-                            {display.title}
-                          </strong>
+                          <strong title={display.subtitle || undefined}>{display.title}</strong>
                           <small>
                             {display.subtitle
                               ? `${display.subtitle} · ${t("common.credentialId", { id: l.credential_id })}`

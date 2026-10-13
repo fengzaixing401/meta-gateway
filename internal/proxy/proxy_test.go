@@ -23,6 +23,10 @@ type queuedRelay struct {
 	results []*relay.Result
 	calls   []string
 	bodies  [][]byte
+	// auths records the Authorization header of each forwarded call, so a test
+	// can check what the attempt log says against the key that actually went
+	// out (the relay's own key parameter is legacy and stays empty).
+	auths []string
 }
 
 type fixedClock struct{ now time.Time }
@@ -42,8 +46,9 @@ func (r *queuedRelay) ChatCompletionsContext(_ context.Context, upstreamURL, _ s
 	return result
 }
 
-func (r *queuedRelay) ForwardWithHeaders(_ context.Context, _, upstreamURL string, _ http.Header, body []byte) *relay.Result {
+func (r *queuedRelay) ForwardWithHeaders(_ context.Context, _, upstreamURL string, headers http.Header, body []byte) *relay.Result {
 	r.bodies = append(r.bodies, append([]byte(nil), body...))
+	r.auths = append(r.auths, headers.Get("Authorization"))
 	return r.ChatCompletionsContext(context.Background(), upstreamURL, "", nil, false)
 }
 
@@ -57,7 +62,7 @@ func response(status int, body string) *relay.Result {
 
 func setupProxy(t *testing.T, upstream Relay) (*Service, *store.DB, int64, int64) {
 	t.Helper()
-	db, err := store.Open(t.TempDir())
+	db, err := store.OpenTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,6 +239,21 @@ func TestSharedAliasRewritesPerChannel(t *testing.T) {
 	if got := string(upstream.bodies[1]); !strings.Contains(got, `"model":"low-model"`) {
 		t.Fatalf("low-channel rewrite failed: %s", got)
 	}
+
+	// The log must stay attributable: every row names BOTH the alias the client
+	// asked for and the real model that answered it. Without the second name a
+	// unified route's rows are indistinguishable from one another.
+	logs, err := db.ProxyLog.ListFilter(store.ProxyLogFilter{Model: "model", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamModel := map[string]string{}
+	for _, row := range logs {
+		upstreamModel[row.RequestID] = row.UpstreamModel
+	}
+	if upstreamModel["req-shared-high"] != "high-model" || upstreamModel["req-shared-low"] != "low-model" {
+		t.Fatalf("log rows must record the upstream model, got %#v", upstreamModel)
+	}
 }
 
 func TestOversizedTransformedResponseIsBoundedAndNotRetried(t *testing.T) {
@@ -375,7 +395,7 @@ func TestKeyPoolFailsOverBeforeNextChannel(t *testing.T) {
 		response(http.StatusServiceUnavailable, `{"error":"key1 busy"}`),
 		response(http.StatusOK, `{"ok":true}`),
 	}}
-	db, err := store.Open(t.TempDir())
+	db, err := store.OpenTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,7 +474,7 @@ func TestKeyPoolFailsOverBeforeNextChannel(t *testing.T) {
 
 func TestChatUsesSiteBaseWhenChannelBaseEmpty(t *testing.T) {
 	upstream := &queuedRelay{results: []*relay.Result{response(http.StatusOK, `{"ok":true}`)}}
-	db, err := store.Open(t.TempDir())
+	db, err := store.OpenTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -612,7 +632,7 @@ func TestChannelRetryConfigAddsCustomStatusCodes(t *testing.T) {
 }
 
 func TestResolveAPIKeyPoolModelAllowlist(t *testing.T) {
-	db, err := store.Open(t.TempDir())
+	db, err := store.OpenTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -627,7 +647,6 @@ func TestResolveAPIKeyPoolModelAllowlist(t *testing.T) {
 	channel, _ := db.Channel.GetByID(channelID)
 
 	service := &Service{db: db, enc: enc}
-	service.SetKeyPoolRotation(true)
 
 	// gpt-4o: matches key A (wildcard) and key B (empty = all).
 	keys, err := service.resolveAPIKeyPool(*channel, "gpt-4o")
@@ -641,33 +660,8 @@ func TestResolveAPIKeyPoolModelAllowlist(t *testing.T) {
 	}
 	// claude: only key B (A's allowlist excludes it).
 	keys, _ = service.resolveAPIKeyPool(*channel, "claude-3-5-sonnet")
-	if len(keys) != 1 || keys[0] != "sk-allow-b" {
+	if len(keys) != 1 || keys[0].Secret != "sk-allow-b" {
 		t.Fatalf("claude pool=%v, want only sk-allow-b", keys)
-	}
-}
-
-func TestKeyPoolRotationOffUsesBoundKeyOnly(t *testing.T) {
-	db, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	enc, _ := crypto.New("rotation-off-test-master")
-	siteID, _ := db.Site.Create(&domain.Site{Name: "s", Status: domain.StatusEnabled})
-	key1, _ := enc.Encrypt([]byte("sk-rot-1"))
-	key2, _ := enc.Encrypt([]byte("sk-rot-2"))
-	cred1, _ := db.Credential.Create(&domain.Credential{SiteID: siteID, Kind: "api_key", SecretEnc: []byte(key1), Status: domain.StatusEnabled})
-	_, _ = db.Credential.Create(&domain.Credential{SiteID: siteID, Kind: "api_key", SecretEnc: []byte(key2), Status: domain.StatusEnabled})
-	channelID, _ := db.Channel.Create(&domain.Channel{SiteID: &siteID, CredentialID: &cred1, Name: "c", Status: domain.StatusEnabled})
-	channel, _ := db.Channel.GetByID(channelID)
-
-	service := &Service{db: db, enc: enc}
-	service.SetKeyPoolRotation(false)
-
-	// Rotation off: only the bound key is returned, never the pool sibling.
-	keys, err := service.resolveAPIKeyPool(*channel, "")
-	if err != nil || len(keys) != 1 || keys[0] != "sk-rot-1" {
-		t.Fatalf("rotation-off pool=%v err=%v, want only bound key", keys, err)
 	}
 }
 
@@ -1040,29 +1034,27 @@ func TestIsRetryableForChannelUsesPrecompiledRegex(t *testing.T) {
 func TestBillingCostFormula(t *testing.T) {
 	upstream := &queuedRelay{results: []*relay.Result{response(http.StatusOK, `{"ok":true}`)}}
 	service, db, _, _ := setupProxy(t, upstream)
-	// Key with unit prices; model ratio 3.0.
-	key := &domain.DownstreamKey{
-		TokenHash: "hash-formula-1", Name: "billed", Enabled: true, Scopes: "relay",
-		PricePromptPer1k: 1.0, PriceCompletionPer1k: 2.0,
-	}
-	keyID, err := db.DownstreamKey.Create(key)
-	if err != nil {
+	// Model metadata prices: prompt 1.0, completion 2.0 per 1k (no dedicated
+	// cache price → cache-read bills at the prompt rate). Model ratio 3.0.
+	if err := db.ModelMetadata.Upsert(&domain.ModelMetadata{
+		ModelName: "ratio-model", PricePromptPer1k: 1.0, PriceCompletionPer1k: 2.0,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.ModelRatio.SetRatio("ratio-model", 3.0); err != nil {
 		t.Fatal(err)
 	}
-	req := Request{DownstreamKeyID: keyID, Model: "ratio-model"}
+	req := Request{Model: "ratio-model"}
 	tokens := usage.Tokens{PromptTokens: 1000, CompletionTokens: 250, CacheReadTokens: 100}
-	// prompt = 1000+100 = 1100 → 1.1 * 1.0; completion = 250 → 0.25 * 2.0;
-	// (1.1 + 0.5) * 3.0 = 4.8
+	// prompt = 1000 + 0 cache-creation → 1.0 * 1.0; completion = 250 → 0.25 * 2.0;
+	// cache-read 100 → 0.1 * 1.0 (prompt rate); (1.0 + 0.5 + 0.1) * 3.0 = 4.8
 	cost := service.billingCost(req, tokens)
 	if cost < 4.79 || cost > 4.81 {
 		t.Fatalf("cost=%v want ~4.8", cost)
 	}
-	// Unknown model → ratio 1.0, no key → 0 price → 0 cost.
+	// Unknown model → no price at any layer → 0 cost.
 	if cost := service.billingCost(Request{}, usage.Tokens{PromptTokens: 100}); cost != 0 {
-		t.Fatalf("no-key cost=%v want 0", cost)
+		t.Fatalf("unpriced cost=%v want 0", cost)
 	}
 }
 

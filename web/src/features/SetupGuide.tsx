@@ -22,12 +22,8 @@ export function SetupGuide() {
   const { client } = useSession();
   const s = api(client!);
   const { t } = useI18n();
-  const [dismissed, setDismissed] = useState(
-    () => localStorage.getItem(DISMISS_KEY) === "1",
-  );
-  const [forced] = useState(
-    () => new URLSearchParams(window.location.search).get("setup") === "1",
-  );
+  const [dismissed, setDismissed] = useState(() => localStorage.getItem(DISMISS_KEY) === "1");
+  const [forced] = useState(() => new URLSearchParams(window.location.search).get("setup") === "1");
   const [copied, setCopied] = useState(false);
 
   const channels = useQuery({
@@ -50,9 +46,7 @@ export function SetupGuide() {
   const hasChannel = channelList.length > 0;
   const hasModels = channelList.some((row) => row.model_count > 0);
   const hasKey = (keys.data ?? []).length > 0;
-  const hasCall = (logs.data ?? []).some(
-    (row) => row.status >= 200 && row.status < 300,
-  );
+  const hasCall = (logs.data ?? []).some((row) => row.status >= 200 && row.status < 300);
 
   const steps = [
     {
@@ -82,9 +76,11 @@ export function SetupGuide() {
   ];
   const doneCount = steps.filter((step) => step.done).length;
   const allDone = doneCount === steps.length;
+  // Placeholder line for the first-call step: this gateway issues mg-… tokens
+  // and imposes no prefix of its own, so the example must not claim sk-.
   const curl = `curl ${window.location.origin}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer sk-..." \\
+  -H "Authorization: Bearer mg-…" \\
   -d '{"model":"<model>","messages":[{"role":"user","content":"hi"}]}'`;
 
   const copyCurl = async () => {
@@ -111,11 +107,7 @@ export function SetupGuide() {
           <span className="setup-guide-progress">
             {t("setup.progress", { done: doneCount, total: steps.length })}
           </span>
-          <button
-            type="button"
-            className="setup-guide-dismiss"
-            onClick={dismiss}
-          >
+          <button type="button" className="setup-guide-dismiss" onClick={dismiss}>
             {t("setup.dismiss")}
           </button>
         </div>

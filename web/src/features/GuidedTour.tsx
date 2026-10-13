@@ -3,7 +3,7 @@ import "driver.js/dist/driver.css";
 import { useEffect, useRef } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useI18n } from "../i18n";
-import { useModules } from "../hooks/useModules";
+import { deferUntilNoModal } from "../lib/deferUntilNoModal";
 
 const DISMISS_KEY = "mg.guided-tour.done";
 
@@ -40,33 +40,28 @@ function waitFor(step: TourStep, timeout = 8000): Promise<Element | null> {
  *
  * Mounted from the app shell so route changes never unmount the controller.
  */
-export function GuidedTour() {
+export function GuidedTour({ enabled = true }: { enabled?: boolean } = {}) {
   const { t } = useI18n();
   const navigate = useNavigate();
   const location = useLocation();
-  const { checkinEnabled } = useModules();
   const launched = useRef(false);
 
   useEffect(() => {
+    if (!enabled) return;
     if (launched.current) return;
     // never run under vitest — the overlay buries whatever the test asserts.
     if (import.meta.env.VITEST) return;
-    const forced =
-      new URLSearchParams(window.location.search).get("tour") === "1";
-    if (
-      !forced &&
-      (localStorage.getItem(DISMISS_KEY) === "1" ||
-        location.pathname !== "/")
-    ) {
+    const forced = new URLSearchParams(window.location.search).get("tour") === "1";
+    // Setup and account claim already provide first-run guidance. The tour is optional.
+    if (!forced) {
       return;
     }
     // Give the first page a beat to mount so its boxes measure correctly.
-    const timer = window.setTimeout(() => {
+    return deferUntilNoModal(() => {
       launched.current = true;
-      start(t, navigate, checkinEnabled);
-    }, 600);
-    return () => window.clearTimeout(timer);
-  }, [location.pathname, t, navigate, checkinEnabled]);
+      start(t, navigate);
+    });
+  }, [enabled, location.pathname, t, navigate]);
 
   return null;
 }
@@ -74,7 +69,6 @@ export function GuidedTour() {
 function start(
   t: (key: string, vars?: Record<string, string | number>) => string,
   navigate: (to: string) => void,
-  checkinEnabled: boolean,
 ) {
   const textButton = (label: string): Element | null =>
     [...document.querySelectorAll("button")].find(
@@ -84,7 +78,14 @@ function start(
   const steps: TourStep[] = [
     {
       route: "/",
-      locate: () => document.querySelector(".deck-sector-rail"),
+      locate: () => {
+        const navigation = document.querySelector(
+          ".console-sidebar .console-navigation, .deck-sector-rail",
+        );
+        return navigation && navigation.getBoundingClientRect().width > 0
+          ? navigation
+          : document.querySelector(".console-mobile-trigger, .classic-mobile-trigger");
+      },
       title: t("tour.navTitle"),
       description: t("tour.navDesc"),
     },
@@ -108,9 +109,8 @@ function start(
     },
     {
       route: "/channels",
-      prepare: () => textButton(t("channels.add"))?.dispatchEvent(
-        new MouseEvent("click", { bubbles: true }),
-      ),
+      prepare: () =>
+        textButton(t("channels.add"))?.dispatchEvent(new MouseEvent("click", { bubbles: true })),
       locate: () => document.querySelector(".sync-mode"),
       title: t("tour.syncTitle"),
       description: t("tour.syncDesc"),
@@ -137,9 +137,13 @@ function start(
           (panel) => panel.getBoundingClientRect().width > 0,
         ) ?? null,
       title: t("tour.checkinsTitle"),
-      description: checkinEnabled
-        ? t("tour.checkinsDesc")
-        : t("tour.checkinsOffDesc"),
+      description: t("tour.checkinsDesc"),
+    },
+    {
+      route: "/users/overview",
+      locate: () => document.getElementById("runtime-mode"),
+      title: t("wizard.editionTitle"),
+      description: t("wizard.editionHint"),
     },
     {
       route: "/settings",
@@ -200,7 +204,7 @@ function start(
       while (nextIndex >= 0 && nextIndex < steps.length) {
         const step = steps[nextIndex];
         if (!step) break;
-        if (window.location.pathname !== step.route) navigate(step.route);
+        if (location.pathname !== step.route) navigate(step.route);
         step.prepare?.();
         index = nextIndex;
         driverObj.drive(nextIndex);

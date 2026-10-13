@@ -11,16 +11,22 @@ import (
 	"github.com/lan/meta-gateway/internal/store"
 )
 
+// openTestDB returns a migrated database for a test.
+//
+// It copies the once-per-process template (see store.OpenTest) instead of
+// migrating from scratch: replaying every migration per test is what made the
+// race suite take ~20 minutes, because -race instruments pure-Go SQLite and
+// turns ~0.14s of migration into ~3.4s.
+//
+// Tests that assert migration behaviour — a replayed migration, an upgrade from
+// an older schema — must call store.Open directly, since OpenTest skips Migrate.
 func openTestDB(t *testing.T) *store.DB {
 	t.Helper()
-	dir := t.TempDir()
-	db, err := store.Open(dir)
+	db, err := store.OpenTest(t.TempDir())
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	// ensure file path is under temp
-	_ = filepath.Join(dir, "meta-gateway.db")
 	return db
 }
 
@@ -182,17 +188,20 @@ func TestDownstreamKeyByHash(t *testing.T) {
 
 func TestMigrationsAreTrackedAndIdempotent(t *testing.T) {
 	db := openTestDB(t)
+	// Keep this in step with the newest NNN_*.sql file: it is the tripwire that
+	// catches a migration that silently failed to apply (or applied twice).
+	const wantMigrations = 135
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 93 {
-		t.Fatalf("got %d applied migrations, want 93", count)
+	if count != wantMigrations {
+		t.Fatalf("got %d applied migrations, want %d", count, wantMigrations)
 	}
 	if err := store.Migrate(db.DB); err != nil {
 		t.Fatalf("second migrate: %v", err)
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil || count != 93 {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil || count != wantMigrations {
 		t.Fatalf("migration history after rerun: count=%d err=%v", count, err)
 	}
 }
@@ -874,6 +883,15 @@ func TestCopyMemberGroupAndListNames(t *testing.T) {
 	if fmt.Sprint(names) != fmt.Sprint(want) {
 		t.Fatalf("group names = %v, want %v", names, want)
 	}
+	// A member carrying no group at all belongs to 'default'. Returning it as an
+	// empty name would put a nameless entry next to the "no group" option in
+	// every pick list, which reads as a different group while meaning default.
+	if _, err := db.Exec(`UPDATE route_members SET group_name = '' WHERE id = ?`, xCh2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if names, err = db.RouteMember.ListRouteGroupNames(); err != nil || fmt.Sprint(names) != fmt.Sprint(want) {
+		t.Fatalf("group names with a blank member = %v err=%v, want %v", names, err, want)
+	}
 }
 
 func TestRuntimeSettingsProxyURLRoundTrip(t *testing.T) {
@@ -1121,6 +1139,69 @@ func TestRouteRetryOverridesRoundTrip(t *testing.T) {
 	cleared, _ := db.Route.GetByID(id)
 	if cleared.RetryTimes != nil || cleared.ChannelRetryTimes != nil {
 		t.Fatalf("override clear failed: %+v", cleared)
+	}
+}
+
+// TestRouteStickySessionRoundTrip covers the per-model affinity tri-state:
+// nil (inherit), forced on, forced off, and back to nil. The route PUT is a
+// full replace, so a nil must survive as NULL rather than collapsing to false
+// — "inherit" and "off" are different decisions.
+func TestRouteStickySessionRoundTrip(t *testing.T) {
+	db := openTestDB(t)
+	id, err := db.Route.Create(&domain.Route{ModelPattern: "sticky-model", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.Route.GetByID(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StickySession != nil {
+		t.Fatalf("a new route must inherit (nil), got %v", *got.StickySession)
+	}
+	for _, want := range []bool{false, true} {
+		v := want
+		got.StickySession = &v
+		if err := db.Route.Update(got); err != nil {
+			t.Fatal(err)
+		}
+		after, err := db.Route.GetByID(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.StickySession == nil || *after.StickySession != want {
+			t.Fatalf("sticky_session=%v, want %v", after.StickySession, want)
+		}
+		got = after
+	}
+	got.StickySession = nil
+	if err := db.Route.Update(got); err != nil {
+		t.Fatal(err)
+	}
+	cleared, err := db.Route.GetByID(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.StickySession != nil {
+		t.Fatalf("clearing the override must store NULL, got %v", *cleared.StickySession)
+	}
+}
+
+func TestProxyLogUpstreamModelRoundTrip(t *testing.T) {
+	db := openTestDB(t)
+	// An aliased attempt records both names; a plain one repeats the model.
+	if _, err := db.ProxyLog.Insert(&domain.ProxyLog{RequestID: "alias", Model: "shared-alias", UpstreamModel: "deepseek-v4-flash", Status: 200}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ProxyLog.Insert(&domain.ProxyLog{RequestID: "plain", Model: "gpt-5", UpstreamModel: "gpt-5", Status: 200}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.ProxyLog.ListFilter(store.ProxyLogFilter{Model: "shared-alias", Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].UpstreamModel != "deepseek-v4-flash" {
+		t.Fatalf("upstream model lost on the aliased row: %+v", rows)
 	}
 }
 
@@ -1526,6 +1607,39 @@ func TestProxyLogListFilter(t *testing.T) {
 		t.Fatalf("unrouted log got pattern %q, want empty", unrouted[0].RoutePattern)
 	}
 
+	// Client-token filter: the one dimension that answers "who spent this".
+	// The upstream key fingerprint rides along on the same row, because a
+	// token filter is usually the first step of "which credential served it".
+	keyID, err := db.DownstreamKey.Create(&domain.DownstreamKey{Name: "cli-token", Enabled: true})
+	if err != nil {
+		t.Fatalf("downstream key: %v", err)
+	}
+	idKey, err := db.ProxyLog.Insert(&domain.ProxyLog{
+		RequestID: "req-key", ChannelID: chA, Model: "gpt-a",
+		Status: 200, LatencyMs: 12, Attempt: 1,
+		DownstreamKeyID: keyID, KeyFingerprint: "9f2c41ab77de0088",
+	})
+	if err != nil {
+		t.Fatalf("key log insert: %v", err)
+	}
+	// Rows written without a token (0) must not be swept up by a key filter.
+	keyLogs, err := db.ProxyLog.ListFilter(store.ProxyLogFilter{DownstreamKeyID: &keyID, Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	containsOnly(mustIDs(keyLogs), idKey)
+	if keyLogs[0].DownstreamKeyID != keyID || keyLogs[0].KeyFingerprint != "9f2c41ab77de0088" {
+		t.Fatalf("key projection got id=%d fp=%q, want %d / 9f2c41ab77de0088", keyLogs[0].DownstreamKeyID, keyLogs[0].KeyFingerprint, keyID)
+	}
+	missingKey := keyID + 999
+	noneForKey, err := db.ProxyLog.ListFilter(store.ProxyLogFilter{DownstreamKeyID: &missingKey, Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(noneForKey) != 0 {
+		t.Fatalf("unknown key matched %v", mustIDs(noneForKey))
+	}
+
 	// Site + channel AND: channel on other site yields empty.
 	empty, err := db.ProxyLog.ListFilter(store.ProxyLogFilter{SiteID: &siteA, ChannelID: &chB, Limit: 100})
 	if err != nil {
@@ -1686,5 +1800,51 @@ func TestChannelStableFirstNonGrayNoop(t *testing.T) {
 	promoted, err := db.Channel.RecordGraySuccess(id, 3)
 	if err != nil || promoted {
 		t.Fatalf("non-gray channel must no-op: promoted=%v err=%v", promoted, err)
+	}
+}
+
+// The site-probe cadence is the one setting an operator is most likely to want
+// to change (sites publish their probe data at very different rates), so the two
+// columns are covered the same way the health-sweep columns are: a real
+// round-trip, and an unset row that must fall back to the env bootstrap instead
+// of zeroing the loop. The notice-board column next door is covered here too,
+// because it is the one place where 0 is a value rather than the unset sentinel.
+func TestRuntimeSettingsSiteProbeScheduleRoundTrip(t *testing.T) {
+	db := openTestDB(t)
+	row := &store.RuntimeSettingsRow{
+		HasOverride:              true,
+		SiteProbeIntervalSeconds: 300,
+		SiteProbeJitterSeconds:   30,
+		// "Off" as the operator picked it: Save must keep it as 0 and Get must
+		// hand it back as 0, not as the unset sentinel that means "use the env".
+		SiteNewsIntervalSeconds: 0,
+	}
+	if err := db.RuntimeSettings.Save(row); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.RuntimeSettings.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.HasOverride || got.SiteProbeIntervalSeconds != 300 || got.SiteProbeJitterSeconds != 30 {
+		t.Fatalf("site probe schedule round trip mismatch: %+v", got)
+	}
+	if got.SiteNewsIntervalSeconds != 0 {
+		t.Fatalf("stored 0 (off) read back as %d, want 0", got.SiteNewsIntervalSeconds)
+	}
+	// A row written before these columns existed reads back as -1, which is what
+	// makes the env bootstrap win rather than the loop falling to zero.
+	if _, err := db.Exec(`INSERT OR REPLACE INTO runtime_settings (id, has_override, updated_at) VALUES (1, 1, datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	got, err = db.RuntimeSettings.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SiteProbeIntervalSeconds != -1 || got.SiteProbeJitterSeconds != -1 {
+		t.Fatalf("unset columns must read -1, got %d/%d", got.SiteProbeIntervalSeconds, got.SiteProbeJitterSeconds)
+	}
+	if got.SiteNewsIntervalSeconds != -1 {
+		t.Fatalf("unset notice-board cadence must read -1, got %d", got.SiteNewsIntervalSeconds)
 	}
 }

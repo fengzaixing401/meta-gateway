@@ -1,13 +1,16 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/lan/meta-gateway/internal/discovery"
+	"github.com/lan/meta-gateway/internal/domain"
 	"github.com/lan/meta-gateway/internal/store"
 )
 
@@ -28,10 +31,46 @@ func (h *DiscoveryHandler) SetModelsCache(cache *modelsCache) {
 func (h *DiscoveryHandler) Register(r chi.Router) {
 	r.Post("/discovery/channels/{id}/probe", h.probeChannel)
 	r.Post("/discovery/channels/{id}/refresh", h.refreshChannel)
+	r.Post("/discovery/channels/{id}/keys/test", h.testChannelKeys)
 	r.Post("/discovery/refresh", h.refreshAll)
+	r.Post("/discovery/models-preview", h.previewModels)
 	r.Get("/discovery/models", h.listModels)
 	r.Get("/discovery/missing-models", h.missingModels)
 	r.Get("/discovery/model-channels", h.modelChannels)
+}
+
+// modelsPreviewRequest is a connection that has not been saved yet: the add-channel
+// dialog's 获取模型 asks what an upstream would serve before anything is stored.
+type modelsPreviewRequest struct {
+	BaseURL  string `json:"base_url"`
+	Secret   string `json:"secret"`
+	TypeHint string `json:"type_hint"`
+}
+
+// previewModels lists the models behind a base URL and a key that are not stored
+// anywhere. Read-only: no probe record, no health history, no model adoption. The
+// alternative — create the channel, then discover — leaves a site, a credential
+// and a channel behind every time the URL or the key turns out wrong.
+func (h *DiscoveryHandler) previewModels(w http.ResponseWriter, r *http.Request) {
+	var req modelsPreviewRequest
+	if err := decodeJSON(w, r, &req, 0, false); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if strings.TrimSpace(req.Secret) == "" {
+		writeError(w, http.StatusBadRequest, "secret is required")
+		return
+	}
+	// Bounded: the dialog blocks on this, and an upstream that accepts the
+	// connection and then says nothing must not hold the form open.
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	result, err := h.service.PreviewModels(ctx, req.BaseURL, req.TypeHint, req.Secret)
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 // missingModels reports channel-exposed models no enabled route covers.
@@ -48,14 +87,15 @@ func (h *DiscoveryHandler) missingModels(w http.ResponseWriter, r *http.Request)
 }
 
 // modelChannels lists the enabled channels serving a route pattern — the live
-// preview behind the add-route dialog's auto-match option.
+// preview behind the add-route dialog's auto-match option. `match=related`
+// widens the check to the pattern's -sibling models as well.
 func (h *DiscoveryHandler) modelChannels(w http.ResponseWriter, r *http.Request) {
 	pattern := strings.TrimSpace(r.URL.Query().Get("model"))
 	if pattern == "" {
 		writeError(w, http.StatusBadRequest, "model is required")
 		return
 	}
-	matches, err := h.db.ChannelsWithModel(pattern)
+	matches, err := h.db.ChannelsMatchingModel(pattern, store.ParseModelMatchMode(r.URL.Query().Get("match")))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to match channels")
 		return
@@ -94,6 +134,49 @@ func (h *DiscoveryHandler) refreshChannel(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, result)
 }
 
+// channelKeyTestRequest names the keys to try. Empty means every key the
+// channel can use, which is what the batch button sends.
+type channelKeyTestRequest struct {
+	CredentialIDs []int64 `json:"credential_ids,omitempty"`
+}
+
+// keyTestBudget bounds one 测活 round. The service tries keys four at a time with
+// a per-key timeout, so this only has to cover the tail of a long pool.
+const keyTestBudget = 90 * time.Second
+
+// testChannelKeys reports whether each named API key still works, by asking the
+// upstream for its model list with that key. Read-only: no probe record, no
+// health history, no adoption — the operator decides what to do with a dead key.
+func (h *DiscoveryHandler) testChannelKeys(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r, "id")
+	if !ok {
+		return
+	}
+	var request channelKeyTestRequest
+	if err := decodeJSON(w, r, &request, 0, false); err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), keyTestBudget)
+	defer cancel()
+	results, err := h.service.TestKeys(ctx, id, request.CredentialIDs)
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+	okCount := 0
+	for i := range results {
+		if results[i].OK {
+			okCount++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"results": results,
+		"ok":      okCount,
+		"failed":  len(results) - okCount,
+		"tested":  len(results),
+	})
+}
+
 func (h *DiscoveryHandler) refreshAll(w http.ResponseWriter, r *http.Request) {
 	result, err := h.service.RefreshAll(r.Context())
 	if err != nil {
@@ -118,6 +201,11 @@ func (h *DiscoveryHandler) listModels(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list discovered models")
 		return
+	}
+	if models == nil {
+		// Same contract as the refresh payload: a channel with no discovered
+		// models answers with an empty array, never JSON null.
+		models = []domain.DiscoveredModel{}
 	}
 	writeJSON(w, http.StatusOK, models)
 }

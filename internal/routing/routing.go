@@ -47,12 +47,22 @@ const (
 //     so retries exhaust [A]→[B]→[次] before moving to the next channel. When
 //     the channel has no eligible members left, selection falls back to the
 //     normal weighted/sticky behavior across the remaining fleet.
-//   - RouteGroup narrows the pool to one route group (see RoutingCandidates);
-//     empty means the route's 'default' group.
+//   - RouteGroup narrows the pool to one route group (see RoutingCandidates).
+//     Empty preserves the legacy pool across all groups; an explicit 'default'
+//     requests the default group with the repository's usual fallback.
 type SelectionConstraint struct {
+	TeamAccess      *domain.TeamAccess
 	ExcludedMembers map[int64]struct{}
 	PreferChannel   int64
 	RouteGroup      string
+	// PinnedMemberID / PinnedChannelID name one upstream the caller chose
+	// explicitly — the console's 试调, or a health probe. That pin is more
+	// specific than the route's own single-mode pin, so the named row stays
+	// selectable on a single-mode route instead of the caller being told
+	// "preferred channel unavailable" about the row it just picked.
+	RecoveryProbe   bool
+	PinnedMemberID  int64
+	PinnedChannelID int64
 }
 
 type Evaluation struct {
@@ -68,7 +78,12 @@ type Evaluation struct {
 }
 
 type Explanation struct {
-	Model            string       `json:"model"`
+	Model          string `json:"model"`
+	RequestedGroup string `json:"requested_group,omitempty"`
+	// RouteGroup is set only when all returned candidates share one group.
+	// An unrestricted/legacy pool may contain several groups.
+	RouteGroup       string       `json:"route_group,omitempty"`
+	GroupFallback    bool         `json:"group_fallback,omitempty"`
 	RouteID          int64        `json:"route_id"`
 	RouteMappingJSON string       `json:"route_mapping_json,omitempty"`
 	RoutingMode      string       `json:"routing_mode,omitempty"`
@@ -82,6 +97,14 @@ type Explanation struct {
 	StickyChannelID *int64 `json:"sticky_channel_id,omitempty"`
 	StickyHit       bool   `json:"sticky_hit,omitempty"`
 	StickyReason    string `json:"sticky_reason,omitempty"`
+	// StickySessionOverride mirrors routes.sticky_session: nil = follow the
+	// global setting, true/false = force affinity on/off for this model.
+	StickySessionOverride *bool `json:"sticky_session_override,omitempty"`
+	// StickyActive is the effective decision for this selection: the global
+	// default folded with the override. It is only meaningful together with a
+	// SessionKey; false there means the model opted out, so the proxy must not
+	// bind the session either.
+	StickyActive bool `json:"sticky_active,omitempty"`
 	// Stable-first grayscale fields: present when the pool is active.
 	// StableFirstHit is true when the grayscale pool won the 1/N draw.
 	StableFirstHit bool `json:"stable_first_hit,omitempty"`
@@ -165,14 +188,19 @@ type Selector struct {
 }
 
 type selectorSettings struct {
-	latencyAware           bool
-	latency                LatencyProvider
-	errorAware             bool
-	errorRate              ErrorProvider
-	concurrencyAware       bool
-	concurrencyLimit       int
-	inflight               ConcurrencyProvider
-	sticky                 *StickyStore
+	latencyAware     bool
+	latency          LatencyProvider
+	errorAware       bool
+	errorRate        ErrorProvider
+	concurrencyAware bool
+	concurrencyLimit int
+	inflight         ConcurrencyProvider
+	sticky           *StickyStore
+	// stickyDefault is what a route inherits when it carries no
+	// sticky_session override. The store itself is installed even while this
+	// is false, so a route can opt a single model in without a second global
+	// switch.
+	stickyDefault          bool
 	stableFirstEnabled     bool
 	stableFirstDenominator int
 }
@@ -198,10 +226,28 @@ func (s *Selector) updateSettings(update func(*selectorSettings)) {
 	}
 }
 
-// SetSticky installs the sticky-session store. Nil (or never called) disables
-// sticky routing; session keys then never influence selection.
-func (s *Selector) SetSticky(store *StickyStore) {
-	s.updateSettings(func(cfg *selectorSettings) { cfg.sticky = store })
+// SetSticky installs the sticky-session store and sets the default affinity
+// for routes that carry no sticky_session override. A nil store disables
+// affinity entirely (including for routes that ask for it); defaultEnabled
+// alone only decides what routes inherit.
+func (s *Selector) SetSticky(store *StickyStore, defaultEnabled bool) {
+	s.updateSettings(func(cfg *selectorSettings) {
+		cfg.sticky = store
+		cfg.stickyDefault = defaultEnabled
+	})
+}
+
+// StickyEnabled reports whether affinity applies to a selection, folding the
+// global default with the route-level override. Nil override = inherit.
+func (s *Selector) StickyEnabled(override *bool) bool {
+	cfg := s.loadSettings()
+	if cfg.sticky == nil {
+		return false
+	}
+	if override != nil {
+		return *override
+	}
+	return cfg.stickyDefault
 }
 
 // SetLatencyAware turns latency-weighted picking on/off. provider may be nil,
@@ -258,8 +304,12 @@ func (s *Selector) Explain(ctx context.Context, model string) (Explanation, erro
 
 // ExplainWithSession is Explain with an optional session key: the response
 // carries the sticky binding for that session when one exists.
-func (s *Selector) ExplainWithSession(ctx context.Context, model, sessionKey string) (Explanation, error) {
-	return s.evaluateWithSession(ctx, model, nil, sessionKey, nil)
+func (s *Selector) ExplainWithSession(ctx context.Context, model, sessionKey string, constraints ...*SelectionConstraint) (Explanation, error) {
+	var constraint *SelectionConstraint
+	if len(constraints) > 0 {
+		constraint = constraints[0]
+	}
+	return s.evaluateWithSession(ctx, model, nil, sessionKey, constraint)
 }
 
 func (s *Selector) Select(ctx context.Context, model string, excluded map[int64]struct{}, constraints ...*SelectionConstraint) (Decision, error) {
@@ -423,6 +473,21 @@ func (s *Selector) evaluate(ctx context.Context, model string, excluded map[int6
 	if route == nil {
 		return Explanation{}, ErrRouteNotFound
 	}
+	if constraint != nil && constraint.TeamAccess != nil {
+		access := constraint.TeamAccess
+		filtered := make([]domain.RoutingCandidate, 0, len(candidates))
+		for _, candidate := range candidates {
+			if !access.AllowsModel(model) || !access.AllowsMember(model, candidate.Member.ID) {
+				continue
+			}
+			if override, ok := access.Plan[candidate.Member.ID]; ok {
+				candidate.Member.Priority = override.Priority
+				candidate.Member.Weight = override.Weight
+			}
+			filtered = append(filtered, candidate)
+		}
+		candidates = filtered
+	}
 	mappingJSON := route.MappingJSON
 	now := s.clock.Now().UTC()
 	// Single mode: routing_mode=single pins the route to one member. When the
@@ -440,8 +505,10 @@ func (s *Selector) evaluate(ctx context.Context, model string, excluded map[int6
 	}
 	evaluations := make([]Evaluation, 0, len(candidates))
 	for _, candidate := range candidates {
+		candidate.UpstreamModel = domain.ResolveUpstreamModel(model, candidate.Member.MappingJSON, route.MappingJSON)
 		reasons := make([]Reason, 0, 2)
-		if !candidate.Member.Enabled {
+		recovery := constraint != nil && constraint.RecoveryProbe && pinnedBy(constraint, candidate) && candidate.Member.AutoDisabled && !candidate.Member.ManualOverride
+		if !candidate.Member.Enabled && !recovery {
 			reasons = append(reasons, ReasonMemberDisabled)
 		}
 		if candidate.Channel.Status != domain.StatusEnabled {
@@ -450,7 +517,7 @@ func (s *Selector) evaluate(ctx context.Context, model string, excluded map[int6
 		if !candidate.CredentialUsable {
 			reasons = append(reasons, ReasonCredentialAbsent)
 		}
-		if candidate.Member.CooldownUntil != nil && candidate.Member.CooldownUntil.After(now) {
+		if !recovery && candidate.Member.CooldownUntil != nil && candidate.Member.CooldownUntil.After(now) {
 			reasons = append(reasons, ReasonCoolingDown)
 		}
 		if _, ok := excluded[candidate.Channel.ID]; ok {
@@ -464,7 +531,7 @@ func (s *Selector) evaluate(ctx context.Context, model string, excluded map[int6
 		if candidate.Member.Weight < 0 {
 			reasons = append(reasons, ReasonInvalidWeight)
 		}
-		if singlePin != nil && candidate.Member.ID != *singlePin {
+		if singlePin != nil && candidate.Member.ID != *singlePin && !pinnedBy(constraint, candidate) {
 			reasons = append(reasons, ReasonSingleMode)
 		}
 		score := s.scoreFor(candidate, route.RoutingMode)
@@ -489,8 +556,22 @@ func (s *Selector) evaluate(ctx context.Context, model string, excluded map[int6
 		zero := 0
 		retryTimesOverride = &zero
 	}
+	requestedGroup := strings.TrimSpace(group)
+	effectiveGroup := ""
+	if len(candidates) > 0 {
+		effectiveGroup = candidates[0].Member.GroupName
+		for _, candidate := range candidates[1:] {
+			if candidate.Member.GroupName != effectiveGroup {
+				effectiveGroup = ""
+				break
+			}
+		}
+	}
 	return Explanation{
 		Model:                          model,
+		RequestedGroup:                 requestedGroup,
+		RouteGroup:                     effectiveGroup,
+		GroupFallback:                  requestedGroup != "" && len(candidates) > 0 && requestedGroup != effectiveGroup,
 		RouteID:                        route.ID,
 		RouteMappingJSON:               mappingJSON,
 		RoutingMode:                    mode,
@@ -500,7 +581,24 @@ func (s *Selector) evaluate(ctx context.Context, model string, excluded map[int6
 		ChannelRetryTimesOverride:      route.ChannelRetryTimes,
 		StableFirstOverride:            route.StableFirst,
 		StableFirstDenominatorOverride: route.StableFirstDenominator,
+		StickySessionOverride:          route.StickySession,
 	}, nil
+}
+
+// pinnedBy reports whether the caller named this candidate explicitly. A
+// member pin wins over a channel pin because it addresses one row of a route
+// that may hold several rows on the same channel (the alias form).
+func pinnedBy(constraint *SelectionConstraint, candidate domain.RoutingCandidate) bool {
+	if constraint == nil {
+		return false
+	}
+	if constraint.PinnedMemberID > 0 {
+		return candidate.Member.ID == constraint.PinnedMemberID
+	}
+	if constraint.PinnedChannelID > 0 {
+		return candidate.Channel.ID == constraint.PinnedChannelID
+	}
+	return false
 }
 
 // evaluateWithSession runs the plain evaluation and annotates the sticky
@@ -511,10 +609,24 @@ func (s *Selector) evaluateWithSession(ctx context.Context, model string, exclud
 		return explanation, err
 	}
 	explanation.SessionKey = sessionKey
-	sticky := s.loadSettings().sticky
+	cfg := s.loadSettings()
+	sticky := cfg.sticky
 	if sticky == nil || sessionKey == "" {
 		return explanation, nil
 	}
+	// The route wins over the global default in both directions: a model that
+	// wants affinity keeps it on a gateway where it is off, and a model that
+	// does not want it stays off where it is on. Recording the decision on the
+	// explanation lets the proxy skip the bind as well — a binding written for
+	// a route that later opts back in would be stale the moment it turns on.
+	enabled := cfg.stickyDefault
+	if explanation.StickySessionOverride != nil {
+		enabled = *explanation.StickySessionOverride
+	}
+	if !enabled {
+		return explanation, nil
+	}
+	explanation.StickyActive = true
 	channelID, ok := sticky.Lookup(sessionKey, explanation.EvaluatedAt)
 	if !ok {
 		return explanation, nil
@@ -559,239 +671,4 @@ func (s *Selector) pickWithGray(candidates []domain.RoutingCandidate, mode strin
 		return s.pick(gray, mode)
 	}
 	return s.pick(stable, mode)
-}
-
-// scoreFor computes the stable policy score for one candidate under the given
-// route mode: base weight × latency factor × error factor. It deliberately
-// excludes the concurrency guard so the admin UI shows a stable, explainable
-// effective weight instead of a number that flaps with in-flight requests.
-func (s *Selector) scoreFor(candidate domain.RoutingCandidate, mode string) float64 {
-	cfg := s.loadSettings()
-	latencyAware := cfg.latencyAware
-	errorAware := cfg.errorAware
-	switch domain.NormalizeRoutingMode(mode) {
-	case domain.RoutingModeLatency:
-		latencyAware = true
-	case domain.RoutingModeWeighted:
-		latencyAware = false
-		errorAware = false
-	case domain.RoutingModeAdaptive:
-		latencyAware = true
-		errorAware = true
-	}
-	weight := float64(candidate.Member.Weight)
-	if weight <= 0 {
-		weight = 1
-	}
-	score := weight
-	if latencyAware && cfg.latency != nil {
-		if latency, ok := cfg.latency(candidate.Channel.ID, candidate.ModelPattern); ok && latency > 0 {
-			score = weight * (baseLatencyMs / (baseLatencyMs + latency))
-		}
-	}
-	if errorAware && cfg.errorRate != nil {
-		if propensity, ok := cfg.errorRate(candidate.Channel.ID, candidate.ModelPattern); ok && propensity > 0 {
-			factor := 1 - propensity
-			if factor < 0.05 {
-				factor = 0.05
-			}
-			score *= factor
-		}
-	}
-	return score
-}
-
-// pick resolves the effective picking strategy. Auto follows global policy;
-// latency forces latency scoring; weighted uses only member priority/weight;
-// adaptive enables both latency and error scoring for this model.
-func (s *Selector) pick(candidates []domain.RoutingCandidate, mode string) domain.RoutingCandidate {
-	cfg := s.loadSettings()
-	latencyAware := cfg.latencyAware
-	errorAware := cfg.errorAware
-	switch domain.NormalizeRoutingMode(mode) {
-	case domain.RoutingModeLatency:
-		latencyAware = true
-	case domain.RoutingModeWeighted:
-		latencyAware = false
-		errorAware = false
-	case domain.RoutingModeAdaptive:
-		latencyAware = true
-		errorAware = true
-	}
-	if latencyAware && cfg.latency != nil {
-		return s.pickLatencyAware(candidates, errorAware)
-	}
-	if errorAware && cfg.errorRate != nil {
-		return s.pickErrorAware(candidates)
-	}
-	return s.pickWeighted(candidates)
-}
-
-// betterCoolingFallback orders last-resort picks among cooling members:
-// higher priority wins, then the cooldown expiring soonest, then the lower
-// member id for determinism.
-func betterCoolingFallback(a, b domain.RoutingCandidate) bool {
-	if a.Member.Priority != b.Member.Priority {
-		return a.Member.Priority > b.Member.Priority
-	}
-	if a.Member.CooldownUntil != nil && b.Member.CooldownUntil != nil &&
-		!a.Member.CooldownUntil.Equal(*b.Member.CooldownUntil) {
-		return a.Member.CooldownUntil.Before(*b.Member.CooldownUntil)
-	}
-	return a.Member.ID < b.Member.ID
-}
-
-// concurrencyFactor returns the burst-guard share multiplier for a channel:
-// 1 when the guard is off or the channel is idle, (limit-inflight)/limit while
-// it is busy, and a small floor (0.01) at or above the limit so a fully
-// saturated fleet still spreads traffic instead of failing the pick.
-func (s *Selector) concurrencyFactor(channelID int64) float64 {
-	cfg := s.loadSettings()
-	if !cfg.concurrencyAware || cfg.inflight == nil || cfg.concurrencyLimit <= 0 {
-		return 1
-	}
-	inflight := cfg.inflight(channelID)
-	if inflight >= cfg.concurrencyLimit {
-		return 0.01
-	}
-	return float64(cfg.concurrencyLimit-inflight) / float64(cfg.concurrencyLimit)
-}
-
-// baseLatencyMs normalizes latency scoring so a 3000 ms channel keeps half its
-// base weight and a 300 ms channel keeps ~91%. Raised from 1000 so a merely
-// slow channel (2-4 s) keeps a meaningful share — failures are punished far
-// harder than slowness.
-const baseLatencyMs = 3000.0
-
-// pickLatencyAware weights each candidate by weight / (1 + latency/base) so
-// slower channels lose share within the same priority tier. Channels without
-// latency samples keep their full weight (cold start). When error-aware is
-// also enabled, the failure propensity (0..1) additionally scales the score by
-// (1 - error), so a channel with a 0.5 error EMA keeps half its share and
-// recovers as successes decay the EMA.
-func (s *Selector) pickLatencyAware(candidates []domain.RoutingCandidate, errorAware bool) domain.RoutingCandidate {
-	cfg := s.loadSettings()
-	type scored struct {
-		candidate domain.RoutingCandidate
-		score     float64
-	}
-	scoredList := make([]scored, 0, len(candidates))
-	total := 0.0
-	for _, candidate := range candidates {
-		weight := float64(candidate.Member.Weight)
-		if weight <= 0 {
-			weight = 1
-		}
-		score := weight
-		if cfg.latency != nil {
-			if latency, ok := cfg.latency(candidate.Channel.ID, candidate.ModelPattern); ok && latency > 0 {
-				score = weight * (baseLatencyMs / (baseLatencyMs + latency))
-			}
-		}
-		if errorAware && cfg.errorRate != nil {
-			if propensity, ok := cfg.errorRate(candidate.Channel.ID, candidate.ModelPattern); ok && propensity > 0 {
-				factor := 1 - propensity
-				if factor < 0.05 {
-					factor = 0.05 // floor: an unhealthy channel keeps a small chance
-				}
-				score *= factor
-			}
-		}
-		score *= s.concurrencyFactor(candidate.Channel.ID)
-		scoredList = append(scoredList, scored{candidate: candidate, score: score})
-		total += score
-	}
-	if total <= 0 || len(scoredList) == 0 {
-		return candidates[s.random.Intn(len(candidates))]
-	}
-	value := s.random.Float64() * total
-	for _, entry := range scoredList {
-		if value < entry.score {
-			return entry.candidate
-		}
-		value -= entry.score
-	}
-	return scoredList[len(scoredList)-1].candidate
-}
-
-// pickErrorAware weights candidates by weight × (1 - error propensity) when
-// no latency data is available (pure error-aware mode).
-func (s *Selector) pickErrorAware(candidates []domain.RoutingCandidate) domain.RoutingCandidate {
-	cfg := s.loadSettings()
-	type scored struct {
-		candidate domain.RoutingCandidate
-		score     float64
-	}
-	scoredList := make([]scored, 0, len(candidates))
-	total := 0.0
-	for _, candidate := range candidates {
-		weight := float64(candidate.Member.Weight)
-		if weight <= 0 {
-			weight = 1
-		}
-		score := weight
-		if cfg.errorRate != nil {
-			if propensity, ok := cfg.errorRate(candidate.Channel.ID, candidate.ModelPattern); ok && propensity > 0 {
-				factor := 1 - propensity
-				if factor < 0.05 {
-					factor = 0.05
-				}
-				score *= factor
-			}
-		}
-		score *= s.concurrencyFactor(candidate.Channel.ID)
-		scoredList = append(scoredList, scored{candidate: candidate, score: score})
-		total += score
-	}
-	if total <= 0 || len(scoredList) == 0 {
-		return candidates[s.random.Intn(len(candidates))]
-	}
-	value := s.random.Float64() * total
-	for _, entry := range scoredList {
-		if value < entry.score {
-			return entry.candidate
-		}
-		value -= entry.score
-	}
-	return scoredList[len(scoredList)-1].candidate
-}
-
-func (s *Selector) pickWeighted(candidates []domain.RoutingCandidate) domain.RoutingCandidate {
-	type scored struct {
-		candidate domain.RoutingCandidate
-		score     float64
-	}
-	scoredList := make([]scored, 0, len(candidates))
-	total := 0.0
-	for _, candidate := range candidates {
-		weight := float64(candidate.Member.Weight)
-		if weight <= 0 {
-			continue // zero-weight channels never win
-		}
-		score := weight * s.concurrencyFactor(candidate.Channel.ID)
-		scoredList = append(scoredList, scored{candidate: candidate, score: score})
-		total += score
-	}
-	if total <= 0 || len(scoredList) == 0 {
-		// All weights zero (or every channel fully saturated): fall back to a
-		// uniform pick among positive-weight channels so traffic is spread.
-		var positive []domain.RoutingCandidate
-		for _, candidate := range candidates {
-			if candidate.Member.Weight > 0 {
-				positive = append(positive, candidate)
-			}
-		}
-		if len(positive) == 0 {
-			return candidates[s.random.Intn(len(candidates))]
-		}
-		return positive[s.random.Intn(len(positive))]
-	}
-	value := s.random.Float64() * total
-	for _, entry := range scoredList {
-		if value < entry.score {
-			return entry.candidate
-		}
-		value -= entry.score
-	}
-	return scoredList[len(scoredList)-1].candidate
 }

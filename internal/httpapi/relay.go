@@ -24,6 +24,7 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/lan/meta-gateway/internal/adapters"
 	"github.com/lan/meta-gateway/internal/auth"
+	"github.com/lan/meta-gateway/internal/plugins"
 	"github.com/lan/meta-gateway/internal/proxy"
 	"github.com/lan/meta-gateway/internal/relay"
 	"github.com/lan/meta-gateway/internal/routing"
@@ -48,6 +49,19 @@ func downstreamRouteGroup(r *http.Request) string {
 	return ""
 }
 
+func downstreamTeam(r *http.Request) *domain.TeamAccess {
+	if key := auth.DownstreamKey(r); key != nil {
+		return key.TeamAccess
+	}
+	return nil
+}
+func downstreamUser(r *http.Request) int64 {
+	if key := auth.DownstreamKey(r); key != nil {
+		return key.UserID
+	}
+	return 0
+}
+
 // RelayHandler serves public /v1/* endpoints.
 type RelayHandler struct {
 	db    *store.DB
@@ -61,15 +75,148 @@ type RelayHandler struct {
 	// liveTrace is the optional in-memory request-state hub for the admin
 	// live view and manual interrupt (nil disables).
 	liveTrace *livetrace.Registry
+	// virtualModels supplies model names that have no route of their own but
+	// are answered by a plugin hook (the "auto" a router plugin intercepts).
+	// Nil when no plugin host is wired.
+	virtualModels func() []string
+	// bodyLimit / imageLimit are the configured request-body ceilings in bytes
+	// (0 = built-in defaults, see maxBodyBytes / maxImageBodyBytes).
+	bodyLimit  int64
+	imageLimit int64
 }
 
 func NewRelayHandler(db *store.DB, service RelayProxy, modelLimiter *ratelimit.Limiter, groupLimiter *groupRateLimiter, modelsCache *modelsCache) *RelayHandler {
 	return &RelayHandler{db: db, proxy: service, modelLimiter: modelLimiter, groupLimiter: groupLimiter, modelsCache: modelsCache}
 }
 
+// SetBodyLimits installs the configured request-body ceilings (bytes). Zero
+// keeps the built-in defaults, so a handler built without config (tests,
+// embedders) behaves as before.
+func (h *RelayHandler) SetBodyLimits(jsonBytes, imageBytes int64) {
+	h.bodyLimit = jsonBytes
+	h.imageLimit = imageBytes
+}
+
+// maxBodyBytes is the ceiling for a JSON relay surface.
+func (h *RelayHandler) maxBodyBytes() int64 {
+	if h.bodyLimit > 0 {
+		return h.bodyLimit
+	}
+	return defaultRelayBodyBytes
+}
+
+// maxImageBodyBytes is the ceiling for the image surfaces, which carry base64 or
+// multipart payloads by definition.
+func (h *RelayHandler) maxImageBodyBytes() int64 {
+	if h.imageLimit > 0 {
+		return h.imageLimit
+	}
+	return defaultRelayImageBytes
+}
+
+const (
+	// defaultRelayBodyBytes covers a chat request with inlined base64 images,
+	// which is what real clients send.
+	defaultRelayBodyBytes = 32 << 20
+	// defaultRelayImageBytes covers multi-image edits and generations.
+	defaultRelayImageBytes = 64 << 20
+	// defaultPassthroughBodyBytes covers the small JSON surfaces (moderations).
+	defaultPassthroughBodyBytes = 2 << 20
+)
+
+// rejectTooLarge answers an over-limit body. It names the limit and the endpoint
+// — a bare "body too large" leaves the operator guessing at both, and the
+// console can then explain how to raise it.
+func (h *RelayHandler) rejectTooLarge(w http.ResponseWriter, r *http.Request, limit int64) {
+	log.Printf("relay: %s rejected: body over the %s limit", r.URL.Path, humanBytes(limit))
+	writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+		"error": map[string]any{
+			"message": fmt.Sprintf(
+				"request body exceeds this gateway's limit for %s (%s); raise RELAY_MAX_BODY_MB / RELAY_MAX_IMAGE_MB to accept larger payloads",
+				r.URL.Path, humanBytes(limit)),
+			"type":        "body_too_large",
+			"limit_bytes": limit,
+			"endpoint":    r.URL.Path,
+		},
+	})
+}
+
+// humanBytes renders a limit the way an operator reads it ("32 MB").
+func humanBytes(bytes int64) string {
+	const mb = 1 << 20
+	if bytes >= mb {
+		value := float64(bytes) / mb
+		if value == float64(int64(value)) {
+			return fmt.Sprintf("%d MB", int64(value))
+		}
+		return fmt.Sprintf("%.1f MB", value)
+	}
+	return fmt.Sprintf("%d KB", bytes>>10)
+}
+
 // SetLiveTrace installs the live-trace registry (nil disables).
 func (h *RelayHandler) SetLiveTrace(registry *livetrace.Registry) {
 	h.liveTrace = registry
+}
+
+// SetVirtualModels installs the provider of plugin-answered model names, so
+// /v1/models lists a virtual model ("auto") a router plugin intercepts. Without
+// it a client has no way to discover the name it is supposed to send.
+func (h *RelayHandler) SetVirtualModels(fn func() []string) {
+	h.virtualModels = fn
+}
+
+// withHookOrigin carries a plugin's hook-recursion marker into the request
+// context, so the plugin host skips that plugin's own hooks for a nested call
+// the plugin made back into the gateway while serving a hook.
+func withHookOrigin(ctx context.Context, header http.Header) context.Context {
+	origin := plugins.HookOriginFromHeaders(header)
+	if origin.PluginID == "" && origin.Depth == 0 {
+		return ctx
+	}
+	return plugins.WithHookOrigin(ctx, origin)
+}
+
+// HookDecisionEchoHeader reports the plugin decision that changed what the
+// client asked for (a route hook turning "auto" into a real model), so a caller
+// can tell what happened without opening the console. Only decisions that
+// actually rewrote something are reported; observations would be noise.
+const HookDecisionEchoHeader = "X-Meta-Hook-Decision"
+
+// hookDecisionHeader renders the rewrite trail for the response header.
+func hookDecisionHeader(decisions []proxy.HookDecision) string {
+	parts := make([]string, 0, len(decisions))
+	for _, decision := range decisions {
+		if decision.Point != proxy.HookRoute || decision.Fallback || decision.Error != "" {
+			continue
+		}
+		if decision.Model == "" {
+			continue
+		}
+		part := decision.Model
+		if decision.Confidence != nil {
+			part += fmt.Sprintf(" (%.2f)", *decision.Confidence)
+		}
+		if decision.PluginID != "" {
+			part += " via " + decision.PluginID
+		}
+		parts = append(parts, part)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, ", ")
+}
+
+// setHookDecisionHeader publishes the plugin decision trail before the response
+// is committed (writeUpstreamResult writes the status, so this must run first).
+func setHookDecisionHeader(header http.Header, meta *proxy.AttemptMeta) {
+	if header == nil || meta == nil || len(meta.HookDecisions) == 0 {
+		return
+	}
+	if value := hookDecisionHeader(meta.HookDecisions); value != "" {
+		header.Set(HookDecisionEchoHeader, value)
+	}
 }
 
 func (h *RelayHandler) Register(r chi.Router) {
@@ -90,6 +237,10 @@ func (h *RelayHandler) Register(r chi.Router) {
 	r.Post("/audio/transcriptions", h.audioTranscriptions)
 	r.Post("/audio/translations", h.audioTranslations)
 	r.Post("/moderations", h.moderations)
+	// Custom-path passthrough: any OTHER /v1 path is forwarded verbatim to the
+	// channel's own endpoint (see relay_custom.go). Registered last so every
+	// real endpoint keeps its exact behaviour.
+	r.Post("/*", h.customPath)
 }
 
 // creditSummary is the OpenAI-compatible billing surface: a downstream key
@@ -102,6 +253,10 @@ func (h *RelayHandler) creditSummary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	// The downstream key's own quota is the first limit; the account pool is the
+	// second. Both carry a token budget and a money budget, and an exhausted one
+	// in EITHER unit is enough to refuse the request — a customer who bought 100
+	// dollars must not stay served because tokens are unlimited, and vice versa.
 	total := key.QuotaTotalTokens
 	used := key.QuotaUsedTokens
 	if used < 0 {
@@ -110,6 +265,10 @@ func (h *RelayHandler) creditSummary(w http.ResponseWriter, r *http.Request) {
 	available := total - used
 	if available < 0 {
 		available = 0
+	}
+	costAvailable := key.QuotaTotalCost - key.QuotaUsedCost
+	if costAvailable < 0 {
+		costAvailable = 0
 	}
 	expiresAt := int64(0)
 	if key.ExpiresAt != "" {
@@ -123,6 +282,11 @@ func (h *RelayHandler) creditSummary(w http.ResponseWriter, r *http.Request) {
 		"total_used":      used,
 		"total_available": available,
 		"expires_at":      expiresAt,
+		// The money budget travels beside the standard token fields; clients that
+		// only know the OpenAI shape simply ignore them.
+		"cost_granted":   key.QuotaTotalCost,
+		"cost_used":      key.QuotaUsedCost,
+		"cost_available": costAvailable,
 	})
 }
 
@@ -144,6 +308,21 @@ func (h *RelayHandler) getModels(w http.ResponseWriter, r *http.Request) {
 		}
 		if modelFilter != nil && !modelFilter.Allows(id) {
 			return
+		}
+		if access := downstreamTeam(r); access != nil {
+			_, candidates, err := h.db.RouteMember.RoutingCandidates(id, downstreamRouteGroup(r))
+			allowed := false
+			if err == nil {
+				for _, c := range candidates {
+					if access.AllowsMember(id, c.Member.ID) {
+						allowed = true
+						break
+					}
+				}
+			}
+			if !allowed {
+				return
+			}
 		}
 		if _, ok := seen[id]; ok {
 			return
@@ -204,10 +383,21 @@ func (h *RelayHandler) computeRawModels() []string {
 			}
 		}
 	}
+	// Virtual models: names a plugin's route hook answers for. They have no
+	// route of their own — the hook rewrites the request before selection — but
+	// a client can only send what /v1/models lists.
+	if h.virtualModels != nil {
+		for _, model := range h.virtualModels() {
+			add(model)
+		}
+	}
 	return raw
 }
 
 type chatCompletionsRequest struct {
+	Reasoning struct {
+		Effort string `json:"effort"`
+	} `json:"reasoning"`
 	Model           string `json:"model"`
 	Stream          bool   `json:"stream"`
 	ReasoningEffort string `json:"reasoning_effort"`
@@ -284,31 +474,31 @@ func (h *RelayHandler) countTokens(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *RelayHandler) imagesGenerations(w http.ResponseWriter, r *http.Request) {
-	h.forwardPassthrough(w, r, "images/generations", auth.ScopeImages, false, 20<<20)
+	h.forwardPassthrough(w, r, "images/generations", auth.ScopeImages, false, h.maxImageBodyBytes())
 }
 
 func (h *RelayHandler) imagesEdits(w http.ResponseWriter, r *http.Request) {
-	h.forwardPassthrough(w, r, "images/edits", auth.ScopeImages, true, 30<<20)
+	h.forwardPassthrough(w, r, "images/edits", auth.ScopeImages, true, h.maxImageBodyBytes())
 }
 
 func (h *RelayHandler) imagesVariations(w http.ResponseWriter, r *http.Request) {
-	h.forwardPassthrough(w, r, "images/variations", auth.ScopeImages, true, 30<<20)
+	h.forwardPassthrough(w, r, "images/variations", auth.ScopeImages, true, h.maxImageBodyBytes())
 }
 
 func (h *RelayHandler) audioSpeech(w http.ResponseWriter, r *http.Request) {
-	h.forwardPassthrough(w, r, "audio/speech", auth.ScopeAudio, false, 10<<20)
+	h.forwardPassthrough(w, r, "audio/speech", auth.ScopeAudio, false, h.maxBodyBytes())
 }
 
 func (h *RelayHandler) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
-	h.forwardPassthrough(w, r, "audio/transcriptions", auth.ScopeAudio, true, 30<<20)
+	h.forwardPassthrough(w, r, "audio/transcriptions", auth.ScopeAudio, true, h.maxImageBodyBytes())
 }
 
 func (h *RelayHandler) audioTranslations(w http.ResponseWriter, r *http.Request) {
-	h.forwardPassthrough(w, r, "audio/translations", auth.ScopeAudio, true, 30<<20)
+	h.forwardPassthrough(w, r, "audio/translations", auth.ScopeAudio, true, h.maxImageBodyBytes())
 }
 
 func (h *RelayHandler) moderations(w http.ResponseWriter, r *http.Request) {
-	h.forwardPassthrough(w, r, "moderations", auth.ScopeModerations, false, 2<<20)
+	h.forwardPassthrough(w, r, "moderations", auth.ScopeModerations, false, defaultPassthroughBodyBytes)
 }
 
 // forwardPassthrough relays OpenAI-compatible paths that may be JSON or multipart.
@@ -329,7 +519,7 @@ func (h *RelayHandler) forwardPassthrough(w http.ResponseWriter, r *http.Request
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBytes))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "body too large")
+		h.rejectTooLarge(w, r, maxBytes)
 		return
 	}
 	defer r.Body.Close()
@@ -338,7 +528,7 @@ func (h *RelayHandler) forwardPassthrough(w http.ResponseWriter, r *http.Request
 	stream := false
 	reasoningEffort := ""
 	if isMultipart {
-		modelName, err = extractMultipartModel(body, contentType)
+		modelName, stream, err = extractMultipartRequest(body, contentType)
 		if err != nil {
 			switch {
 			case errors.Is(err, errMultipartModelMissing):
@@ -374,7 +564,7 @@ func (h *RelayHandler) forwardPassthrough(w http.ResponseWriter, r *http.Request
 			return
 		}
 		modelName = request.Model
-		// Only speech/json endpoints may stream; still pass flag through.
+		// Image generation/edit responses may stream too.
 		stream = request.Stream
 		reasoningEffort = request.ReasoningEffort
 	}
@@ -400,16 +590,21 @@ func (h *RelayHandler) forwardPassthrough(w http.ResponseWriter, r *http.Request
 	clientFamily := ClientFamilyOf(r)
 
 	// Live-trace hook: same as forwardModelRequest.
+	clientKeyName := ""
+	if key := auth.DownstreamKey(r); key != nil {
+		clientKeyName = key.Name
+	}
 	watchCtx := r.Context()
 	var finishTrace func()
 	if h.liveTrace != nil && requestID != "" {
-		lbCtx, release, _ := h.liveTrace.Begin(r.Context(), requestID, "openai", modelName)
+		lbCtx, release, _ := h.liveTrace.Begin(r.Context(), requestID, "openai", modelName, livetrace.BeginMeta{Stream: stream, ClientKey: clientKeyName})
 		watchCtx, finishTrace = lbCtx, release
 	}
 	if finishTrace == nil {
 		finishTrace = func() {}
 	}
 	defer finishTrace()
+	watchCtx = withHookOrigin(watchCtx, r.Header)
 
 	proxyReq := proxy.Request{
 		RequestID:       requestID,
@@ -419,6 +614,8 @@ func (h *RelayHandler) forwardPassthrough(w http.ResponseWriter, r *http.Request
 		Method:          http.MethodPost,
 		OpenAIPath:      openAIPath,
 		DownstreamKeyID: keyID,
+		UserID:          downstreamUser(r),
+		TeamAccess:      downstreamTeam(r),
 		ContentType:     contentType,
 		SessionKey:      r.Header.Get("X-Meta-Session-Id"),
 		ReasoningEffort: reasoningEffort,
@@ -426,39 +623,28 @@ func (h *RelayHandler) forwardPassthrough(w http.ResponseWriter, r *http.Request
 		RouteGroup:      downstreamRouteGroup(r),
 	}
 	result, meta := h.proxy.ForwardWithMeta(watchCtx, proxyReq)
-	if h.liveTrace != nil && requestID != "" {
-		switch {
-		case result == nil:
-			h.liveTrace.Finish(requestID, livetrace.StatusFailed, "upstream response missing")
-		case result.Err != nil:
-			if r.Context().Err() != nil {
-				h.liveTrace.Finish(requestID, livetrace.StatusCanceled, result.Err.Error())
-			} else {
-				h.liveTrace.Finish(requestID, livetrace.StatusFailed, result.Err.Error())
-			}
-		default:
-			h.liveTrace.Finish(requestID, livetrace.StatusSuccess, "")
-		}
-	}
+	setHookDecisionHeader(w.Header(), meta)
+	h.finalizeFailedLiveTrace(requestID, result, r.Context().Err() != nil)
 	// Binary / non-JSON responses: do not force SSE content-type unless stream.
 	forceSSE := stream
-	writeUpstreamResult(
-		w, watchCtx, requestID, result, forceSSE,
-		func(tokens usage.Tokens, status int, firstByteMs int) {
-			channelID := int64(0)
-			if meta != nil {
-				channelID = meta.ChannelID
-				proxyReq.RouteID = meta.RouteID
-				proxyReq.GrayAttempt = meta.GrayAttempt
+	var lastProgress time.Time
+	h.writeObservedUpstreamResult(
+		w, watchCtx, proxyReq, meta, result, forceSSE,
+		h.attemptAccountant(proxyReq, meta, requestID, clientFamily),
+		func(bytesSent int64) {
+			// Throttled stream progress for the live view (~1 update/s).
+			if h.liveTrace == nil || requestID == "" {
+				return
 			}
-			h.proxy.RecordUsage(proxyReq, channelID, status, tokens)
-			if h.db != nil && h.db.ProxyLog != nil && requestID != "" {
-				if err := h.db.ProxyLog.UpdateMetaByRequestID(requestID, firstByteMs, clientFamily); err != nil {
-					log.Printf("relay: update log meta request_id=%s: %v", requestID, err)
-				}
+			now := time.Now()
+			if now.Sub(lastProgress) < time.Second {
+				return
 			}
+			lastProgress = now
+			h.liveTrace.Progress(requestID, int64(result.FirstByteMs), bytesSent)
 		},
 		h.streamErrorCallback(watchCtx, meta),
+		!strings.HasPrefix(openAIPath, "images/"),
 	)
 }
 
@@ -476,16 +662,23 @@ const maxMultipartModelBytes = 4 << 10
 // never confused with the actual form field.  The caller keeps forwarding the
 // original body bytes, so parsing cannot alter the upstream request.
 func extractMultipartModel(body []byte, contentType string) (string, error) {
+	model, _, err := extractMultipartRequest(body, contentType)
+	return model, err
+}
+
+func extractMultipartRequest(body []byte, contentType string) (string, bool, error) {
 	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil || !strings.EqualFold(mediaType, "multipart/form-data") {
-		return "", errMultipartInvalid
+		return "", false, errMultipartInvalid
 	}
 	boundary := params["boundary"]
 	if boundary == "" {
-		return "", errMultipartInvalid
+		return "", false, errMultipartInvalid
 	}
 	reader := multipart.NewReader(bytes.NewReader(body), boundary)
 	modelCount := 0
+	streamCount := 0
+	stream := false
 	model := ""
 	for {
 		part, nextErr := reader.NextPart()
@@ -493,33 +686,61 @@ func extractMultipartModel(body []byte, contentType string) (string, error) {
 			break
 		}
 		if nextErr != nil {
-			return "", errMultipartInvalid
+			return "", false, errMultipartInvalid
 		}
-		if part.FormName() != "model" {
+		field := part.FormName()
+		if field != "model" && field != "stream" {
 			continue
 		}
-		modelCount++
-		if modelCount > 1 {
-			return "", errMultipartModelDuplicate
+		if field == "model" {
+			modelCount++
+			if modelCount > 1 {
+				return "", false, errMultipartModelDuplicate
+			}
+		} else {
+			streamCount++
+			if streamCount > 1 {
+				return "", false, errMultipartInvalid
+			}
 		}
 		// A file part named model is not a scalar model selector. Reject it
 		// instead of interpreting arbitrary file bytes as an allowlisted model.
 		if part.FileName() != "" {
-			return "", errMultipartInvalid
+			return "", false, errMultipartInvalid
 		}
 		value, readErr := io.ReadAll(io.LimitReader(part, maxMultipartModelBytes+1))
 		if readErr != nil {
-			return "", errMultipartInvalid
+			return "", false, errMultipartInvalid
 		}
 		if len(value) > maxMultipartModelBytes {
-			return "", errMultipartModelTooLarge
+			return "", false, errMultipartModelTooLarge
 		}
-		model = strings.TrimSpace(string(value))
+		if field == "model" {
+			model = strings.TrimSpace(string(value))
+		} else {
+			stream, err = strconv.ParseBool(strings.TrimSpace(string(value)))
+			if err != nil {
+				return "", false, errMultipartInvalid
+			}
+		}
 	}
 	if modelCount == 0 || model == "" {
-		return "", errMultipartModelMissing
+		return "", stream, errMultipartModelMissing
 	}
-	return model, nil
+	return model, stream, nil
+}
+
+// groupQuotaExceeded reports whether a tenant group has spent either of its
+// budgets. Both units count: an operator who set only a spend budget must not
+// have it ignored because the token budget is unlimited.
+func groupQuotaExceeded(g *domain.KeyGroup) bool {
+	if g == nil {
+		return false
+	}
+	if g.QuotaTotalTokens > 0 && g.QuotaUsedTokens >= g.QuotaTotalTokens {
+		return true
+	}
+	return g.QuotaTotalCost > 0 && g.QuotaUsedCost >= g.QuotaTotalCost
 }
 
 func (h *RelayHandler) ensureQuota(w http.ResponseWriter, r *http.Request) bool {
@@ -537,10 +758,17 @@ func (h *RelayHandler) ensureQuota(w http.ResponseWriter, r *http.Request) bool 
 	// unlimited (Group.Get returns a zero-quota group for unknown names).
 	if groupName := key.GroupName; groupName != "" && h.db.Group != nil {
 		group, err := h.db.Group.Get(groupName)
-		if err == nil && group != nil && group.QuotaTotalTokens > 0 && group.QuotaUsedTokens >= group.QuotaTotalTokens {
+		if err == nil && groupQuotaExceeded(group) {
 			writeError(w, http.StatusPaymentRequired, "group quota exceeded")
 			return false
 		}
+	}
+	// Account pool: the third limit, and the one a credit code tops up. It
+	// rides along on the already-resolved access snapshot, so enforcing it
+	// costs no extra query.
+	if key.TeamAccess.QuotaExceeded() {
+		writeError(w, http.StatusPaymentRequired, "account quota exceeded")
+		return false
 	}
 	return true
 }
@@ -556,9 +784,9 @@ func (h *RelayHandler) forwardModelRequest(w http.ResponseWriter, r *http.Reques
 	if !h.ensureGroupRate(w, r) {
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 10*1024*1024))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.maxBodyBytes()))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "body too large")
+		h.rejectTooLarge(w, r, h.maxBodyBytes())
 		return
 	}
 	defer r.Body.Close()
@@ -575,6 +803,9 @@ func (h *RelayHandler) forwardModelRequest(w http.ResponseWriter, r *http.Reques
 		modelName = request.Model
 		stream = request.Stream
 		reasoningEffort = request.ReasoningEffort
+		if openAIPath == "responses" && request.Reasoning.Effort != "" {
+			reasoningEffort = request.Reasoning.Effort
+		}
 	} else {
 		var request modelOnlyRequest
 		if err := json.Unmarshal(body, &request); err != nil {
@@ -611,12 +842,16 @@ func (h *RelayHandler) forwardModelRequest(w http.ResponseWriter, r *http.Reques
 	}
 	clientFamily := ClientFamilyOf(r)
 
+	clientKeyName := ""
+	if key := auth.DownstreamKey(r); key != nil {
+		clientKeyName = key.Name
+	}
 	// Live-trace hook (optional): register the request for the admin live view
 	// and manual interrupt; the watch context cancels on operator interrupt.
 	watchCtx := r.Context()
 	var finishTrace func()
 	if h.liveTrace != nil && requestID != "" {
-		lbCtx, release, ok := h.liveTrace.Begin(r.Context(), requestID, downstream, modelName)
+		lbCtx, release, ok := h.liveTrace.Begin(r.Context(), requestID, downstream, modelName, livetrace.BeginMeta{Stream: stream, ClientKey: clientKeyName})
 		if ok {
 			watchCtx, finishTrace = lbCtx, release
 		} else {
@@ -627,6 +862,7 @@ func (h *RelayHandler) forwardModelRequest(w http.ResponseWriter, r *http.Reques
 		finishTrace = func() {}
 	}
 	defer finishTrace()
+	watchCtx = withHookOrigin(watchCtx, r.Header)
 
 	proxyReq := proxy.Request{
 		RequestID:          requestID,
@@ -636,21 +872,44 @@ func (h *RelayHandler) forwardModelRequest(w http.ResponseWriter, r *http.Reques
 		Method:             http.MethodPost,
 		OpenAIPath:         openAIPath,
 		DownstreamKeyID:    keyID,
+		UserID:             downstreamUser(r),
+		TeamAccess:         downstreamTeam(r),
 		DownstreamProtocol: downstream,
 		SessionKey:         r.Header.Get("X-Meta-Session-Id"),
 		ReasoningEffort:    reasoningEffort,
 		Headers:            clientHeaders(r.Header),
 		RouteGroup:         downstreamRouteGroup(r),
 	}
+	proxyReq, imageEditShim, shimErr := h.prepareImageEditShim(proxyReq)
+	if shimErr != nil {
+		writeError(w, http.StatusBadRequest, shimErr.Error())
+		return
+	}
 	result, meta := h.proxy.ForwardWithMeta(watchCtx, proxyReq)
-	writeUpstreamResult(
-		w, watchCtx, requestID, result, stream,
-		func(tokens usage.Tokens, status int, firstByteMs int) {
+	setHookDecisionHeader(w.Header(), meta)
+	var imageTokens usage.Tokens
+	if imageEditShim {
+		w.Header().Set("X-Meta-Image-Shim", proxyReq.OpenAIPath)
+		result, imageTokens = imageEditChatResult(watchCtx, result, modelName, stream, h.mediaFetcher())
+	}
+	var lastProgress time.Time
+	h.writeObservedUpstreamResult(
+		w, watchCtx, proxyReq, meta, result, stream,
+		func(tokens usage.Tokens, status int, firstByteMs int, bytesSent int64) {
+			if imageEditShim {
+				// Base64 image bytes and image counts are not token estimates.
+				tokens = imageTokens
+			}
 			channelID := int64(0)
 			if meta != nil {
 				channelID = meta.ChannelID
 				proxyReq.RouteID = meta.RouteID
+				// Billing resolves the member's own prices by id: the
+				// (route, channel) pair is not unique across route groups.
+				proxyReq.MemberID = meta.MemberID
+				proxyReq.UpstreamModel = meta.UpstreamModel
 				proxyReq.GrayAttempt = meta.GrayAttempt
+				proxyReq.BillingSnapshot = meta.BillingSnapshot
 			}
 			h.proxy.RecordUsage(proxyReq, channelID, status, tokens)
 			if h.db != nil && h.db.ProxyLog != nil && requestID != "" {
@@ -659,10 +918,23 @@ func (h *RelayHandler) forwardModelRequest(w http.ResponseWriter, r *http.Reques
 				}
 			}
 			if h.liveTrace != nil && requestID != "" {
-				h.liveTrace.Finish(requestID, livetrace.StatusSuccess, "")
+				h.liveTrace.FinishCopied(requestID, status, int64(firstByteMs), bytesSent, tokens.PromptTokens, tokens.CompletionTokens)
 			}
 		},
+		func(bytesSent int64) {
+			// Throttled stream progress for the live view (~1 update/s).
+			if h.liveTrace == nil || requestID == "" {
+				return
+			}
+			now := time.Now()
+			if now.Sub(lastProgress) < time.Second {
+				return
+			}
+			lastProgress = now
+			h.liveTrace.Progress(requestID, int64(result.FirstByteMs), bytesSent)
+		},
 		h.streamErrorCallback(watchCtx, meta),
+		!imageEditShim,
 	)
 	if h.liveTrace != nil && requestID != "" {
 		switch {
@@ -738,7 +1010,10 @@ func (h *RelayHandler) streamErrorCallback(requestCtx context.Context, meta *pro
 	}
 }
 
-func writeUpstreamResult(w http.ResponseWriter, requestCtx context.Context, requestID string, result *relay.Result, stream bool, onUsage func(usage.Tokens, int, int), onStreamError func()) {
+// onProgress streams the running byte count while a stream is being copied
+// (nil = no progress reporting); onUsage fires once after the transfer with
+// the final metrics.
+func writeUpstreamResult(w http.ResponseWriter, requestCtx context.Context, requestID string, result *relay.Result, stream bool, onUsage func(usage.Tokens, int, int, int64), onProgress func(int64), onStreamError func(), estimateOnInterrupt ...bool) {
 	if result == nil {
 		writeError(w, http.StatusBadGateway, "upstream response missing")
 		return
@@ -790,11 +1065,13 @@ func writeUpstreamResult(w http.ResponseWriter, requestCtx context.Context, requ
 	if status < 100 || status > 999 {
 		status = http.StatusBadGateway
 	}
+	// A JSON error is not an SSE stream, even if the client requested one.
+	stream = stream && status >= 200 && status < 300
 	defer result.Body.Close()
 	copyResponseHeaders(w.Header(), result.Header, stream)
 	w.WriteHeader(status)
 	tee := usage.NewTee(io.NopCloser(result.Body), stream)
-	bytesWritten, copyErr := copyUpstreamBody(w, tee, stream)
+	bytesWritten, copyErr := copyUpstreamBody(w, tee, stream, onProgress)
 	if copyErr != nil {
 		log.Printf("relay: copy upstream response request_id=%s: %v", requestID, copyErr)
 		if stream && onStreamError != nil {
@@ -804,18 +1081,25 @@ func writeUpstreamResult(w http.ResponseWriter, requestCtx context.Context, requ
 	_ = tee.Close()
 	if onUsage != nil {
 		tokens := tee.Tokens()
+		if result.MeteredUsage != nil {
+			if original := result.MeteredUsage(); original.Valid() {
+				tokens = original
+			}
+		}
 		// An interrupted stream that never delivered its final usage chunk
 		// would otherwise meter nothing for bytes the client already received.
 		// Fall back to a conservative estimate from the written byte count so
 		// partial completions are never entirely free.
-		if stream && copyErr != nil && !tokens.Valid() && bytesWritten > 0 {
+		allowEstimate := len(estimateOnInterrupt) == 0 || estimateOnInterrupt[0]
+		if allowEstimate && stream && copyErr != nil && !tokens.Valid() && bytesWritten > 0 {
 			tokens = usage.Tokens{
 				PromptTokens:     0,
+				Estimated:        true,
 				CompletionTokens: int(bytesWritten / streamEstimateBytesPerToken),
 				TotalTokens:      int(bytesWritten / streamEstimateBytesPerToken),
 			}
 		}
-		onUsage(tokens, status, result.FirstByteMs)
+		onUsage(tokens, status, result.FirstByteMs, bytesWritten)
 	}
 }
 
@@ -824,11 +1108,15 @@ func writeUpstreamResult(w http.ResponseWriter, requestCtx context.Context, requ
 func clientHeaders(h http.Header) map[string]string {
 	out := make(map[string]string, 8)
 	for key, values := range h {
-		if key == "Authorization" || key == "Host" {
+		canonical := http.CanonicalHeaderKey(key)
+		switch canonical {
+		case "Authorization", "Host", "Cookie", "Proxy-Authorization", "X-Meta-Csrf", "X-Api-Key", "X-Goog-Api-Key":
+			// Gateway authentication is not upstream request metadata. In
+			// particular HttpOnly team cookies must not reach hooks/rules.
 			continue
 		}
 		if len(values) > 0 && values[0] != "" {
-			out[http.CanonicalHeaderKey(key)] = values[0]
+			out[canonical] = values[0]
 		}
 	}
 	return out
@@ -941,12 +1229,12 @@ const sseKeepaliveInterval = 15 * time.Second
 // upstream stays silent past sseKeepaliveInterval. It returns the number of
 // bytes written to the client (used to estimate usage when an interrupted
 // stream never delivered its final usage chunk).
-func copyUpstreamBody(w http.ResponseWriter, body io.Reader, stream bool) (int64, error) {
+func copyUpstreamBody(w http.ResponseWriter, body io.Reader, stream bool, onProgress func(int64)) (int64, error) {
 	if !stream {
 		n, err := io.Copy(w, body)
 		return n, err
 	}
-	return copySSEWithKeepalive(w, body, sseKeepaliveInterval)
+	return copySSEWithKeepalive(w, body, sseKeepaliveInterval, onProgress)
 }
 
 // copySSEWithKeepalive pumps an SSE stream to the client. A single reader
@@ -955,7 +1243,7 @@ func copyUpstreamBody(w http.ResponseWriter, body io.Reader, stream bool) (int64
 // and flushed, which keeps proxies/clients from timing the connection out
 // during long silent stretches (e.g. a model "thinking" for minutes before the
 // first token).
-func copySSEWithKeepalive(w http.ResponseWriter, body io.Reader, idle time.Duration) (int64, error) {
+func copySSEWithKeepalive(w http.ResponseWriter, body io.Reader, idle time.Duration, onProgress func(int64)) (int64, error) {
 	flusher, canFlush := w.(http.Flusher)
 	type readRes struct {
 		data []byte
@@ -995,6 +1283,9 @@ func copySSEWithKeepalive(w http.ResponseWriter, body io.Reader, idle time.Durat
 				if canFlush {
 					flusher.Flush()
 				}
+				if onProgress != nil {
+					onProgress(written)
+				}
 			}
 			if res.err != nil {
 				if errors.Is(res.err, io.EOF) {
@@ -1020,6 +1311,19 @@ func copyResponseHeaders(dst, src http.Header, stream bool) {
 		if value := src.Get(key); value != "" {
 			dst.Set(key, value)
 		}
+	}
+	// Surface the endpoint the gateway actually called. Custom-path passthrough
+	// (POST /v1/<anything>) forwards a path the client chose, and a channel's
+	// endpoint override can relocate it further; without this header an operator
+	// reading a proxy log cannot tell the two apart from their own client code.
+	if value := src.Get(UpstreamURLEchoHeader); value != "" {
+		dst.Set(UpstreamURLEchoHeader, value)
+	}
+	// A Responses→chat fallback cannot carry server-side tools; the proxy names
+	// the ones it dropped so a client (or the operator reading its logs) can see
+	// why the model did not search the web.
+	if value := src.Get(proxy.DroppedToolsEchoHeader); value != "" {
+		dst.Set(proxy.DroppedToolsEchoHeader, value)
 	}
 	if stream {
 		dst.Set("Content-Type", "text/event-stream")

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -26,8 +27,10 @@ import (
 	"github.com/lan/meta-gateway/internal/exchange"
 	"github.com/lan/meta-gateway/internal/financesweep"
 	"github.com/lan/meta-gateway/internal/healthsweep"
+	"github.com/lan/meta-gateway/internal/keepalive"
 	"github.com/lan/meta-gateway/internal/livetrace"
 	"github.com/lan/meta-gateway/internal/maintenance"
+	"github.com/lan/meta-gateway/internal/modelcatalog"
 	"github.com/lan/meta-gateway/internal/observability"
 	"github.com/lan/meta-gateway/internal/outbound"
 	"github.com/lan/meta-gateway/internal/plugins"
@@ -37,28 +40,35 @@ import (
 	"github.com/lan/meta-gateway/internal/relay"
 	"github.com/lan/meta-gateway/internal/routing"
 	"github.com/lan/meta-gateway/internal/runtimeconfig"
+	"github.com/lan/meta-gateway/internal/selfupdate"
+	"github.com/lan/meta-gateway/internal/sitenews"
+	"github.com/lan/meta-gateway/internal/siteprobe"
 	"github.com/lan/meta-gateway/internal/store"
 	"github.com/lan/meta-gateway/internal/updatecheck"
+
 	"github.com/lan/meta-gateway/internal/webdavsync"
 	"github.com/lan/meta-gateway/internal/webhook"
 	"github.com/lan/meta-gateway/internal/webui"
 )
 
 type Dependencies struct {
-	Registry          *adapters.Registry
-	CheckinService    *checkin.Service
-	CheckinScheduler  *checkin.Scheduler
-	DiscoveryService  *discovery.Service
-	ExchangeService   *exchange.Service
-	PluginService     *plugins.Service
-	OutboundClient    *http.Client
-	Logger            *slog.Logger
-	Metrics           *observability.Registry
-	State             *observability.State
-	BackupService     *backup.Service
-	WebDAVService     *webdavsync.Service
-	RuntimeController *runtimeconfig.Controller
-	SetAuditRetention func(days, rows int)
+	Registry         *adapters.Registry
+	CheckinService   *checkin.Service
+	CheckinScheduler *checkin.Scheduler
+	DiscoveryService *discovery.Service
+	ExchangeService  *exchange.Service
+	PluginService    *plugins.Service
+	OutboundClient   *http.Client
+	// OutboundImageClient is the client for the image endpoints (longer
+	// response-header ceiling). nil = reuse OutboundClient.
+	OutboundImageClient *http.Client
+	Logger              *slog.Logger
+	Metrics             *observability.Registry
+	State               *atomic.Bool
+	BackupService       *backup.Service
+	WebDAVService       *webdavsync.Service
+	RuntimeController   *runtimeconfig.Controller
+	SetAuditRetention   func(days, rows int)
 }
 
 // New creates a fully wired chi.Router.
@@ -79,9 +89,10 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 	}
 	state := dependencies.State
 	if state == nil {
-		state = observability.NewState()
+		state = new(atomic.Bool)
+		state.Store(true)
 	}
-	clientIPs, err := newClientIPResolver(cfg.TrustedProxyCIDRs)
+	clientIPs, err := newClientIPResolver(cfg.TrustedProxyCIDRs, logger)
 	if err != nil {
 		panic("httpapi: invalid trusted proxy policy")
 	}
@@ -97,11 +108,35 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 		panic("httpapi: invalid outbound policy")
 	}
 	outboundClient := dependencies.OutboundClient
+	// The two clients are live: the outbound limits are runtime settings, so the
+	// relays keep one client whose transport is rebuilt when they change. The
+	// pool sizes ride along, which is why they are set here and not in
+	// NewClient's caller.
+	var liveOutbound, liveImage *outbound.LiveClient
 	if outboundClient == nil {
-		outboundClient = outbound.NewClient(outboundPolicy, outbound.ClientOptions{
+		live := outbound.NewLiveClient(outboundPolicy, outbound.ClientOptions{
 			ResponseHeaderTimeout: cfg.OutboundResponseHeaderTimeout,
 			TLSHandshakeTimeout:   cfg.OutboundTLSHandshakeTimeout,
+			MaxIdleConns:          cfg.OutboundMaxIdleConns,
+			MaxIdleConnsPerHost:   cfg.OutboundMaxIdleConnsPerHost,
 		})
+		liveOutbound = live
+		outboundClient = live.Client
+	}
+	// A second client with the image ceiling: image edits are non-idempotent (so
+	// they are never retried) and slow by nature, which made the shared 60s
+	// header timeout the only thing standing between a working upstream and a
+	// 502 (production, 2026-10-07).
+	imageClient := dependencies.OutboundImageClient
+	if imageClient == nil {
+		live := outbound.NewLiveClient(outboundPolicy, outbound.ClientOptions{
+			ResponseHeaderTimeout: cfg.OutboundImageHeaderTimeout,
+			TLSHandshakeTimeout:   cfg.OutboundTLSHandshakeTimeout,
+			MaxIdleConns:          cfg.OutboundMaxIdleConns,
+			MaxIdleConnsPerHost:   cfg.OutboundMaxIdleConnsPerHost,
+		})
+		liveImage = live
+		imageClient = live.Client
 	}
 	registry := dependencies.Registry
 	if registry == nil {
@@ -133,6 +168,11 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 	r.Use(clientIPs.Middleware)
 	r.Use(requestTelemetry(logger, metrics))
 	r.Use(recoverMiddleware(logger))
+	// CORS sits at the root rather than on the /v1 group: a preflight must be
+	// answered before the group's downstream-auth middleware runs, and a
+	// group-level middleware never sees an OPTIONS for a route that only
+	// registers POST.
+	r.Use(corsMiddleware("/v1", cfg.CORSAllowedOrigins))
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
@@ -142,7 +182,7 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 		})
 	})
 	r.Get("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if !state.Ready() || !pingReady(db, cfg.ReadinessTimeout) {
+		if !state.Load() || !pingReady(db, cfg.ReadinessTimeout) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
 			return
 		}
@@ -155,7 +195,7 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		if err := metrics.WritePrometheus(w, state.Ready()); err != nil {
+		if err := metrics.WritePrometheus(w, state.Load()); err != nil {
 			logger.ErrorContext(request.Context(), "metrics write failed", "category", "write")
 		}
 	})
@@ -183,43 +223,87 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 		}
 		http.Redirect(w, request, target, http.StatusPermanentRedirect)
 	}))
-	r.Get("/", handleLanding)
+	teamHandler := NewTeamHandler(db, enc)
+	// One front door. There is a single console now, so the root goes straight
+	// to it in either mode: a personal gateway's only user is the operator, and
+	// a team gateway's members sign in at the same door as everyone else. The
+	// old landing page is still served at /landing for anyone who wants a
+	// public brand surface.
+	r.Get("/", func(w http.ResponseWriter, request *http.Request) {
+		http.Redirect(w, request, "/console", http.StatusTemporaryRedirect)
+	})
+	r.Get("/landing", handleLanding)
 
 	// Admin routes
 	adminGroup := chi.NewRouter()
-	adminGroup.Use(auditAdmin(logger, db.AuditEvent))
+	adminGroup.Use(teamHandler.PrincipalSlot)
+	adminGroup.Use(auditAdmin(logger, db.AuditEvent, ratelimit.New(auditFailureRatePerMinute, auditFailureBurst), metrics))
 	// Session-token verification uses the master-key-derived HMAC key (with a
 	// fallback to the raw key material when the encrypter is unavailable).
 	sessionKey := auth.SessionSigningKey(enc.KeyMaterial(), cfg.AdminTokenList())
 	sessionHandler := &sessionHandler{
-		db:          db,
-		adminTokens: cfg.AdminTokenList(),
-		sessionKey:  sessionKey,
-		enc:         enc,
+		db:            db,
+		adminTokens:   cfg.AdminTokenList(),
+		adminUsername: cfg.AdminUsername,
+		team:          teamHandler,
+		sessionKey:    sessionKey,
+		enc:           enc,
 		// Keep the public TOTP exchange independently bounded from the admin
 		// limiter, which does not cover this route.
-		globalLoginLimiter: ratelimit.New(30, 5),
+		globalLoginLimiter: ratelimit.New(loginGlobalRatePerMinute, loginGlobalBurst),
 		loginLimiter:       ratelimit.New(30, 5),
+		// Empty (the default) keeps the upgrade path open only until the
+		// deployment claims an owner account; "break-glass" forces it open for
+		// a lost owner password.
+		tokenLoginBreakGlass: cfg.AdminTokenLogin,
 	}
 	sessionHandler.RegisterPublic(r)
-	adminGroup.Use(auth.AdminMiddlewareWithSession(cfg.AdminTokenList(), func(token string) bool {
-		return auth.VerifySessionToken(sessionKey, token)
+	adminGroup.Use(teamHandler.AdminAuth(func(token string) bool {
+		return auth.ValidateAdminToken(token, cfg.AdminTokenList(), func(value string) bool { return auth.VerifySessionToken(sessionKey, value) })
 	}))
 	adminLimiter := ratelimit.New(cfg.AdminRatePerMinute, cfg.AdminRateBurst)
 	relayLimiter := ratelimit.New(cfg.RelayRatePerMinute, cfg.RelayRateBurst)
 	adminGroup.Use(rateLimitMiddleware(adminLimiter, func(*http.Request) int64 { return 0 }, "admin", metrics))
 	adminGroup.Use(withAdminBodyLimit(cfg.MaxAdminBodyBytes))
+	teamHandler.RegisterAdmin(adminGroup)
+	teamHandler.RegisterPublic(r)
+	// /app was the member app's own SPA. There is one console now, so these
+	// links land there instead — the path and query are carried over, because
+	// invitation and recovery links are query-carrying deep links that must
+	// keep working (an /app?invite=… link now opens the console's sign-in page
+	// with the invitation already in hand).
+	r.Get("/app", func(w http.ResponseWriter, request *http.Request) {
+		target := "/console"
+		if request.URL.RawQuery != "" {
+			target += "?" + request.URL.RawQuery
+		}
+		http.Redirect(w, request, target, http.StatusTemporaryRedirect)
+	})
+	r.Get("/app/*", func(w http.ResponseWriter, request *http.Request) {
+		target := "/console" + strings.TrimPrefix(request.URL.Path, "/app")
+		if request.URL.RawQuery != "" {
+			target += "?" + request.URL.RawQuery
+		}
+		http.Redirect(w, request, target, http.StatusTemporaryRedirect)
+	})
 	selector := routing.New(db.RouteMember)
-	var stickyStore *routing.StickyStore
-	if cfg.StickyEnabled {
-		stickyStore = routing.NewStickyStore(cfg.StickyTTL, nil)
-		selector.SetSticky(stickyStore)
+	// The affinity store is installed unconditionally, and StickyEnabled only
+	// decides what routes INHERIT: a route may force affinity on for one model
+	// (routes.sticky_session) on a gateway whose global default is off. A
+	// non-positive TTL can only come from a config that never enabled sticky
+	// and left the placeholder value; a zero TTL would expire every binding
+	// immediately, so fall back to the shipped default.
+	stickyTTL := cfg.StickyTTL
+	if stickyTTL <= 0 {
+		stickyTTL = routing.DefaultStickyTTL
 	}
+	stickyStore := routing.NewStickyStore(stickyTTL, nil)
+	selector.SetSticky(stickyStore, cfg.StickyEnabled)
 	proxyService := proxy.New(selector, relay.NewWithClient(outboundClient), db, enc, cfg.RetryTimes, cfg.Cooldown)
+	proxyService.SetImageRelay(relay.NewWithClient(imageClient))
 	proxyService.SetAdapterRegistry(registry)
 	proxyService.SetCredentialRefresher(checkinService)
 	proxyService.SetChannelRetryTimes(cfg.ChannelRetryTimes)
-	proxyService.SetKeyPoolRotation(cfg.KeyPoolRotation)
 	proxyService.SetAutoDisableThreshold(cfg.ChannelAutoDisableThreshold)
 	if cfg.FaultProtectionConfigured {
 		proxyService.SetFaultProtection(cfg.FaultProtectionEnabled)
@@ -266,6 +350,33 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 	adminHandler.SetProxyValidator(func(raw string) error {
 		return globalProxy.Validate(raw, outboundPolicy)
 	})
+	// External model index sync: refreshes the capability registry (how to call
+	// a model) and fills unset metadata/prices from the public LiteLLM and
+	// models.dev indexes. It reuses the SSRF-policy client, so a deployment can
+	// still fence it off with OUTBOUND_ALLOW_HOSTS. A zero interval disables the
+	// schedule but leaves the console's manual sync working.
+	catalogURLs := modelCatalogURLs(cfg.ModelCatalogSources)
+	if len(catalogURLs) > 0 {
+		catalogService := modelcatalog.New(db, modelcatalog.Options{
+			Client: outboundClient,
+			URLs:   catalogURLs,
+		})
+		scheduled := cfg.ModelCatalogInterval > 0
+		adminHandler.SetModelCatalog(catalogService, scheduled, cfg.ModelCatalogSyncPrices)
+		adminHandler.SetLogger(logger)
+		// The bootstrap worker runs even when the periodic sweep is switched
+		// off: a model the operator just routed is worth one targeted sync, and
+		// "I had to press a button" is exactly the friction this removes.
+		bootstrapCtx, bootstrapCancel := context.WithCancel(context.Background())
+		RegisterStopper(bootstrapCancel)
+		go runModelBootstraps(bootstrapCtx, logger, adminHandler.ModelBootstrapQueue(),
+			catalogService, cfg.ModelCatalogSyncPrices)
+		if scheduled {
+			catalogCtx, catalogCancel := context.WithCancel(context.Background())
+			RegisterStopper(catalogCancel)
+			go runCatalogSweep(catalogCtx, logger, db, catalogService, cfg.ModelCatalogInterval, cfg.ModelCatalogSyncPrices)
+		}
+	}
 	adminHandler.Register(adminGroup)
 	sessionHandler.RegisterAdmin(adminGroup)
 	discoveryHandler := NewDiscoveryHandler(db, discoveryService)
@@ -295,6 +406,7 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 	})
 	accountService := account.New(db, enc, registry)
 	accountService.SetNotifier(webhookNotifier)
+	RegisterStopper(accountService.Stop)
 	checkinService.SetNotifier(webhookNotifier)
 	// Proactive sweep: refresh finance (balance-low) + probe tokens (expired)
 	// on a timer so alerts fire without an operator opening the admin pages.
@@ -308,11 +420,14 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 	go alertRules.Run(alertRulesCtx)
 	RegisterStopper(alertRulesCancel)
 	// Daily balance-history snapshot + retention prunes (balance, decision
-	// snapshots, health history): see maintenance.BalanceSweeper.
+	// snapshots, health history, model changes): see maintenance.BalanceSweeper.
 	balanceSweeper := maintenance.NewBalanceSweeperWithRetention(accountService, db, maintenance.RetentionConfig{
-		BalanceHistoryDays:   cfg.BalanceHistoryRetentionDays,
-		DecisionSnapshotDays: cfg.DecisionSnapshotRetentionDays,
-		HealthHistoryDays:    cfg.HealthHistoryRetentionDays,
+		BalanceHistoryDays:        cfg.BalanceHistoryRetentionDays,
+		DecisionSnapshotDays:      cfg.DecisionSnapshotRetentionDays,
+		HealthHistoryDays:         cfg.HealthHistoryRetentionDays,
+		ModelChangeDays:           cfg.ModelChangeRetentionDays,
+		ModelChangeAutoIgnoreDays: cfg.ModelChangeAutoIgnoreDays,
+		SiteProbeDays:             cfg.SiteProbeRetentionDays,
 	}, logger)
 	balanceSweeper.Start()
 	RegisterStopper(balanceSweeper.Stop)
@@ -320,7 +435,12 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 		exchangeService.SetKeySyncer(account.ExchangeKeySyncer{Service: accountService})
 	}
 	NewAccountHandler(accountService).Register(adminGroup)
-	NewTryHandler(proxyService).Register(adminGroup)
+	tryHandler := NewTryHandler(proxyService, db)
+	// The connection drawer's 试调 action asks whether a channel serves a model
+	// at all, before the model is adopted into a route — which is why it needs
+	// the route-free path rather than the ordinary try/chat relay.
+	tryHandler.SetChannelModelTester(proxyService)
+	tryHandler.Register(adminGroup)
 	// Model probing rides the same proxy path as /v1, so it needs the live
 	// proxy service rather than its own upstream client.
 	probeService := probe.NewService(db, proxyService, logger)
@@ -331,10 +451,62 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 	probeScheduler := probe.NewScheduler(db, probeService, probe.Schedule{}, logger, nil)
 	RegisterStopper(probeScheduler.Stop)
 
+	// Keepalive: one small call to an account that has gone quiet, before the
+	// site's own "no call for N days" rule becomes a ban. It shares the probe's
+	// call plan (internal/callplan) so a site that bans probing is called in the
+	// shape it asked for, and it is idle-driven because the window is a property
+	// of the site (15 days here, 30 there). Off until an operator turns it on.
+	keepaliveService := keepalive.NewService(db, proxyService, webhookNotifier, logger)
+	keepaliveService.SetConfig(keepalive.Config{
+		Interval:        time.Duration(cfg.KeepaliveCheckIntervalSeconds) * time.Second,
+		DefaultIdleDays: cfg.KeepaliveDefaultIdleDays,
+	})
+	keepaliveCtx, stopKeepalive := context.WithCancel(context.Background())
+	go keepaliveService.Run(keepaliveCtx)
+	RegisterStopper(stopKeepalive)
+	NewKeepaliveHandler(db, keepaliveService).Register(adminGroup)
+
+	// External site probe sources: read the probe data a public-benefit site
+	// publishes itself (Uptime Kuma status page / New-API price table) so
+	// availability can be judged without spending upstream tokens. Collection is
+	// read-only against public endpoints; the routing changes it proposes only
+	// happen when an operator applies them from the model page tool.
+	// The hook binds the SSRF policy once, the way the outbound client above
+	// does, so probe requests follow the console-configured global proxy
+	// without ever inheriting the environment's.
+	siteProbeService := siteprobe.NewService(db, logger, func(req *http.Request) (*url.URL, error) {
+		return globalProxy.ForRequest(req, outboundPolicy)
+	})
+	siteProbeScheduler := siteprobe.NewScheduler(siteProbeService,
+		time.Duration(cfg.SiteProbeIntervalSeconds)*time.Second,
+		time.Duration(cfg.SiteProbeJitterSeconds)*time.Second,
+		cfg.SiteProbeCatalogURL, logger)
+	siteProbeScheduler.Start()
+	RegisterStopper(siteProbeScheduler.Stop)
+	NewSiteProbeHandler(db, siteProbeService, siteProbeScheduler).Register(adminGroup)
+
+	// Site news: what each upstream publishes on its own notice board (New-API's
+	// /api/status → data.announcements). Read-only, public endpoints, no token —
+	// the same network view as the probe collector, bound to the console's global
+	// proxy the same way and never to the environment's.
+	siteNewsService := sitenews.NewService(db, logger, func(req *http.Request) (*url.URL, error) {
+		return globalProxy.ForRequest(req, outboundPolicy)
+	})
+	siteNewsScheduler := sitenews.NewScheduler(siteNewsService,
+		time.Duration(cfg.SiteNewsIntervalSeconds)*time.Second, 0, logger)
+	siteNewsScheduler.Start()
+	RegisterStopper(siteNewsScheduler.Stop)
+	NewSiteNewsHandler(siteNewsService, siteNewsScheduler).Register(adminGroup)
+
 	// Plugin catalog + add-on gates. Optional modules (exchange, checkin) must be
 	// enabled to expose their Admin surfaces. Core audit/backup stay always-on.
 	pluginService := dependencies.PluginService
 	if pluginService != nil {
+		// Plugin intercept hooks: the plugin host implements
+		// proxy.Interceptor, so a plugin can take part in routing and
+		// request/response rewriting without internal/proxy importing any
+		// plugin machinery (same seam as LiveTraceObserver).
+		proxyService.SetInterceptor(pluginService)
 		pluginHandler := NewPluginHandler(pluginService)
 		pluginHandler.SetTokenVerifier(func(token string) bool {
 			return auth.ValidateAdminToken(token, cfg.AdminTokenList(), func(s string) bool {
@@ -347,18 +519,10 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 		pluginHandler.RegisterPublic(r)
 	}
 
-	adminGroup.Group(func(module chi.Router) {
-		if pluginService != nil {
-			module.Use(requirePluginEnabled(pluginService, "checkin"))
-		}
-		NewCheckinHandler(db, checkinService, enc).Register(module)
-	})
-	adminGroup.Group(func(module chi.Router) {
-		if pluginService != nil {
-			module.Use(requirePluginEnabled(pluginService, "exchange"))
-		}
-		NewExchangeHandler(exchangeService, cfg.ExchangeAllowSecretExport).Register(module)
-	})
+	// Check-in and exchange are built-in surfaces, not store-gated extensions:
+	// their handlers are always registered.
+	NewCheckinHandler(db, checkinService, enc).Register(adminGroup)
+	NewExchangeHandler(exchangeService, cfg.ExchangeAllowSecretExport).Register(adminGroup)
 	webdavService := dependencies.WebDAVService
 	if webdavService == nil {
 		maxBytes := cfg.WebDAVMaxBytes
@@ -378,9 +542,6 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 		webdavService.SetExporter(exchangeService)
 	}
 	adminGroup.Group(func(module chi.Router) {
-		if pluginService != nil {
-			module.Use(requirePluginEnabled(pluginService, "exchange"))
-		}
 		NewWebDAVHandler(webdavService).Register(module)
 	})
 	auditHandler := NewAuditHandler(db, cfg.AuditRetentionDays, cfg.AuditRetentionRows)
@@ -391,6 +552,12 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 	}
 	// Core: audit + online backups are always available (not store-gated).
 	NewBackupHandler(backupService).Register(adminGroup)
+
+	// The relay handler is built further down (it needs the mounted /v1 router),
+	// but the runtime appliers are constructed here: this is where the body-ceiling
+	// applier stores its value until the handler exists, and where it finds it
+	// again on every later change.
+	var relayHandler *RelayHandler
 
 	runtimeController := dependencies.RuntimeController
 	if runtimeController == nil {
@@ -422,15 +589,15 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 				})
 			},
 			CheckinSched: dependencies.CheckinScheduler,
-			CheckinAllowed: func() bool {
-				return pluginService == nil || pluginService.IsEnabled("checkin")
-			},
 			SetAudit:     auditHandler.SetRetention,
 			SetAuditLoop: dependencies.SetAuditRetention,
 			// Sticky hot-swap: rewire selector + proxy + admin handler so an
-			// admin toggle takes effect without a restart.
-			SetSticky: func(store *routing.StickyStore, ttl time.Duration) {
-				selector.SetSticky(store)
+			// admin toggle takes effect without a restart. enabled is the
+			// inherited default, not a hard switch — routes may override it,
+			// and the admin stats endpoint reads the default back off the
+			// selector rather than keeping its own copy.
+			SetSticky: func(store *routing.StickyStore, enabled bool, ttl time.Duration) {
+				selector.SetSticky(store, enabled)
 				proxyService.SetSticky(store)
 				adminHandler.SetSticky(store)
 			},
@@ -461,8 +628,58 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 			SetChannelRetryTimes: func(times int) {
 				proxyService.SetChannelRetryTimes(times)
 			},
-			SetKeyPoolRotation: func(enabled bool) {
-				proxyService.SetKeyPoolRotation(enabled)
+			// External site-probe cadence: the loop re-reads it every round, so a
+			// settings change takes effect on the next one.
+			SetSiteProbeSchedule: func(interval, jitter time.Duration) {
+				siteProbeScheduler.SetSchedule(interval, jitter)
+			},
+			// Upstream notice-board cadence: 0 turns the scheduled read off (the
+			// dashboard's refresh button keeps working), and any change re-arms the
+			// wait in flight instead of waiting out the old interval.
+			SetSiteNewsSchedule: func(interval time.Duration) {
+				siteNewsScheduler.SetSchedule(interval, 0)
+			},
+			// Keepalive master switch + cadence + fallback window. The loop re-reads
+			// these every wake, so turning the switch off stops the next round.
+			SetKeepalive: func(enabled bool, checkInterval time.Duration, defaultIdleDays int) {
+				keepaliveService.SetConfig(keepalive.Config{
+					Enabled:         enabled,
+					Interval:        checkInterval,
+					DefaultIdleDays: defaultIdleDays,
+				})
+			},
+			// Outbound limits hot reload. The two relays share one client each, so the
+			// transport underneath them is rebuilt here and the next request picks up
+			// the new timeouts; the connect timeout lives on the policy's dialer. The
+			// image client keeps its own, longer ceiling. An embedder that injected
+			// its own client keeps it untouched (both live clients are nil then),
+			// which is the documented contract for injected dependencies.
+			SetOutboundLimits: func(limits runtimeconfig.OutboundLimits) {
+				outboundPolicy.SetDialTimeout(limits.ConnectTimeout)
+				if liveOutbound != nil {
+					liveOutbound.Rebuild(outbound.ClientOptions{
+						ResponseHeaderTimeout: limits.HeaderTimeout,
+						TLSHandshakeTimeout:   limits.TLSTimeout,
+						MaxIdleConns:          limits.MaxIdleConns,
+						MaxIdleConnsPerHost:   limits.MaxIdleConnsPerHost,
+					})
+				}
+				if liveImage != nil {
+					liveImage.Rebuild(outbound.ClientOptions{
+						ResponseHeaderTimeout: limits.ImageHeaderTimeout,
+						TLSHandshakeTimeout:   limits.TLSTimeout,
+						MaxIdleConns:          limits.MaxIdleConns,
+						MaxIdleConnsPerHost:   limits.MaxIdleConnsPerHost,
+					})
+				}
+			},
+			// Request-body ceilings hot reload. The handler reads them per request,
+			// so nothing is rebuilt: the next call accepts (or refuses) the bigger
+			// body. Nil before the handler exists — see relayHandler above.
+			SetRelayBodyLimits: func(jsonBytes, imageBytes int64) {
+				if relayHandler != nil {
+					relayHandler.SetBodyLimits(jsonBytes, imageBytes)
+				}
 			},
 		})
 	}
@@ -472,39 +689,88 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 	if err := runtimeController.Bootstrap(); err != nil {
 		logger.Error("runtime settings bootstrap failed", "category", "configuration", "err", err.Error())
 	}
+	teamHandler.requestDefaults = func() TeamRequestDefaults {
+		snapshot := runtimeController.Snapshot().Editable
+		return TeamRequestDefaults{FailoverEnabled: snapshot.CrossChannelFailoverEnabled, RetryTimes: snapshot.RetryTimes}
+	}
+	// Switching to team mode seeds the owner from this identity: the operator is
+	// already signed in as the deployment administrator, and the console's own
+	// admin username wins over ADMIN_USERNAME once it has been set. The password
+	// is the admin token, which is the only secret that authenticates it.
+	teamHandler.deploymentAdmin = func() (string, string) {
+		username, err := db.OperatorUsername(cfg.AdminUsername)
+		if err != nil {
+			return "", ""
+		}
+		return username, cfg.AdminToken
+	}
+	// The sign-in page asks /auth/options whether the upgrade path is still open
+	// (see authOptions); the answer is the same predicate the login endpoint
+	// uses, so the entry can never appear on a gateway that would refuse it.
+	teamHandler.tokenLoginOpen = sessionHandler.tokenLoginAllowed
+	// Third-party sign-in calls the provider's token and userinfo endpoints from
+	// the server, so they follow the same proxy the operator configured for
+	// outbound traffic — not the container's HTTP_PROXY, which usually points at
+	// the host and cannot reach GitHub.
+	teamHandler.outboundProxy = func() string {
+		return runtimeController.Snapshot().Editable.ProxyURL
+	}
 	// Update check: periodic GitHub latest-release comparison for the console
 	// badge. The admin toggle (read live from runtime settings) gates every
 	// outbound call.
+	//
+	// The channel is the deployment's own tag, not a console preference. The
+	// console cannot change which tag the container runs — that is the
+	// deployment file — so a switch there could only make the check offer a build
+	// the executor would never install. Deriving it means "what you are offered"
+	// and "what you can install" are the same question; a pinned tag or a
+	// container predating the variable checks the stable channel.
 	updateCtx, updateCancel := context.WithCancel(context.Background())
 	RegisterStopper(updateCancel)
 	updateService := updatecheck.New(func() bool {
 		return runtimeController.Snapshot().Editable.UpdateCheckEnabled
 	})
+	updateService.SetChannelSource(func() string {
+		if channel := selfupdate.TrackingChannel(); channel != "" {
+			return channel
+		}
+		return "stable"
+	})
 	go updateService.Run(updateCtx)
 	NewUpdateCheckHandler(updateService, runtimeController).Register(adminGroup)
+	// One-click container update (opt-in: needs the Docker socket mounted).
+	selfUpdateService := selfupdate.NewWithDataDir(selfupdate.DefaultSocket, cfg.DataDir)
+	NewSelfUpdateHandler(selfUpdateService, updateService, backupService, db).Register(adminGroup)
 	NewRuntimeSettingsHandler(runtimeController).Register(adminGroup)
 	// Passive-recovery loop: probes auto-disabled channels on a schedule and
 	// restores them when the upstream answers (config hot-reloadable).
 	recoveryCtx, recoveryCancel := context.WithCancel(context.Background())
 	RegisterStopper(recoveryCancel)
 	go discoveryService.RunRecoveryLoop(recoveryCtx)
-	// Re-apply check-in schedule from effective runtime settings when the add-on is toggled.
-	if pluginService != nil && runtimeController != nil {
-		ctrl := runtimeController
-		pluginService.SetOnChange(func(id string, _enabled bool) {
-			if id != "checkin" {
-				return
-			}
-			if err := ctrl.ResyncCheckin(); err != nil {
-				logger.Error("check-in resync after module toggle failed", "category", "scheduler", "err", err.Error())
-			}
-		})
-	}
+	// Re-apply the check-in schedule from effective runtime settings whenever the
+	// settings change; the check-in surface itself is always on now, so there is
+	// no module toggle left to react to.
 	NewRuntimeSettingsHandler(runtimeController).Register(adminGroup)
 	r.Mount("/admin", adminGroup)
 
 	// Relay routes (v1)
-	relayHandler := NewRelayHandler(db, proxyService, ratelimit.New(cfg.RelayModelRatePerMinute, cfg.RelayModelRateBurst), newGroupRateLimiter(), modelsCache)
+	relayHandler = NewRelayHandler(db, proxyService, ratelimit.New(cfg.RelayModelRatePerMinute, cfg.RelayModelRateBurst), newGroupRateLimiter(), modelsCache)
+	// Request-body ceilings are configuration, not a constant: what a client sends
+	// (base64 images in a chat request, multi-image edits) is the input the gateway
+	// has to accept. They are also runtime settings, so the handler starts from the
+	// EFFECTIVE values (console override when there is one, deployment default
+	// otherwise) rather than from the environment: the applier installed above has
+	// already run during Bootstrap, when this handler did not exist yet.
+	effective := runtimeController.Snapshot().Editable
+	relayHandler.SetBodyLimits(
+		int64(effective.RelayMaxBodyMB)<<20,
+		int64(effective.RelayMaxImageMB)<<20,
+	)
+	if pluginService != nil {
+		// A router plugin's match_models make a model name reachable that has
+		// no route of its own ("auto"): list it so clients can discover it.
+		relayHandler.SetVirtualModels(pluginService.VirtualModels)
+	}
 	// Live-trace registry: in-memory request states for the admin console's
 	// live view + manual interrupt. Wired into both the proxy (round updates)
 	// and the relay handler (begin/finish + interrupt context).
@@ -514,6 +780,7 @@ func NewWithDependencies(cfg *config.Config, db *store.DB, enc *crypto.Encrypter
 	newLiveTraceHandler(liveRegistry).Register(adminGroup)
 	v1Group := chi.NewRouter()
 	v1Group.Use(auth.NewDownstreamAuth(db.DownstreamKey).Middleware())
+	v1Group.Use(teamHandler.RelayMiddleware)
 	v1Group.Use(rateLimitMiddleware(relayLimiter, downstreamRateKey, "relay", metrics))
 	relayHandler.Register(v1Group)
 	r.Mount("/v1", v1Group)

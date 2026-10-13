@@ -81,6 +81,41 @@ type RuntimeSettingsRow struct {
 	ProbeChannels    []int64
 	ProbeModels      []string
 
+	// External site-probe collection cadence. NULL (which reads back as -1)
+	// means "not overridden" and resolves to the env bootstrap.
+	SiteProbeIntervalSeconds int
+	SiteProbeJitterSeconds   int
+
+	// Upstream notice-board reader cadence. NULL (which reads back as -1) means
+	// "not overridden" and resolves to the env bootstrap; a stored 0 is the
+	// operator's "off" and must stay distinguishable from unset.
+	SiteNewsIntervalSeconds int
+
+	// Keepalive: the master switch, how often a round asks whether anything is
+	// due, and the window used by a site that has none of its own. The per-site
+	// window and the per-channel switch live on their own rows, because the
+	// window is the site's rule rather than a global preference.
+	KeepaliveEnabled              bool
+	KeepaliveCheckIntervalSeconds int
+	KeepaliveDefaultIdleDays      int
+
+	// Outbound client limits. 0 means "no override": the deployment default
+	// (OUTBOUND_* in the environment) applies. They are runtime settings because
+	// the header ceiling is what decides whether a slow upstream dies at 60s.
+	OutboundConnectTimeoutSeconds     int
+	OutboundHeaderTimeoutSeconds      int
+	OutboundImageHeaderTimeoutSeconds int
+	OutboundTLSTimeoutSeconds         int
+	OutboundMaxIdleConns              int
+	OutboundMaxIdleConnsPerHost       int
+
+	// /v1 request-body ceilings in megabytes. 0 means "no override": the
+	// deployment default (RELAY_MAX_BODY_MB / RELAY_MAX_IMAGE_MB) applies. They
+	// are runtime settings for the same reason as the outbound limits — the
+	// ceiling is what refuses an ordinary request with inlined base64 images.
+	RelayMaxBodyMB  int
+	RelayMaxImageMB int
+
 	UpdatedAt time.Time
 }
 
@@ -113,6 +148,13 @@ func (s *RuntimeSettingsStore) Get() (*RuntimeSettingsRow, error) {
 		       default_model_sync_mode,
 		       probe_cron, probe_prompt, probe_max_tokens, probe_concurrency,
 		       probe_auto_disable, probe_channels, probe_models,
+		       site_probe_interval_seconds, site_probe_jitter_seconds,
+		       site_news_interval_seconds,
+		       keepalive_enabled, keepalive_check_interval_seconds, keepalive_default_idle_days,
+		       outbound_connect_timeout_seconds, outbound_header_timeout_seconds,
+		       outbound_image_header_timeout_seconds, outbound_tls_timeout_seconds,
+		       outbound_max_idle_conns, outbound_max_idle_conns_per_host,
+		       relay_max_body_mb, relay_max_image_mb,
 		       updated_at
 		FROM runtime_settings WHERE id = 1`)
 	var (
@@ -137,6 +179,11 @@ func (s *RuntimeSettingsStore) Get() (*RuntimeSettingsRow, error) {
 		probeCron, probePrompt                                                             sql.NullString
 		probeMaxTokens, probeConcurrency, probeAutoDisable                                 sql.NullInt64
 		probeChannels, probeModels                                                         sql.NullString
+		siteProbeInterval, siteProbeJitter, siteNewsInterval                               sql.NullInt64
+		keepaliveEnabled, keepaliveCheckInterval, keepaliveDefaultIdle                     sql.NullInt64
+		outboundConnect, outboundHeader, outboundImageHeader                               sql.NullInt64
+		outboundTLS, outboundIdle, outboundIdlePerHost                                     sql.NullInt64
+		relayBodyMB, relayImageMB                                                          sql.NullInt64
 		cron, updated                                                                      sql.NullString
 	)
 	if err := row.Scan(
@@ -155,6 +202,11 @@ func (s *RuntimeSettingsStore) Get() (*RuntimeSettingsRow, error) {
 		&defaultSyncMode,
 		&probeCron, &probePrompt, &probeMaxTokens, &probeConcurrency, &probeAutoDisable,
 		&probeChannels, &probeModels,
+		&siteProbeInterval, &siteProbeJitter, &siteNewsInterval,
+		&keepaliveEnabled, &keepaliveCheckInterval, &keepaliveDefaultIdle,
+		&outboundConnect, &outboundHeader, &outboundImageHeader,
+		&outboundTLS, &outboundIdle, &outboundIdlePerHost,
+		&relayBodyMB, &relayImageMB,
 		&updated,
 	); err != nil {
 		if err == sql.ErrNoRows {
@@ -367,6 +419,58 @@ func (s *RuntimeSettingsStore) Get() (*RuntimeSettingsRow, error) {
 	if probeModels.Valid {
 		out.ProbeModels = decodeStringList(probeModels.String)
 	}
+	if siteProbeInterval.Valid {
+		out.SiteProbeIntervalSeconds = int(siteProbeInterval.Int64)
+	} else {
+		out.SiteProbeIntervalSeconds = -1
+	}
+	// Unlike the site-probe pair, 0 is a value the operator can pick ("off"),
+	// so only NULL/-1 resolves to the env bootstrap.
+	if siteNewsInterval.Valid {
+		out.SiteNewsIntervalSeconds = int(siteNewsInterval.Int64)
+	} else {
+		out.SiteNewsIntervalSeconds = -1
+	}
+	out.KeepaliveEnabled = keepaliveEnabled.Int64 != 0
+	if keepaliveCheckInterval.Valid {
+		out.KeepaliveCheckIntervalSeconds = int(keepaliveCheckInterval.Int64)
+	} else {
+		out.KeepaliveCheckIntervalSeconds = -1
+	}
+	if keepaliveDefaultIdle.Valid {
+		out.KeepaliveDefaultIdleDays = int(keepaliveDefaultIdle.Int64)
+	} else {
+		out.KeepaliveDefaultIdleDays = -1
+	}
+	if siteProbeJitter.Valid {
+		out.SiteProbeJitterSeconds = int(siteProbeJitter.Int64)
+	} else {
+		out.SiteProbeJitterSeconds = -1
+	}
+	if outboundConnect.Valid {
+		out.OutboundConnectTimeoutSeconds = int(outboundConnect.Int64)
+	}
+	if outboundHeader.Valid {
+		out.OutboundHeaderTimeoutSeconds = int(outboundHeader.Int64)
+	}
+	if outboundImageHeader.Valid {
+		out.OutboundImageHeaderTimeoutSeconds = int(outboundImageHeader.Int64)
+	}
+	if outboundTLS.Valid {
+		out.OutboundTLSTimeoutSeconds = int(outboundTLS.Int64)
+	}
+	if outboundIdle.Valid {
+		out.OutboundMaxIdleConns = int(outboundIdle.Int64)
+	}
+	if outboundIdlePerHost.Valid {
+		out.OutboundMaxIdleConnsPerHost = int(outboundIdlePerHost.Int64)
+	}
+	if relayBodyMB.Valid {
+		out.RelayMaxBodyMB = int(relayBodyMB.Int64)
+	}
+	if relayImageMB.Valid {
+		out.RelayMaxImageMB = int(relayImageMB.Int64)
+	}
 	if updated.Valid {
 		if parsed, err := time.Parse("2006-01-02 15:04:05", updated.String); err == nil {
 			out.UpdatedAt = parsed.UTC()
@@ -417,6 +521,13 @@ func (s *RuntimeSettingsStore) Save(settings *RuntimeSettingsRow) error {
 			default_model_sync_mode,
 			probe_cron, probe_prompt, probe_max_tokens, probe_concurrency,
 			probe_auto_disable, probe_channels, probe_models,
+			site_probe_interval_seconds, site_probe_jitter_seconds,
+			site_news_interval_seconds,
+			keepalive_enabled, keepalive_check_interval_seconds, keepalive_default_idle_days,
+			outbound_connect_timeout_seconds, outbound_header_timeout_seconds,
+			outbound_image_header_timeout_seconds, outbound_tls_timeout_seconds,
+			outbound_max_idle_conns, outbound_max_idle_conns_per_host,
+			relay_max_body_mb, relay_max_image_mb,
 			updated_at
 		) VALUES (
 			1, ?, ?, ?, ?, ?, ?,
@@ -440,6 +551,10 @@ func (s *RuntimeSettingsStore) Save(settings *RuntimeSettingsRow) error {
 			?,
 			?, ?, ?, ?,
 			?, ?, ?,
+			?, ?, ?,
+			?, ?, ?,
+			?, ?, ?, ?, ?, ?,
+			?, ?,
 			datetime('now')
 		)
 		ON CONFLICT(id) DO UPDATE SET
@@ -493,6 +608,20 @@ func (s *RuntimeSettingsStore) Save(settings *RuntimeSettingsRow) error {
 			probe_auto_disable = excluded.probe_auto_disable,
 			probe_channels = excluded.probe_channels,
 			probe_models = excluded.probe_models,
+			site_probe_interval_seconds = excluded.site_probe_interval_seconds,
+			site_probe_jitter_seconds = excluded.site_probe_jitter_seconds,
+			site_news_interval_seconds = excluded.site_news_interval_seconds,
+			keepalive_enabled = excluded.keepalive_enabled,
+			keepalive_check_interval_seconds = excluded.keepalive_check_interval_seconds,
+			keepalive_default_idle_days = excluded.keepalive_default_idle_days,
+			outbound_connect_timeout_seconds = excluded.outbound_connect_timeout_seconds,
+			outbound_header_timeout_seconds = excluded.outbound_header_timeout_seconds,
+			outbound_image_header_timeout_seconds = excluded.outbound_image_header_timeout_seconds,
+			outbound_tls_timeout_seconds = excluded.outbound_tls_timeout_seconds,
+			outbound_max_idle_conns = excluded.outbound_max_idle_conns,
+			outbound_max_idle_conns_per_host = excluded.outbound_max_idle_conns_per_host,
+			relay_max_body_mb = excluded.relay_max_body_mb,
+			relay_max_image_mb = excluded.relay_max_image_mb,
 			updated_at = datetime('now')`,
 		hasOverride,
 		settings.RetryTimes,
@@ -544,6 +673,20 @@ func (s *RuntimeSettingsStore) Save(settings *RuntimeSettingsRow) error {
 		settings.ProbeAutoDisable,
 		encodeIntList(settings.ProbeChannels),
 		encodeStringList(settings.ProbeModels),
+		settings.SiteProbeIntervalSeconds,
+		settings.SiteProbeJitterSeconds,
+		settings.SiteNewsIntervalSeconds,
+		settings.KeepaliveEnabled,
+		settings.KeepaliveCheckIntervalSeconds,
+		settings.KeepaliveDefaultIdleDays,
+		settings.OutboundConnectTimeoutSeconds,
+		settings.OutboundHeaderTimeoutSeconds,
+		settings.OutboundImageHeaderTimeoutSeconds,
+		settings.OutboundTLSTimeoutSeconds,
+		settings.OutboundMaxIdleConns,
+		settings.OutboundMaxIdleConnsPerHost,
+		settings.RelayMaxBodyMB,
+		settings.RelayMaxImageMB,
 	)
 	if err != nil {
 		return fmt.Errorf("runtime settings save: %w", err)

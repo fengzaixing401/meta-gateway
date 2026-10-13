@@ -1,42 +1,120 @@
+import { useSyncExternalStore } from "react";
 /** Compact token/request counts: 1.2M / 34.5k / 812. */
 export function formatTokens(n: number) {
-	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-	if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-	return String(n);
-}
-
-/** Compact dollar rendering: $1.2k / $3.50 / $0.000123. */
-export function formatCost(value: number) {
-	if (value >= 1000) return `$${value.toFixed(0)}`;
-	if (value >= 1) return `$${value.toFixed(2)}`;
-	if (value >= 0.01) return `$${value.toFixed(4)}`;
-	if (value === 0) return "$0.00";
-	return `$${value.toFixed(6)}`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
 }
 
 /**
- * Per-component log cost: cache-read tokens are billed at their own unit
- * price when configured, otherwise they fall back to the prompt price.
- * Returns the USD cost or null when no pricing applies.
+ * The site's money presentation.
+ *
+ * Amounts travel through the app in the ledger's unit (USD — the same number
+ * `usage_records.cost` holds). The console and the member app render them
+ * through a symbol and a rate the operator sets once, so a site that prices in
+ * yuan shows yuan everywhere without rewriting a single stored amount.
+ *
+ * It is a module-level value rather than a React context on purpose: `formatCost`
+ * is called from plain helpers, table renderers and log formatters that are not
+ * all inside one provider, and threading a context through them would be a
+ * bigger change than the feature. The shells set it once when they load the
+ * settings.
  */
-export function logCostUsd(input: {
-	promptTokens: number;
-	completionTokens: number;
-	cacheReadTokens: number;
-	pricePromptPer1k?: number;
-	priceCompletionPer1k?: number;
-	priceCachePer1k?: number;
-}): number | null {
-	const promptPrice = input.pricePromptPer1k ?? 0;
-	const completionPrice = input.priceCompletionPer1k ?? 0;
-	if (promptPrice <= 0 && completionPrice <= 0) return null;
-	const cache = Math.min(Math.max(0, input.cacheReadTokens ?? 0), Math.max(0, input.promptTokens ?? 0));
-	const prompt = Math.max(0, input.promptTokens ?? 0);
-	const uncached = Math.max(0, prompt - cache);
-	const cachePrice = (input.priceCachePer1k ?? 0) > 0 ? input.priceCachePer1k! : promptPrice;
-	const total =
-		(uncached / 1000) * promptPrice +
-		(cache / 1000) * cachePrice +
-		((input.completionTokens ?? 0) / 1000) * completionPrice;
-	return total > 0 ? total : null;
+
+let symbol = "$";
+let rate = 1;
+let currencySnapshot = { symbol, rate };
+const currencyListeners = new Set<() => void>();
+const subscribeCurrency = (listener: () => void) => {
+  currencyListeners.add(listener);
+  return () => {
+    currencyListeners.delete(listener);
+  };
+};
+/** Trigger dependent renderers when a display setting is loaded or changed. */
+export function useCurrency() {
+  return useSyncExternalStore(
+    subscribeCurrency,
+    () => currencySnapshot,
+    () => DEFAULT_CURRENCY,
+  );
+}
+
+/** Defaults used until the shells have read the site settings. */
+export const DEFAULT_CURRENCY = { symbol: "$", rate: 1 };
+
+/**
+ * Applies the site's settings. An empty symbol or a non-positive rate falls
+ * back to the defaults instead of printing nonsense: this value is written from
+ * a server response, and a broken response must not be able to garble every
+ * amount on the page.
+ */
+export function setCurrency(next: { symbol?: string; rate?: number } | null | undefined) {
+  const nextSymbol = String(next?.symbol ?? "").trim();
+  symbol = nextSymbol && nextSymbol.length <= 8 ? nextSymbol : DEFAULT_CURRENCY.symbol;
+  const nextRate = Number(next?.rate ?? 1);
+  rate = Number.isFinite(nextRate) && nextRate > 0 ? nextRate : 1;
+  if (currencySnapshot.symbol !== symbol || currencySnapshot.rate !== rate) {
+    currencySnapshot = { symbol, rate };
+    currencyListeners.forEach((listener) => listener());
+  }
+}
+
+/** Converts a stored amount into the display currency. */
+export function displayAmount(value: number) {
+  return value * rate;
+}
+
+/** Compact money rendering: ¥1.2k / $3.50 / $0.000123. */
+export function formatCost(value: number) {
+  const shown = displayAmount(value);
+  if (shown >= 1000) return `${symbol}${shown.toFixed(0)}`;
+  if (shown >= 1) return `${symbol}${shown.toFixed(2)}`;
+  if (shown >= 0.01) return `${symbol}${shown.toFixed(4)}`;
+  if (shown === 0) return `${symbol}0.00`;
+  return `${symbol}${shown.toFixed(6)}`;
+}
+
+/** Unit prices must not turn small nonzero charges into a displayed zero. */
+export function formatUnitPrice(value: number) {
+  const shown = displayAmount(value);
+  if (!Number.isFinite(shown)) return "—";
+  if (shown !== 0 && Math.abs(shown) < 0.000001)
+    return `${symbol}${Number(shown.toPrecision(10)).toString()}`;
+  return `${symbol}${Number(shown.toPrecision(10)).toLocaleString("en-US", { minimumFractionDigits: Math.abs(shown) >= 1 || shown === 0 ? 2 : 0, maximumFractionDigits: 10 })}`;
+}
+
+/**
+ * "3 分钟前" for a timestamp the server already normalized to UTC.
+ *
+ * Shared by the dashboard's request stream and the upstream-news panel: two
+ * copies of this drifted apart the moment one of them changed its wording, and
+ * the i18n keys are the same either way.
+ */
+export function relativeTime(
+  iso: string,
+  t: (key: string, vars?: Record<string, string | number>) => string,
+) {
+  const ms = Date.now() - new Date(iso).getTime();
+  const minute = 60_000;
+  if (ms < minute) return t("dashboard.justNow");
+  if (ms < 3_600_000) return t("dashboard.minutesAgo", { n: Math.floor(ms / minute) });
+  if (ms < 24 * 3_600_000) return t("dashboard.hoursAgo", { n: Math.floor(ms / 3_600_000) });
+  return t("dashboard.daysAgo", { n: Math.floor(ms / (24 * 3_600_000)) });
+}
+
+/**
+ * A millisecond reading as a person reads it: "420 ms", "1.4 s", "2 分 5 秒".
+ *
+ * Latency arrives in milliseconds everywhere (proxy_logs, health sweeps), but a
+ * window average can be seconds — printing "12480 ms" makes the reader do the
+ * division themselves.
+ */
+export function formatLatency(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "—";
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)} s`;
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.round((ms % 60_000) / 1000);
+  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
 }

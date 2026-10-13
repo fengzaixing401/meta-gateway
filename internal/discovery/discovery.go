@@ -73,8 +73,13 @@ type ProbeResult struct {
 	Models    []string `json:"models"`
 	// CredentialModels maps each usable credential to the models it could list.
 	CredentialModels map[int64][]string `json:"credential_models,omitempty"`
-	LatencyMs        int                `json:"latency_ms"`
-	CheckedAt        time.Time          `json:"checked_at"`
+	// KeysAttempted/KeysListed expose per-round multi-key coverage: when only
+	// some of the channel's keys answered, the merged list may be incomplete
+	// and removals derived from it are flagged as possible false positives.
+	KeysAttempted int       `json:"keys_attempted,omitempty"`
+	KeysListed    int       `json:"keys_listed,omitempty"`
+	LatencyMs     int       `json:"latency_ms"`
+	CheckedAt     time.Time `json:"checked_at"`
 }
 
 type RefreshItem struct {
@@ -212,24 +217,11 @@ func (s *Service) Probe(ctx context.Context, channelID int64) (*ProbeResult, err
 		if errors.Is(lastErr, context.Canceled) || errors.Is(lastErr, context.DeadlineExceeded) {
 			return nil, lastErr
 		}
-		category := domain.CategoryUpstreamFailure
-		var adapterErr *adapters.Error
-		if errors.As(lastErr, &adapterErr) {
-			category = string(adapterErr.Kind)
-			// 401/403 on /v1/models with a user access_token is expected on many New API hosts.
-			if adapterErr.Kind == adapters.ErrorStatus &&
-				(adapterErr.Status == 401 || adapterErr.Status == 403) {
-				kind := ""
-				if lastCredential != nil {
-					kind = strings.ToLower(strings.TrimSpace(lastCredential.Kind))
-				}
-				if kind == "access_token" || kind == "session" {
-					category = domain.CategoryUserTokenNotForModels
-				} else {
-					category = domain.CategoryUpstreamUnauthorized
-				}
-			}
+		credentialKind := ""
+		if lastCredential != nil {
+			credentialKind = lastCredential.Kind
 		}
+		category := categoryForListError(lastErr, credentialKind)
 		if persist {
 			checkedAt := s.now()
 			_ = s.db.Channel.RecordProbeFailure(channel.ID, checkedAt, category)
@@ -255,6 +247,8 @@ func (s *Service) Probe(ctx context.Context, channelID int64) (*ProbeResult, err
 		Adapter:          adapter.Name(),
 		Models:           models,
 		CredentialModels: perKey,
+		KeysAttempted:    len(credentials),
+		KeysListed:       len(perKey),
 		LatencyMs:        latency,
 		CheckedAt:        checkedAt,
 	}, nil
@@ -305,7 +299,12 @@ func (s *Service) probeModels(ctx context.Context, adapter adapters.ModelAdapter
 		sort.Strings(perKey[credential.ID])
 	}
 	if len(merged) == 0 {
-		return nil, perKey, lastErr, lastCredential, nil
+		// An upstream that lists nothing is a healthy channel with an empty
+		// catalogue, and this slice goes straight into the refresh payload where
+		// the console reads `.models.length`. A nil slice marshals to
+		// `"models": null` and blanked the whole page there, so the empty case
+		// must still be an array.
+		return []string{}, perKey, lastErr, lastCredential, nil
 	}
 	models = make([]string, 0, len(merged))
 	for model := range merged {
@@ -372,12 +371,22 @@ func (s *Service) Refresh(ctx context.Context, channelID int64) (*RefreshResult,
 		ChannelID:        probe.ChannelID,
 		Models:           probe.Models,
 		CredentialModels: probe.CredentialModels,
+		PartialDiscovery: probe.KeysAttempted > 1 && probe.KeysListed < probe.KeysAttempted,
 		Source:           probe.Adapter,
 		LatencyMs:        probe.LatencyMs,
 		CheckedAt:        probe.CheckedAt,
 	})
 	if err != nil {
 		return nil, internalError("persistence_failure")
+	}
+	// Best-effort capability auto-tagging: give newly discovered models a
+	// protocol classification so the workbench and shim can reason about them
+	// without an operator visit. Rows that already exist (including manual
+	// overrides) are left alone, and a failure here must never fail a refresh.
+	for _, model := range probe.Models {
+		if tagErr := s.db.ModelCapability.AutoTag(model); tagErr != nil {
+			break
+		}
 	}
 	return &RefreshResult{
 		ChannelID: probe.ChannelID, Adapter: probe.Adapter, Models: probe.Models,

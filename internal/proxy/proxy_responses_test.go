@@ -10,6 +10,7 @@ import (
 
 	"github.com/lan/meta-gateway/internal/adapters"
 	"github.com/lan/meta-gateway/internal/relay"
+	"github.com/lan/meta-gateway/internal/store"
 )
 
 // responsesBody is a minimal Responses API request document.
@@ -60,6 +61,69 @@ func TestResponsesNativePassthrough(t *testing.T) {
 	}
 }
 
+// TestResponsesNativeProbeIsPaidOncePerChannel pins the cost side of the
+// native-first rule: an upstream that 404s /v1/responses is asked ONCE, and the
+// channel is translated from then on.
+//
+// Production, 2026-10-07: channel 98 (openai-compatible) answered 404 to
+// /v1/responses, and all 44 Responses requests in the log uploaded their whole
+// body to that endpoint first (the captured client body was 77 KB) before the
+// translation ran. The answer never changes, so asking once is enough.
+func TestResponsesNativeProbeIsPaidOncePerChannel(t *testing.T) {
+	chatAnswer := `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"model",` +
+		`"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"hi"}}],` +
+		`"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}`
+	upstream := &queuedRelay{results: []*relay.Result{
+		response(http.StatusNotFound, `{"error":{"message":"not found"}}`),
+		response(http.StatusOK, chatAnswer),
+		response(http.StatusOK, chatAnswer),
+	}}
+	service, db, highMemberID, _ := setupProxy(t, upstream)
+	service.SetAdapterRegistry(adapters.NewRegistry(nil))
+
+	call := func(id string) *relay.Result {
+		result, meta := service.ForwardWithMeta(context.Background(), Request{
+			RequestID:          id,
+			Model:              "model",
+			Body:               []byte(responsesBody),
+			Method:             http.MethodPost,
+			OpenAIPath:         "responses",
+			DownstreamProtocol: "responses",
+		})
+		if result == nil || result.Err != nil {
+			t.Fatalf("%s: result=%+v", id, result)
+		}
+		if meta == nil || meta.MemberID != highMemberID {
+			t.Fatalf("%s: meta=%+v", id, meta)
+		}
+		return result
+	}
+
+	call("probe-first")
+	if len(upstream.calls) != 2 {
+		t.Fatalf("first request must probe then translate, calls=%v", upstream.calls)
+	}
+	call("probe-second")
+	if len(upstream.calls) != 3 {
+		t.Fatalf("the native probe was paid again, calls=%v", upstream.calls)
+	}
+	if !strings.HasSuffix(upstream.calls[0], "/responses") {
+		t.Fatalf("calls[0]=%q, want the native probe first", upstream.calls[0])
+	}
+	for _, call := range upstream.calls[1:] {
+		if !strings.HasSuffix(call, "/chat/completions") {
+			t.Fatalf("call=%q, want the translated endpoint", call)
+		}
+	}
+	// The mark is per channel: another one still gets its own probe.
+	if !service.nativeResponsesUnsupported(channelOfMember(t, db, highMemberID)) {
+		t.Fatal("the probed channel was not remembered")
+	}
+	if service.nativeResponsesUnsupported(channelOfMember(t, db, highMemberID) + 1000) {
+		t.Fatal("the mark leaked to another channel")
+	}
+}
+
 // TestResponsesFallbackTranslatesOn404 verifies the in-place fallback: the
 // upstream 404s on /v1/responses, so the SAME channel is replayed with the
 // request pivoted to chat/completions and the chat answer converts back to
@@ -100,6 +164,18 @@ func TestResponsesFallbackTranslatesOn404(t *testing.T) {
 	}
 	if !strings.HasSuffix(upstream.calls[1], "/chat/completions") {
 		t.Fatalf("fallback must hit /chat/completions, calls=%v", upstream.calls)
+	}
+	// The pivoted replay is the endpoint that answered, so the echoed url and
+	// the log row must name it — not the /responses endpoint that 404'd.
+	if echoed := result.Header.Get(UpstreamURLEchoHeader); !strings.HasSuffix(echoed, "/chat/completions") {
+		t.Fatalf("echoed upstream url = %q, want the translated replay", echoed)
+	}
+	logs, err := db.ProxyLog.ListFilter(store.ProxyLogFilter{Model: "model", Limit: 10})
+	if err != nil {
+		t.Fatalf("proxy logs: %v", err)
+	}
+	if len(logs) == 0 || !strings.HasSuffix(logs[0].UpstreamURL, "/chat/completions") {
+		t.Fatalf("log row must record the translated replay url, got %+v", logs)
 	}
 	var chat struct {
 		Messages []struct {
@@ -209,6 +285,16 @@ func TestResponsesStreamFallbackReshapes(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("stream reshape missing %q in:\n%s", want, body)
 		}
+	}
+	// The terminal answer must repeat what was streamed: Responses clients
+	// replace the rendered message with response.completed's output, so an
+	// empty text there wipes the reply the user just watched arrive.
+	if !strings.Contains(string(body), `"text":"streamed"`) {
+		t.Fatalf("response.completed must carry the streamed text in:\n%s", body)
+	}
+	completed := string(body[strings.Index(string(body), "event: response.completed"):])
+	if !strings.Contains(completed, `"output":[{"content":[{"annotations":[],"text":"streamed","type":"output_text"}`) {
+		t.Fatalf("response.completed output item wrong in:\n%s", completed)
 	}
 }
 

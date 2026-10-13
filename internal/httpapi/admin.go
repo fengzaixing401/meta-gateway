@@ -3,6 +3,8 @@ package httpapi
 import (
 	"database/sql"
 	"errors"
+	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/lan/meta-gateway/internal/crypto"
 	"github.com/lan/meta-gateway/internal/maintenance"
+	"github.com/lan/meta-gateway/internal/modelcatalog"
 	"github.com/lan/meta-gateway/internal/routing"
 	"github.com/lan/meta-gateway/internal/store"
 )
@@ -33,6 +36,21 @@ type AdminHandler struct {
 	// validateProxyURL validates a per-channel proxy URL against the outbound
 	// SSRF policy (nil skips validation — admin handlers without a policy).
 	validateProxyURL func(raw string) error
+	// modelCatalog drives the external model-index sync (nil disables the
+	// endpoint pair, which is how a deployment without outbound access runs).
+	modelCatalog *modelcatalog.Service
+	// modelCatalogScheduled / modelCatalogPrices mirror the process settings so
+	// the console can report whether the registry refreshes on its own and
+	// whether a sync is allowed to fill prices.
+	modelCatalogScheduled bool
+	modelCatalogPrices    bool
+	// modelBootstraps carries newly routed models to the background worker that
+	// fills their registry row right away. Nil when no catalog service is
+	// wired; see ModelBootstrapQueue.
+	modelBootstraps chan string
+	// logger is optional (nil in tests that do not care) and only used for
+	// best-effort background failures, never for request outcomes.
+	logger *slog.Logger
 	// connectionMu serializes the site-reuse/create/rollback sequence. Without
 	// it, two simultaneous creates for a new base URL could let one failed
 	// rollback delete the other request's newly attached credentials/channels.
@@ -62,6 +80,28 @@ func (h *AdminHandler) SetGCService(s *maintenance.GCService) {
 	h.gcService = s
 }
 
+// SetModelCatalog wires the external model-index sync. scheduled reports whether
+// a background sweep is configured; pricesEnabled reports the process default
+// for writing prices during that sweep. A nil service disables both catalog
+// endpoints.
+func (h *AdminHandler) SetModelCatalog(service *modelcatalog.Service, scheduled, pricesEnabled bool) {
+	h.modelCatalog = service
+	h.modelCatalogScheduled = scheduled
+	h.modelCatalogPrices = pricesEnabled
+	// The bootstrap queue exists exactly as long as there is a catalog to sync
+	// against; a nil queue is what tells bootstrapNewModel to skip the network
+	// half and keep the (local) auto-tag.
+	if service != nil && h.modelBootstraps == nil {
+		h.modelBootstraps = make(chan string, modelBootstrapQueueSize)
+	}
+}
+
+// SetLogger wires the logger used for best-effort background failures (nil
+// silences them; request outcomes are reported through the response, not here).
+func (h *AdminHandler) SetLogger(logger *slog.Logger) {
+	h.logger = logger
+}
+
 // SetSticky hot-swaps the sticky-session store backing the admin read-only
 // stats endpoint (nil = disabled). Used by the runtime-settings hot reload.
 func (h *AdminHandler) SetSticky(store *routing.StickyStore) {
@@ -77,9 +117,13 @@ func (h *AdminHandler) Register(r chi.Router) {
 	r.Delete("/sites/{id}", h.deleteSite)
 	// Site-type detection (AAH chain) for the connection editor.
 	r.Get("/site-type", h.detectSiteType)
+	// Endpoint preview: what URL this base would actually call, shown in the
+	// connection editor so a wrong join is visible before the first request.
+	r.Get("/endpoint-preview", h.endpointPreview)
 	// One-shot connection creation: site + credential + channel, with site
 	// reuse by normalized URL and rollback of partially created rows.
 	r.Post("/connections", h.createConnection)
+	r.Post("/channels/{id}/model-alias", h.setChannelModelAlias)
 
 	// Credentials
 	r.Get("/sites/{siteId}/credentials", h.listCredentials)
@@ -121,11 +165,15 @@ func (h *AdminHandler) Register(r chi.Router) {
 	r.Post("/routes/{routeId}/groups/copy", h.copyRouteMemberGroup)
 	r.Delete("/routes/{routeId}/groups/{name}", h.deleteRouteMemberGroup)
 	r.Get("/route-groups", h.listRouteGroupNames)
+	// Attach every channel that already serves the route's model ("add all").
+	r.Post("/routes/{id}/auto-match", h.autoMatchRouteMembers)
 
 	r.Get("/models/changes", h.listModelChanges)
 	r.Post("/models/changes/ignore", h.ignoreModelChanges)
 	r.Post("/models/changes/preview", h.previewModelChanges)
 	r.Post("/models/changes/apply", h.applyModelChanges)
+	r.Post("/models/changes/discard-preview", h.previewModelDiscard)
+	r.Post("/models/changes/discard-apply", h.applyModelDiscard)
 
 	// Model-name unification assistant
 	r.Post("/models/unify/preview", h.unifyPreview)
@@ -133,8 +181,8 @@ func (h *AdminHandler) Register(r chi.Router) {
 	r.Get("/models/unify/batches", h.unifyBatches)
 	r.Get("/models/unify/batches/{id}/ops", h.unifyBatchOps)
 	r.Post("/models/unify/batches/{id}/undo", h.unifyUndo)
-	// Bring a single archived original back without discarding the alias.
-	r.Post("/models/unify/archived/{id}/restore", h.unifyRestoreRoute)
+	// Rebuild a single removed original without discarding the alias.
+	r.Post("/models/unify/deleted/{id}/restore", h.unifyRestoreRoute)
 
 	// Downstream keys
 	r.Get("/downstream-keys", h.listDownstreamKeys)
@@ -148,12 +196,18 @@ func (h *AdminHandler) Register(r chi.Router) {
 
 	// Usage / simple billing
 	r.Get("/usage/summary", h.usageSummary)
+	r.Get("/usage/series", h.usageSeries)
+	r.Get("/usage/top-models", h.usageTopModels)
 	r.Get("/usage", h.listUsage)
 	// Billing ratios (model markup; 1.0 = no markup)
 	r.Get("/ratios", h.listModelRatios)
 	r.Put("/ratios/{model}", h.setModelRatio)
 	// Tenant groups (multi-tenant quotas / rate limits)
 	r.Get("/groups", h.listGroups)
+	// Money presentation (symbol + rate). Amounts stay stored in the ledger's
+	// unit; these two values decide how they are printed.
+	r.Get("/display-settings", h.displaySettings)
+	r.Put("/display-settings", h.saveDisplaySettings)
 	r.Put("/groups/{name}", h.upsertGroup)
 	r.Delete("/groups/{name}", h.deleteGroup)
 
@@ -176,6 +230,17 @@ func (h *AdminHandler) Register(r chi.Router) {
 	r.Get("/model-metadata", h.listModelMetadata)
 	r.Put("/model-metadata/{name}", h.upsertModelMetadata)
 	r.Delete("/model-metadata/{name}", h.deleteModelMetadata)
+	// Model capability registry (protocol layer: endpoint, encoding, limits).
+	r.Get("/model-capabilities", h.listModelCapabilities)
+	r.Put("/model-capabilities/{name}", h.upsertModelCapability)
+	r.Delete("/model-capabilities/{name}", h.deleteModelCapability)
+	r.Post("/model-capabilities/resolve", h.resolveModelCapabilities)
+	r.Post("/model-capabilities/auto-tag", h.autoTagModelCapabilities)
+	// External model-index sync (LiteLLM / models.dev). Preview before sync is
+	// the intended order: the plan names every field the write would touch.
+	r.Get("/model-capabilities/catalog", h.catalogStatus)
+	r.Post("/model-capabilities/catalog/preview", h.previewModelCatalog)
+	r.Post("/model-capabilities/catalog/sync", h.syncModelCatalog)
 	// Channel health history + availability summaries.
 	r.Get("/health-history", h.listHealthHistory)
 	r.Get("/health-history/summary", h.healthHistorySummary)
@@ -194,6 +259,14 @@ func (h *AdminHandler) Register(r chi.Router) {
 	r.Get("/db/gc", h.lastDBGC)
 	// Error passthrough rules (status/keyword → passthrough/rewrite/ignore).
 	r.Get("/error-rules", h.listErrorRules)
+	r.Get("/model-pricing", h.modelPricing)
+	r.Get("/model-pricing/batch", h.modelPricingBatch)
+	r.Get("/billing-rule", h.billingRule)
+	r.Put("/billing-rule", h.saveBillingRule)
+	r.Post("/billing-rule/copy-quote", h.copyBillingQuote)
+	r.Get("/price-quotes", h.priceQuotes)
+	r.Post("/price-quotes", h.manualPriceQuote)
+	r.Post("/price-quotes/estimate", h.estimatePriceQuote)
 	r.Post("/error-rules", h.createErrorRule)
 	r.Put("/error-rules/{id}", h.updateErrorRule)
 	r.Delete("/error-rules/{id}", h.deleteErrorRule)
@@ -208,25 +281,40 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "resource already exists")
 		return
 	}
+	// The console only ever sees the generic message below, so without this line
+	// a 500 here has no server-side record at all and cannot be diagnosed from
+	// the outside (the request log carries the status, not the cause).
+	log.Printf("httpapi: store error: %v", err)
 	writeError(w, http.StatusInternalServerError, "database operation failed")
 }
 
 // latencyHistogram returns the latency distribution over the newest proxy
-// logs (AAH-style 10-bucket histogram; slow = >= 5s).
+// logs (AAH-style 10-bucket histogram; slow = >= 5s), optionally scoped to an
+// inclusive since/until window.
 func (h *AdminHandler) latencyHistogram(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
 	sample := 1000
-	if raw := r.URL.Query().Get("sample"); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= 10000 {
+	if raw := query.Get("sample"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= maxHistogramSample {
 			sample = parsed
 		}
 	}
-	hist, err := h.db.ProxyLog.LatencyHistogram(sample)
+	since, until, ok := parseTimeRange(w, query)
+	if !ok {
+		return
+	}
+	hist, err := h.db.ProxyLog.LatencyHistogram(sample, since, until)
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, hist)
 }
+
+// maxHistogramSample bounds how many latency rows one histogram request may
+// pull. Large enough that an explicit window is never silently truncated,
+// small enough that the scan cannot be used to exhaust memory.
+const maxHistogramSample = 100000
 
 func (h *AdminHandler) listProxyLogs(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
@@ -251,6 +339,12 @@ func (h *AdminHandler) listProxyLogs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Which client token made the call: the one dimension that answers "who
+	// spent this", and the only one that cannot be derived from the row.
+	downstreamKeyID, ok := optionalPositiveQueryID(w, query.Get("downstream_key_id"), "downstream_key_id")
+	if !ok {
+		return
+	}
 	model := strings.TrimSpace(query.Get("model"))
 	upstreamRequestID := strings.TrimSpace(query.Get("upstream_request_id"))
 	var status *int
@@ -267,19 +361,61 @@ func (h *AdminHandler) listProxyLogs(w http.ResponseWriter, r *http.Request) {
 			status = &parsed
 		}
 	}
+	since, until, ok := parseTimeRange(w, query)
+	if !ok {
+		return
+	}
 	logs, err := h.db.ProxyLog.ListFilter(store.ProxyLogFilter{
 		SiteID:            siteID,
 		ChannelID:         channelID,
+		DownstreamKeyID:   downstreamKeyID,
 		Model:             model,
 		Status:            status,
 		FailedOnly:        failedOnly,
 		UpstreamRequestID: upstreamRequestID,
 		BeforeID:          beforeID,
+		Since:             since,
+		Until:             until,
 		Limit:             limit,
+		Query:             query.Get("q"),
 	})
 	if err != nil {
 		writeStoreError(w, err)
 		return
+	}
+	// Annotate each row with its persisted billing amount. proxy_logs carries
+	// no cost column; the amount lives on usage_records, joined by request_id.
+	if h.db.Usage != nil && len(logs) > 0 {
+		requestIDs := make([]string, 0, len(logs))
+		for _, entry := range logs {
+			if entry.RequestID != "" {
+				requestIDs = append(requestIDs, entry.RequestID)
+			}
+		}
+		if costs, costErr := h.db.Usage.CostByRequestIDs(requestIDs); costErr == nil {
+			for i := range logs {
+				if cost, ok := costs[logs[i].RequestID]; ok {
+					value := cost
+					logs[i].Cost = &value
+				}
+			}
+		} else {
+			log.Printf("admin: proxy log costs: %v", costErr)
+		}
+		// The explanation behind the amount: one entry per metered attempt, so a
+		// request that failed over and billed twice shows both decisions rather
+		// than one summary that cannot say which attempt charged. Read-time
+		// annotation, admin only — a member's request list is a different query
+		// and never receives the rule snapshot.
+		if billing, billingErr := h.db.Usage.BillingByRequestIDs(requestIDs); billingErr == nil {
+			for i := range logs {
+				if explanations, ok := billing[logs[i].RequestID]; ok {
+					logs[i].Billing = explanations
+				}
+			}
+		} else {
+			log.Printf("admin: proxy log billing: %v", billingErr)
+		}
 	}
 	writeJSON(w, http.StatusOK, logs)
 }

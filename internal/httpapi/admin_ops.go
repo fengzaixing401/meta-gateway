@@ -94,12 +94,26 @@ func (h *AdminHandler) upsertModelMetadata(w http.ResponseWriter, r *http.Reques
 	}
 	name = strings.TrimSpace(name)
 	var req struct {
-		ContextWindow    *int64  `json:"context_window"`
-		InputModalities  *string `json:"input_modalities"`
-		OutputModalities *string `json:"output_modalities"`
-		SupportsThinking *int    `json:"supports_thinking"`
-		Vendor           *string `json:"vendor"`
-		Notes            *string `json:"notes"`
+		ContextWindow    *int64   `json:"context_window"`
+		InputModalities  *string  `json:"input_modalities"`
+		OutputModalities *string  `json:"output_modalities"`
+		SupportsThinking *int     `json:"supports_thinking"`
+		Vendor           *string  `json:"vendor"`
+		Notes            *string  `json:"notes"`
+		PricePrompt      *float64 `json:"price_prompt_per_1k"`
+		PriceCompletion  *float64 `json:"price_completion_per_1k"`
+		PriceCache       *float64 `json:"price_cache_per_1k"`
+		// A flat charge per call, for upstreams that sell calls rather than
+		// tokens. It was already a column the billing path reads and the store
+		// round-trips — but this handler never accepted it, so the field could
+		// be set by a test and by nothing else.
+		PricePerRequest *float64 `json:"price_per_request"`
+		// The context-length ladder and time-of-day windows travel as JSON text,
+		// the shape the columns store — the same convention mapping_json and
+		// payload_rules follow. Absent leaves them alone; an empty string clears
+		// them.
+		PriceTiers    *string `json:"price_tiers"`
+		PriceSchedule *string `json:"price_schedule"`
 	}
 	if err := decodeJSON(w, r, &req, 0, false); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body")
@@ -109,6 +123,17 @@ func (h *AdminHandler) upsertModelMetadata(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		writeStoreError(w, err)
 		return
+	}
+	if req.PricePrompt != nil || req.PriceCompletion != nil || req.PriceCache != nil || req.PricePerRequest != nil || req.PriceTiers != nil || req.PriceSchedule != nil {
+		rule, err := h.db.BillingRule("model", name)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		if rule != nil {
+			writeError(w, 409, "versioned billing rule exists; use /admin/billing-rule")
+			return
+		}
 	}
 	meta := domain.ModelMetadata{ModelName: name}
 	if existing != nil {
@@ -139,6 +164,47 @@ func (h *AdminHandler) upsertModelMetadata(w http.ResponseWriter, r *http.Reques
 	}
 	if req.Notes != nil {
 		meta.Notes = *req.Notes
+	}
+	// Self-set per-model unit prices: 0 means "no model-level price", so the
+	// layer below (a route member's own price) applies instead.
+	for _, price := range []struct {
+		name  string
+		value *float64
+	}{
+		{"price_prompt_per_1k", req.PricePrompt},
+		{"price_completion_per_1k", req.PriceCompletion},
+		{"price_cache_per_1k", req.PriceCache},
+		{"price_per_request", req.PricePerRequest},
+	} {
+		if price.value == nil {
+			continue
+		}
+		if *price.value < 0 {
+			writeError(w, http.StatusBadRequest, price.name+" must be >= 0")
+			return
+		}
+	}
+	if req.PricePrompt != nil {
+		meta.PricePromptPer1k = *req.PricePrompt
+	}
+	if req.PriceCompletion != nil {
+		meta.PriceCompletionPer1k = *req.PriceCompletion
+	}
+	if req.PriceCache != nil {
+		meta.PriceCachePer1k = *req.PriceCache
+	}
+	if req.PricePerRequest != nil {
+		meta.PricePerRequest = *req.PricePerRequest
+	}
+	if req.PriceTiers != nil {
+		meta.PriceTiers = *req.PriceTiers
+	}
+	if req.PriceSchedule != nil {
+		meta.PriceSchedule = *req.PriceSchedule
+	}
+	if err := validateModelPricing(&meta); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	if err := h.db.ModelMetadata.Upsert(&meta); err != nil {
 		writeStoreError(w, err)
@@ -292,12 +358,17 @@ func (h *AdminHandler) decisionSnapshot(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *AdminHandler) explainRoute(w http.ResponseWriter, r *http.Request) {
-	model := r.URL.Query().Get("model")
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
 	if model == "" {
 		writeError(w, http.StatusBadRequest, "model is required")
 		return
 	}
-	explanation, err := h.router.ExplainWithSession(r.Context(), model, r.URL.Query().Get("session"))
+	group, valid := validateRouteGroup(r.URL.Query().Get("route_group"))
+	if !valid {
+		writeError(w, http.StatusBadRequest, "group name too long")
+		return
+	}
+	explanation, err := h.router.ExplainWithSession(r.Context(), model, r.URL.Query().Get("session"), &routing.SelectionConstraint{RouteGroup: group})
 	if err != nil {
 		if errors.Is(err, routing.ErrRouteNotFound) {
 			writeError(w, http.StatusNotFound, "route not found")
@@ -312,6 +383,13 @@ func (h *AdminHandler) explainRoute(w http.ResponseWriter, r *http.Request) {
 // stickyStats returns a stable response for the admin UI. Sticky routing is
 // optional, so a disabled instance is represented as an ordinary successful
 // response instead of a noisy 404 from the model page's status query.
+//
+// "enabled" is the INHERITED default, read back off the selector so the
+// runtime-settings toggle cannot drift from the snapshot it reports: the store
+// itself is always installed, because routes may force affinity on for one
+// model (routes.sticky_session) even while the default is off. A deployment
+// with the default off but a model opted in therefore reports enabled=false
+// and a non-zero bound-session count, which is what the console shows.
 func (h *AdminHandler) stickyStats(w http.ResponseWriter, _ *http.Request) {
 	sticky := h.sticky.Load()
 	if sticky == nil {
@@ -323,8 +401,9 @@ func (h *AdminHandler) stickyStats(w http.ResponseWriter, _ *http.Request) {
 		})
 		return
 	}
+	enabled := h.router != nil && h.router.StickyEnabled(nil)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled":     true,
+		"enabled":     enabled,
 		"stats":       sticky.Stats(),
 		"entries":     sticky.Snapshot(100),
 		"ttl_seconds": int(sticky.TTL() / time.Second),

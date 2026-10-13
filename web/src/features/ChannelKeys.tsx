@@ -1,16 +1,50 @@
-import { ChevronDown, ChevronUp, Eye, Trash2 } from "lucide-react";
-import { useQuery } from "@tanstack/react-query";
+import { ChevronDown, ChevronUp, Eye, HeartPulse, Trash2 } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api } from "../api/client";
-import type { Channel, Credential } from "../api/types";
+import type { Channel, ChannelKeyTestResult, Credential } from "../api/types";
 import { ModelPicker } from "../components/ModelPicker";
 import { SecretRevealDialog } from "../components/SecretRevealDialog";
 import { Button, ConfirmDialog, Field, InfoTip } from "../components/ui";
 import { useAdminMutation } from "../hooks/useAdminMutation";
 import { Drawer } from "../components/Drawer";
 import { useI18n } from "../i18n";
+import { apiKeyLooksWrong, keyHintFor, splitApiKeys } from "../lib/apiKeyPaste";
 import { useSession } from "../session";
 import { parseCredentialMeta } from "./credentialMeta";
+
+/**
+ * Pool tiers this drawer exposes, mirroring domain.CredentialPriority*.
+ * Higher goes first; keys that share a tier rotate, so equal tiers spread the
+ * traffic instead of pinning it on whichever key happens to come first.
+ */
+const KEY_TIERS = [
+  {
+    value: 10,
+    label: "channels.keyTierPreferred",
+    hint: "channels.keyTierPreferredHint",
+  },
+  {
+    value: 0,
+    label: "channels.keyTierBalanced",
+    hint: "channels.keyTierBalancedHint",
+  },
+  {
+    value: -10,
+    label: "channels.keyTierBackup",
+    hint: "channels.keyTierBackupHint",
+  },
+] as const;
+
+/**
+ * matchesModel reports whether one allowlist entry covers a model: an exact
+ * name, or a "*" suffix prefix wildcard — the same syntax the proxy's per-key
+ * allowlist accepts.
+ */
+function matchesModel(entry: string, model: string): boolean {
+  if (entry.endsWith("*")) return model.startsWith(entry.slice(0, -1));
+  return entry === model;
+}
 
 /**
  * Overlay drawer with the full API-key management UI for one channel.
@@ -25,6 +59,7 @@ export function ChannelKeysDrawer({
   syncKeysPending,
   onToggleKey,
   onUpdateKeyModels,
+  onUpdateKeyPriority,
   onDeleteKey,
   onAddApiKey,
   onSyncKeys,
@@ -37,21 +72,29 @@ export function ChannelKeysDrawer({
   syncKeysPending?: boolean;
   onToggleKey: (id: number, enabled: boolean) => void;
   onUpdateKeyModels: (id: number, modelsCsv: string) => void;
+  onUpdateKeyPriority: (id: number, priority: number) => void;
   onDeleteKey: (id: number) => void;
-  onAddApiKey: (secret: string) => void;
+  onAddApiKey: (secret: string, name?: string) => void;
   onSyncKeys: () => void;
   onClose: () => void;
 }) {
   const { client } = useSession();
-  const { t } = useI18n();
+  const { t, status } = useI18n();
   const service = api(client!);
+  const queryClient = useQueryClient();
+  const [apiKeyName, setApiKeyName] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [keyModelsDraft, setKeyModelsDraft] = useState<
-    Record<number, string>
-  >({});
-  const [expandedModelIds, setExpandedModelIds] = useState<Set<number>>(
-    () => new Set(),
+  // What the last paste added, so a multi-key submit cannot look like a no-op.
+  const [pasteSummary, setPasteSummary] = useState<{ added: number; duplicates: number } | null>(
+    null,
   );
+  const pendingPaste = splitApiKeys(apiKey);
+  const keyHint = keyHintFor(channel.type_hint ?? "");
+  // Only meaningful for a single key: a pasted blob is not one token.
+  const keyWarning =
+    pendingPaste.keys.length === 1 && apiKeyLooksWrong(channel.type_hint ?? "", apiKey);
+  const [keyModelsDraft, setKeyModelsDraft] = useState<Record<number, string>>({});
+  const [expandedModelIds, setExpandedModelIds] = useState<Set<number>>(() => new Set());
   // Reveal: decrypt and show the plaintext secret of one credential.
   const [revealing, setRevealing] = useState<Credential | null>(null);
   const [revealedSecret, setRevealedSecret] = useState<string | null>(null);
@@ -60,19 +103,103 @@ export function ChannelKeysDrawer({
     label: string;
   } | null>(null);
   const reveal = useAdminMutation({
-    mutationFn: (v: { siteId: number; id: number }) =>
-      service.revealCredential(v.siteId, v.id),
+    mutationFn: (v: { siteId: number; id: number }) => service.revealCredential(v.siteId, v.id),
     toastOnError: false,
     onSuccess: (result) => setRevealedSecret(result.secret),
+  });
+
+  // —— 批量操作：勾选、测活、删除 ——
+  // Selection is the operator's own; a round of 测活 then decides what to do
+  // with it (the dead ones are usually what they came to delete).
+  const [selected, setSelected] = useState<Set<number>>(() => new Set());
+  const [testResults, setTestResults] = useState<Record<number, ChannelKeyTestResult>>({});
+  const [testingIds, setTestingIds] = useState<Set<number>>(() => new Set());
+  const [testNotice, setTestNotice] = useState<string | null>(null);
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
+  const [confirmingBatch, setConfirmingBatch] = useState(false);
+
+  const toggleSelected = (id: number) => {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const allSelected = apiKeys.length > 0 && apiKeys.every((key) => selected.has(key.id));
+  const toggleAll = () =>
+    setSelected(allSelected ? new Set() : new Set(apiKeys.map((key) => key.id)));
+  const failedIds = apiKeys.filter((key) => testResults[key.id]?.ok === false).map((key) => key.id);
+
+  // 测活 is a read-only diagnostic: one request per key against the upstream's
+  // model list. It reports; it never disables or deletes anything.
+  const testKeys = useMutation({
+    mutationFn: (ids: number[]) => service.testChannelKeys(channel.id, ids),
+    onMutate: (ids: number[]) => {
+      setTestingIds(new Set(ids));
+      setTestNotice(null);
+      setDeleteNotice(null);
+    },
+    onSuccess: (report) => {
+      setTestResults((previous) => {
+        const next = { ...previous };
+        for (const result of report.results) next[result.credential_id] = result;
+        return next;
+      });
+      setTestingIds(new Set());
+      setTestNotice(
+        t("channels.keyTestSummary", {
+          ok: report.ok,
+          failed: report.failed,
+          total: report.tested,
+        }),
+      );
+    },
+    onError: () => setTestingIds(new Set()),
+  });
+
+  // Deleting in bulk is the same call the single-row trash icon makes, repeated.
+  // The loop is here rather than server-side so one refusal cannot take the rest
+  // of the batch with it; the counts say what actually happened.
+  const deleteSelected = useMutation({
+    mutationFn: async (ids: number[]) => {
+      let deleted = 0;
+      const failed: number[] = [];
+      for (const id of ids) {
+        try {
+          await service.deleteCredential(id);
+          deleted += 1;
+        } catch {
+          failed.push(id);
+        }
+      }
+      return { deleted, failed };
+    },
+    onSuccess: ({ deleted, failed }) => {
+      void queryClient.invalidateQueries({ queryKey: ["credentials"] });
+      void queryClient.invalidateQueries({ queryKey: ["channel-overviews"] });
+      setSelected(new Set(failed));
+      setTestResults((previous) => {
+        const next: Record<number, ChannelKeyTestResult> = {};
+        for (const [key, result] of Object.entries(previous)) {
+          if (failed.includes(Number(key))) next[Number(key)] = result;
+        }
+        return next;
+      });
+      setDeleteNotice(
+        failed.length > 0
+          ? t("channels.keyDeletePartial", { deleted, failed: failed.length })
+          : t("channels.keyDeleteDone", { deleted }),
+      );
+      setConfirmingBatch(false);
+    },
   });
 
   const discovered = useQuery({
     queryKey: ["discovered-models", channel.id],
     queryFn: ({ signal }) => service.discoveredModels(channel.id, signal),
   });
-  const channelModelNames = (discovered.data ?? []).map(
-    (model) => model.model_name,
-  );
+  const channelModelNames = (discovered.data ?? []).map((model) => model.model_name);
 
   const toggleModelPicker = (id: number) => {
     setExpandedModelIds((previous) => {
@@ -81,6 +208,21 @@ export function ChannelKeysDrawer({
       else next.add(id);
       return next;
     });
+  };
+
+  const submitAdd = () => {
+    if (pending || addApiKeyPending) return;
+    // A pending multi-line paste is normalized on submit: every unique key is
+    // added, duplicates are reported instead of silently dropped. The name is
+    // only applied when a single key is submitted — labelling three different
+    // keys the same would be a lie.
+    const { keys, duplicates } = splitApiKeys(apiKey);
+    if (keys.length === 0) return;
+    const label = keys.length === 1 ? apiKeyName.trim() || undefined : undefined;
+    keys.forEach((secret, index) => onAddApiKey(secret, index === 0 ? label : undefined));
+    setPasteSummary(keys.length > 1 || duplicates > 0 ? { added: keys.length, duplicates } : null);
+    setApiKey("");
+    setApiKeyName("");
   };
 
   return (
@@ -109,6 +251,59 @@ export function ChannelKeysDrawer({
           </Button>
         </div>
 
+        {apiKeys.length > 0 ? (
+          <div className="credential-key-bulk">
+            <label className="check credential-key-bulk-all">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                disabled={pending}
+                onChange={toggleAll}
+              />
+              <span>{t("channels.keySelectAll")}</span>
+            </label>
+            <span className="muted credential-key-bulk-count">
+              {t("channels.keySelectedCount", { n: selected.size })}
+            </span>
+            <Button
+              variant="quiet"
+              icon={<HeartPulse size={14} />}
+              disabled={pending || testingIds.size > 0 || deleteSelected.isPending}
+              title={t("channels.keyTestHint")}
+              onClick={() =>
+                testKeys.mutate(selected.size > 0 ? [...selected] : apiKeys.map((key) => key.id))
+              }
+            >
+              {testingIds.size > 0
+                ? t("channels.keyTesting")
+                : selected.size > 0
+                  ? t("channels.keyTestSelected", { n: selected.size })
+                  : t("channels.keyTestAll")}
+            </Button>
+            {failedIds.length > 0 ? (
+              <button
+                type="button"
+                className="credential-key-bulk-link"
+                onClick={() => setSelected(new Set(failedIds))}
+              >
+                {t("channels.keySelectFailed", { n: failedIds.length })}
+              </button>
+            ) : null}
+            {testNotice || deleteNotice ? (
+              <span className="muted credential-key-bulk-notice">{deleteNotice ?? testNotice}</span>
+            ) : null}
+            <Button
+              variant="quiet"
+              icon={<Trash2 size={14} />}
+              className="credential-key-bulk-delete"
+              disabled={pending || selected.size === 0 || deleteSelected.isPending}
+              onClick={() => setConfirmingBatch(true)}
+            >
+              {t("channels.keyDeleteSelected", { n: selected.size })}
+            </Button>
+          </div>
+        ) : null}
+
         {apiKeys.length === 0 ? (
           <p className="exchange-panel-note">{t("channels.apiKeysEmpty")}</p>
         ) : (
@@ -116,41 +311,50 @@ export function ChannelKeysDrawer({
             {apiKeys.map((item) => {
               const meta = parseCredentialMeta(item.meta_json);
               const enabled = item.status === "enabled";
-              const usedByThisConnection = channel.credential_id === item.id;
-              const label =
-                meta.name?.trim() ||
-                t("channels.apiKeyUnnamed", { id: item.id });
-              const groupLabel =
-                meta.group?.trim() || t("channels.apiKeyGroupDefault");
-              const selectedModels = (keyModelsDraft[item.id] ??
-                item.models_csv ??
-                "")
+              const label = meta.name?.trim() || t("channels.apiKeyUnnamed", { id: item.id });
+              const groupLabel = meta.group?.trim() || t("channels.apiKeyGroupDefault");
+              const selectedModels = (keyModelsDraft[item.id] ?? item.models_csv ?? "")
                 .split(",")
                 .map((model) => model.trim())
                 .filter(Boolean);
               const modelsExpanded = expandedModelIds.has(item.id);
+              const tier = item.priority ?? 0;
+              const ownModels = item.models ?? [];
+              const scoped = ownModels.length > 0;
+              // Candidates are the models THIS key synced. Without a snapshot
+              // there is nothing to scope by, so fall back to the channel-wide
+              // list and say so above the picker.
+              const candidateModels = scoped ? ownModels : channelModelNames;
+              // Selections this key never listed: an explicit allowlist
+              // overrides the proxy's per-key discovered filter, so these are
+              // tried upstream and 404 instead of being skipped.
+              const outOfScope = scoped
+                ? selectedModels.filter(
+                    (model) => !ownModels.some((own) => matchesModel(model, own)),
+                  )
+                : [];
               return (
                 <li
                   key={item.id}
-                  className={[
-                    "credential-key-row",
-                    usedByThisConnection ? "is-bound" : "",
-                    !enabled ? "is-disabled" : "",
-                  ]
+                  className={["credential-key-row", !enabled ? "is-disabled" : ""]
                     .filter(Boolean)
                     .join(" ")}
                 >
                   <div className="credential-key-row-head">
+                    <label className="credential-key-select">
+                      <input
+                        type="checkbox"
+                        checked={selected.has(item.id)}
+                        disabled={pending}
+                        aria-label={t("channels.keySelectOne", { name: label })}
+                        onChange={() => toggleSelected(item.id)}
+                      />
+                    </label>
                     <div className="credential-key-main">
                       <strong>{label}</strong>
                       <small>
                         {`${groupLabel} · #${item.id}`}
-                        {usedByThisConnection
-                          ? ` · ${t("channels.apiKeyUsedByConnection")}`
-                          : ""}
-                        {!item.has_secret
-                          ? ` · ${t("channels.apiKeyNoSecret")}`
-                          : ""}
+                        {!item.has_secret ? ` · ${t("channels.apiKeyNoSecret")}` : ""}
                         {item.model_count != null && item.model_count >= 0
                           ? ` · ${t("channels.apiKeyModelCount", {
                               count: item.model_count,
@@ -159,6 +363,35 @@ export function ChannelKeysDrawer({
                       </small>
                     </div>
                     <div className="credential-key-actions">
+                      {/* The pool tier sits where the old read-only "preferred"
+                          tag used to: same concept, upgraded from a label into
+                          the control that sets it. */}
+                      <div
+                        className="sync-mode-toggle credential-key-tier"
+                        role="radiogroup"
+                        aria-label={t("channels.keyTier")}
+                      >
+                        {KEY_TIERS.map((option) => {
+                          const active = tier === option.value;
+                          return (
+                            <button
+                              key={option.value}
+                              type="button"
+                              disabled={pending}
+                              className={active ? "is-active" : ""}
+                              aria-pressed={active}
+                              title={t(option.hint)}
+                              onClick={() => {
+                                if (!active) {
+                                  onUpdateKeyPriority(item.id, option.value);
+                                }
+                              }}
+                            >
+                              {t(option.label)}
+                            </button>
+                          );
+                        })}
+                      </div>
                       <label
                         className={`credential-key-status ${enabled ? "is-enabled" : "is-disabled"}`}
                       >
@@ -166,14 +399,10 @@ export function ChannelKeysDrawer({
                           type="checkbox"
                           checked={enabled}
                           disabled={pending}
-                          onChange={(event) =>
-                            onToggleKey(item.id, event.target.checked)
-                          }
+                          onChange={(event) => onToggleKey(item.id, event.target.checked)}
                         />
                         <span className="credential-key-status-dot" aria-hidden="true" />
-                        <span>
-                          {enabled ? t("common.enabled") : t("common.disabled")}
-                        </span>
+                        <span>{enabled ? t("common.enabled") : t("common.disabled")}</span>
                       </label>
                       <span className="credential-key-action-group">
                         {item.has_secret ? (
@@ -211,6 +440,40 @@ export function ChannelKeysDrawer({
                       </span>
                     </div>
                   </div>
+                  {testingIds.has(item.id) ? (
+                    <p className="credential-key-test is-pending">{t("channels.keyTesting")}</p>
+                  ) : testResults[item.id] ? (
+                    <p
+                      className={`credential-key-test ${
+                        testResults[item.id]!.ok ? "is-ok" : "is-failed"
+                      }`}
+                    >
+                      {testResults[item.id]!.ok
+                        ? testResults[item.id]!.model_count > 0
+                          ? t("channels.keyTestOk", {
+                              count: testResults[item.id]!.model_count,
+                              ms: testResults[item.id]!.latency_ms,
+                            })
+                          : t("channels.keyTestOkEmpty", { ms: testResults[item.id]!.latency_ms })
+                        : t("channels.keyTestFailed", {
+                            reason: status(testResults[item.id]!.category || "upstream_failure"),
+                          })}
+                      {testResults[item.id]!.ok &&
+                      (testResults[item.id]!.sample?.length ?? 0) > 0 ? (
+                        <span className="credential-key-test-sample">
+                          {testResults[item.id]!.sample!.join(", ")}
+                          {testResults[item.id]!.model_count > testResults[item.id]!.sample!.length
+                            ? " …"
+                            : ""}
+                        </span>
+                      ) : null}
+                      {!testResults[item.id]!.ok && testResults[item.id]!.error ? (
+                        <span className="credential-key-test-sample">
+                          {testResults[item.id]!.error}
+                        </span>
+                      ) : null}
+                    </p>
+                  ) : null}
                   <div className="credential-key-model-control">
                     <div className="credential-key-model-toggle-row">
                       <span className="credential-key-model-label">
@@ -244,8 +507,20 @@ export function ChannelKeysDrawer({
                         id={`credential-key-models-${item.id}`}
                         className="credential-key-model-editor"
                       >
+                        {scoped ? null : (
+                          <p className="credential-key-model-note">
+                            {t("channels.keyModelsNoSnapshot")}
+                          </p>
+                        )}
+                        {outOfScope.length > 0 ? (
+                          <p className="credential-key-model-note is-warning">
+                            {t("channels.keyModelsOutOfScope", {
+                              n: outOfScope.length,
+                            })}
+                          </p>
+                        ) : null}
                         <ModelPicker
-                          allModels={channelModelNames}
+                          options={candidateModels.map((name) => ({ name }))}
                           selected={selectedModels}
                           onChange={(selected) => {
                             const next = selected.join(",");
@@ -268,46 +543,74 @@ export function ChannelKeysDrawer({
           </ul>
         )}
 
-        <Field
-          label={t("channels.apiKeyAdd")}
-          hint={t("channels.apiKeyAddHint")}
-        >
+        <Field label={t("channels.apiKeyAdd")} hint={t("channels.apiKeyAddHint")}>
           <div className="credential-key-add-row">
             <input
-              type="password"
-              autoComplete="new-password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder={t("channels.apiKeyPlaceholder")}
+              className="credential-key-name-input"
+              value={apiKeyName}
+              onChange={(e) => setApiKeyName(e.target.value)}
+              placeholder={t("channels.apiKeyNamePlaceholder")}
               disabled={pending || Boolean(addApiKeyPending)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   e.preventDefault();
-                  const secret = apiKey.trim();
-                  if (!secret || pending || addApiKeyPending) return;
-                  onAddApiKey(secret);
-                  setApiKey("");
+                  submitAdd();
+                }
+              }}
+            />
+            <textarea
+              className="credential-key-secret-input"
+              rows={2}
+              spellCheck={false}
+              autoComplete="off"
+              value={apiKey}
+              onChange={(e) => {
+                setApiKey(e.target.value);
+                setPasteSummary(null);
+              }}
+              placeholder={t("channels.apiKeyPlaceholder")}
+              disabled={pending || Boolean(addApiKeyPending)}
+              onKeyDown={(e) => {
+                // A newline is part of a multi-key paste, so Enter submits only when
+                // the value is a single key (Ctrl/Cmd+Enter always submits).
+                if (e.key === "Enter" && (e.ctrlKey || e.metaKey || !apiKey.includes("\n"))) {
+                  e.preventDefault();
+                  submitAdd();
                 }
               }}
             />
             <Button
               variant="secondary"
-              disabled={
-                pending || Boolean(addApiKeyPending) || !apiKey.trim()
-              }
-              onClick={() => {
-                const secret = apiKey.trim();
-                if (!secret) return;
-                // First key becomes the relay key; later keys just join the pool.
-                onAddApiKey(secret);
-                setApiKey("");
-              }}
+              disabled={pending || Boolean(addApiKeyPending) || pendingPaste.keys.length === 0}
+              onClick={submitAdd}
             >
-              {addApiKeyPending
-                ? t("common.loading")
-                : t("channels.apiKeyAddSave")}
+              {addApiKeyPending ? t("common.loading") : t("channels.apiKeyAddSave")}
             </Button>
           </div>
+          {keyHint ? (
+            <p className="map-section-hint">{t("channels.keyFormatHint", { hint: keyHint })}</p>
+          ) : null}
+          {keyWarning ? (
+            <p className="map-row-error">
+              {t("channels.keyFormatMismatch", {
+                type: channel.type_hint || channel.name,
+                hint: keyHint || "-",
+              })}
+            </p>
+          ) : null}
+          {pendingPaste.keys.length > 1 || pasteSummary ? (
+            <p className="map-section-hint">
+              {t("channels.apiKeyPasteCount", { n: pendingPaste.keys.length })}
+              {pendingPaste.duplicates > 0
+                ? ` · ${t("channels.apiKeyPasteDuplicates", { n: pendingPaste.duplicates })}`
+                : pasteSummary && pasteSummary.duplicates > 0
+                  ? ` · ${t("channels.apiKeyPasteDuplicates", { n: pasteSummary.duplicates })}`
+                  : ""}
+              {pasteSummary
+                ? ` · ${t("channels.apiKeyPasteAdded", { n: pasteSummary.added })}`
+                : ""}
+            </p>
+          ) : null}
         </Field>
       </section>
       {revealing && (
@@ -337,6 +640,15 @@ export function ChannelKeysDrawer({
             onDeleteKey(confirmingDelete.id);
             setConfirmingDelete(null);
           }}
+        />
+      ) : null}
+      {confirmingBatch ? (
+        <ConfirmDialog
+          title={t("channels.keyDeleteSelectedTitle")}
+          message={t("channels.keyDeleteSelectedConfirm", { n: selected.size })}
+          pending={deleteSelected.isPending}
+          onClose={() => setConfirmingBatch(false)}
+          onConfirm={() => deleteSelected.mutate([...selected])}
         />
       ) : null}
     </Drawer>

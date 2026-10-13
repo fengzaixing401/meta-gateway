@@ -13,7 +13,6 @@ import {
   Dialog,
   ErrorState,
   Field,
-  InfoTip,
   Loading,
   Panel,
 } from "../../components/ui";
@@ -33,9 +32,7 @@ export function ExternalCheckinsPanel() {
   const qc = useQueryClient();
   const [editing, setEditing] = useState<ExternalCheckin | null>(null);
   const [creating, setCreating] = useState<{ open: boolean } | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState<ExternalCheckin | null>(
-    null,
-  );
+  const [confirmDelete, setConfirmDelete] = useState<ExternalCheckin | null>(null);
 
   const list = useQuery({
     queryKey: ["external-checkins"],
@@ -56,8 +53,7 @@ export function ExternalCheckinsPanel() {
     },
   });
   const toggle = useAdminMutation({
-    mutationFn: (input: { id: number; enabled: boolean }) =>
-      s.setCheckin(input.id, input.enabled),
+    mutationFn: (input: { id: number; enabled: boolean }) => s.setCheckin(input.id, input.enabled),
     invalidateKeys: EXTERNAL_KEYS,
     pendingIdOf: (input) => input.id,
   });
@@ -70,6 +66,7 @@ export function ExternalCheckinsPanel() {
   return (
     <Panel
       title={t("ops.external.title")}
+      lede={t("ops.external.lede")}
       titleHelp={t("ops.external.titleHint")}
       actions={
         <Button
@@ -81,10 +78,6 @@ export function ExternalCheckinsPanel() {
         </Button>
       }
     >
-      <div className="ops-panel-context">
-        <span>{t("ops.external.hint")}</span>
-        <InfoTip label={t("ops.external.hint")} />
-      </div>
       {list.isPending ? (
         <Loading />
       ) : list.isError ? (
@@ -196,9 +189,7 @@ function ExternalCheckinDialog({
   const { t } = useI18n();
   const [name, setName] = useState(existing?.name ?? "");
   const [baseUrl, setBaseUrl] = useState(existing?.base_url ?? "");
-  const [checkinPath, setCheckinPath] = useState(
-    existing?.checkin_path ?? "/api/checkin/spin",
-  );
+  const [checkinPath, setCheckinPath] = useState(existing?.checkin_path ?? "/api/checkin/spin");
   const [method, setMethod] = useState(existing?.checkin_method ?? "POST");
   const [headersText, setHeadersText] = useState(
     existing?.headers && Object.keys(existing.headers).length
@@ -208,9 +199,7 @@ function ExternalCheckinDialog({
   const [cookie, setCookie] = useState("");
   const [enabled, setEnabled] = useState(existing?.checkin_enabled ?? true);
   const [error, setError] = useState("");
-  const canSubmit = Boolean(
-    baseUrl.trim() && cookie.trim() && checkinPath.trim(),
-  );
+  const canSubmit = Boolean(baseUrl.trim() && cookie.trim() && checkinPath.trim());
   const save = useAdminMutation({
     mutationFn: () => {
       let parsedHeaders: Record<string, string> | undefined;
@@ -254,11 +243,7 @@ function ExternalCheckinDialog({
 
   return (
     <Dialog
-      title={
-        existing
-          ? t("ops.external.editTitle")
-          : t("ops.external.addTitle")
-      }
+      title={existing ? t("ops.external.editTitle") : t("ops.external.addTitle")}
       onClose={onClose}
       actions={
         <>
@@ -313,10 +298,7 @@ function ExternalCheckinDialog({
             </select>
           </Field>
         </div>
-        <Field
-          label={t("ops.external.headers")}
-          hint={t("ops.external.headersHint")}
-        >
+        <Field label={t("ops.external.headers")} hint={t("ops.external.headersHint")}>
           <textarea
             className="mono"
             rows={3}
@@ -329,9 +311,7 @@ function ExternalCheckinDialog({
         <Field
           label={t("ops.external.cookie")}
           hint={
-            existing?.has_cookie
-              ? t("ops.external.cookieKeepHint")
-              : t("ops.external.cookieHint")
+            existing?.has_cookie ? t("ops.external.cookieKeepHint") : t("ops.external.cookieHint")
           }
         >
           <input
@@ -339,15 +319,11 @@ function ExternalCheckinDialog({
             autoComplete="new-password"
             value={cookie}
             onChange={(e) => setCookie(e.target.value)}
-            placeholder={
-              existing?.has_cookie
-                ? t("common.maskedPlaceholder")
-                : "auth_token=…"
-            }
+            placeholder={existing?.has_cookie ? t("common.maskedPlaceholder") : "auth_token=…"}
             disabled={save.isPending}
           />
         </Field>
-        <label className="check" style={{ marginTop: 4 }}>
+        <label className="check is-tight">
           <input
             type="checkbox"
             checked={enabled}

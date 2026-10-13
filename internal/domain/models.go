@@ -81,6 +81,38 @@ type Site struct {
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// External probe source: the site's own public probe data (an Uptime Kuma
+	// status page) and/or its public price table (New-API /api/pricing), so
+	// availability can be observed without spending upstream tokens.
+	// Kind is "uptime_kuma" | "newapi"; empty means "not probed".
+	// Config carries source-specific JSON (slug, excluded monitors, price unit).
+	ProbeSourceKind string `json:"probe_source_kind,omitempty"`
+	ProbeSourceURL  string `json:"probe_source_url,omitempty"`
+	// ProbeAuto marks a site that wants its source derived from the platform
+	// (new-api -> /api/pricing, sub2api -> the public-transit discovery) instead
+	// of a hand-typed URL. A custom ProbeSourceURL always wins when present.
+	ProbeAuto          bool       `json:"probe_auto"`
+	ProbeSourceConfig  string     `json:"probe_source_config,omitempty"`
+	ProbeSourceEnabled bool       `json:"probe_source_enabled"`
+	ProbeLastRunAt     *time.Time `json:"probe_last_run_at,omitempty"`
+	ProbeLastError     string     `json:"probe_last_error,omitempty"`
+
+	// CallPolicy is how this site wants automated traffic to look (the channel
+	// can override it). See domain.CallPolicy.
+	CallPolicy string `json:"call_policy,omitempty"`
+	// The keepalive window. It lives on the site because the ban is "no call for
+	// N days" and N is the site's rule (15 days here, 30 there), not the
+	// channel's; a channel only overrides the switch and the window when its
+	// account differs.
+	KeepaliveEnabled          bool   `json:"keepalive_enabled"`
+	KeepaliveIdleDays         int    `json:"keepalive_idle_days,omitempty"`
+	KeepaliveSafetyMarginDays int    `json:"keepalive_safety_margin_days,omitempty"`
+	KeepaliveModel            string `json:"keepalive_model,omitempty"`
+	KeepalivePrompt           string `json:"keepalive_prompt,omitempty"`
+	KeepaliveMaxTokens        int    `json:"keepalive_max_tokens,omitempty"`
+	KeepaliveDailyCap         int    `json:"keepalive_daily_cap,omitempty"`
+	KeepaliveQuietHours       string `json:"keepalive_quiet_hours,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -103,9 +135,39 @@ type Credential struct {
 	ImportFingerprint string `json:"-"`
 	// ModelsCSV is the per-key model allowlist (comma-separated, "*" suffix
 	// wildcards). Empty = the key serves every model on its channel.
-	ModelsCSV string    `json:"models_csv,omitempty"`
+	ModelsCSV string `json:"models_csv,omitempty"`
+	// Priority orders the site key pool: higher wins, keys sharing a priority
+	// are a tier and rotate (round-robin) inside it. Zero = balanced, which is
+	// the column default so credentials created without an explicit value stay
+	// ordinary pool members.
+	Priority  int       `json:"priority"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Key-pool priority tiers exposed on the site credentials API. Any value in
+// [-100, 100] is accepted (an operator may want an intermediate tier), these
+// three are the named presets the console offers.
+const (
+	// CredentialPriorityBackup is tried only after every higher tier failed.
+	CredentialPriorityBackup = -10
+	// CredentialPriorityBalanced rotates with its peers (the default).
+	CredentialPriorityBalanced = 0
+	// CredentialPriorityPreferred is tried before the balanced/backup tiers.
+	CredentialPriorityPreferred = 10
+)
+
+// CredentialPriorityBounds limits what the admin API accepts, so a typo
+// ("1000") cannot silently outrank every other key forever.
+const (
+	CredentialPriorityMin = -100
+	CredentialPriorityMax = 100
+)
+
+// ValidCredentialPriority reports whether a priority is within the accepted
+// range.
+func ValidCredentialPriority(priority int) bool {
+	return priority >= CredentialPriorityMin && priority <= CredentialPriorityMax
 }
 
 type CheckinLog struct {
@@ -148,6 +210,17 @@ type Channel struct {
 	// MaxConcurrent is the hard per-channel concurrency ceiling (FIFO wait
 	// queue at the proxy; 0 = unlimited).
 	MaxConcurrent int `json:"max_concurrent,omitempty"`
+	// NonStreamTimeoutSeconds caps a non-streaming upstream attempt on this
+	// channel (request + full body read); 0 = global default (5 minutes).
+	// Streaming requests are exempt. Slow deep-reasoning upstreams raise it.
+	NonStreamTimeoutSeconds int `json:"non_stream_timeout_seconds,omitempty"`
+	// StreamPolicy overrides the client's stream choice for this channel:
+	// "" follows the client, "force_stream" answers non-streaming clients
+	// from an aggregated upstream stream, "force_non_stream" answers
+	// streaming clients from one synthesized chunk frame (upstreams whose
+	// SSE breaks mid-path). Effective for OpenAI-shaped exchanges; native
+	// Anthropic passthrough and the Responses API are exempt.
+	StreamPolicy string `json:"stream_policy,omitempty"`
 	// ProxyURL is the per-channel outbound HTTP(S) proxy; empty inherits the
 	// global proxy (runtime setting proxy_url).
 	ProxyURL string `json:"proxy_url,omitempty"`
@@ -164,12 +237,60 @@ type Channel struct {
 	// refreshes the discovery snapshot and models_csv — adoption happens per
 	// model from the channel models panel.
 	ModelSyncMode string `json:"model_sync_mode,omitempty"`
+	// UpstreamPathOverride replaces the OpenAI path outright ("chat/completions"
+	// → "systemone") for upstreams that do not speak the OpenAI endpoint set.
+	UpstreamPathOverride string `json:"upstream_path_override,omitempty"`
+	// UpstreamPathMap is a JSON object mapping OpenAI paths to this upstream's
+	// real paths (keys may end in "*" for a prefix match; values may use
+	// "{path}"/"{model}"). It exists for providers whose API root is not /v1,
+	// which the passthrough adapter would otherwise mangle into
+	// <base>/v1/<path>.
+	UpstreamPathMap string `json:"upstream_path_map,omitempty"`
+	// UpstreamRequestMap / UpstreamResponseMap are JSON arrays of field maps
+	// applied to the outbound and inbound bodies (same path language as
+	// payload_rules). They let a non-OpenAI upstream sit behind /v1.
+	UpstreamRequestMap  string `json:"upstream_request_map,omitempty"`
+	UpstreamResponseMap string `json:"upstream_response_map,omitempty"`
 	// StableFirst marks the channel as a grayscale candidate: it receives a
 	// small 1/N fraction of traffic until it earns promotion.
 	StableFirst bool `json:"stable_first,omitempty"`
 	// StableFirstRequests counts successful relay attempts since the channel
 	// was marked grayscale (promotion input).
 	StableFirstRequests int `json:"stable_first_requests,omitempty"`
+	// CallPolicy overrides the site's policy for this channel ("" = inherit).
+	// See domain.CallPolicy: it decides the *shape* of automated calls, never
+	// whether reads happen.
+	CallPolicy string `json:"call_policy,omitempty"`
+	// KeepaliveEnabled overrides the site's keepalive switch. nil = inherit,
+	// which is why it is a pointer: "off by my own decision" and "inherit an
+	// off site" are different answers in the console.
+	KeepaliveEnabled *bool `json:"keepalive_enabled,omitempty"`
+	// KeepaliveIdleDays overrides the site's ban window; 0 = inherit.
+	KeepaliveIdleDays int `json:"keepalive_idle_days,omitempty"`
+	// LastRealCallAt is when the upstream last received a chat request on this
+	// channel. Written by the relay on every attempt the upstream answered,
+	// including failures: the ban counts requests that arrived, not requests
+	// that succeeded.
+	LastRealCallAt *time.Time `json:"last_real_call_at,omitempty"`
+	// UsageLimitCost / UsageLimitTokens are this account's budget: stop sending
+	// once the channel has cost (or consumed) more than this, cumulative from the
+	// account's start. 0 = no limit, and either limit can trip on its own.
+	UsageLimitCost   float64 `json:"usage_limit_cost,omitempty"`
+	UsageLimitTokens int64   `json:"usage_limit_tokens,omitempty"`
+	// UsageUsedCost / UsageUsedTokens are the counters behind those limits,
+	// accrued in the same transaction as the usage row (and re-derived from
+	// usage_records whenever a limit is saved, so they cannot drift away from
+	// the ledger).
+	UsageUsedCost   float64 `json:"usage_used_cost,omitempty"`
+	UsageUsedTokens int64   `json:"usage_used_tokens,omitempty"`
+	// UsageLimitReason is set when the budget trips and the channel is parked:
+	// which limit came due ("cost", "tokens", "cost,tokens") — the console
+	// phrases it in the reader's language, because this is the operator's own
+	// decision coming due rather than an upstream failure.
+	UsageLimitHit string `json:"usage_limit_hit,omitempty"`
+	// UsageLimitHitAt is when that happened. A non-empty value is also the marker
+	// for "parked by this budget", which is what lets a higher limit release it.
+	UsageLimitHitAt string `json:"usage_limit_hit_at,omitempty"`
 	// ConsecutiveFailures counts failed relay attempts (auto-disable input).
 	ConsecutiveFailures int       `json:"-"`
 	CreatedAt           time.Time `json:"created_at"`
@@ -183,6 +304,27 @@ const (
 	ModelSyncModeAuto   = "auto"
 	ModelSyncModeManual = "manual"
 )
+
+// Stream policy values for Channel.StreamPolicy.
+const (
+	// StreamPolicyDefault passes the client's stream choice through.
+	StreamPolicyDefault = ""
+	// StreamPolicyForceStream serves non-streaming clients from an upstream
+	// stream that the gateway aggregates into one completion.
+	StreamPolicyForceStream = "force_stream"
+	// StreamPolicyForceNonStream serves streaming clients from a non-stream
+	// upstream answer synthesized into a single-chunk SSE replay.
+	StreamPolicyForceNonStream = "force_non_stream"
+)
+
+// NormalizeStreamPolicy maps unknown values to the default (client decides).
+func NormalizeStreamPolicy(policy string) string {
+	switch policy {
+	case StreamPolicyForceStream, StreamPolicyForceNonStream:
+		return policy
+	}
+	return StreamPolicyDefault
+}
 
 // NormalizeModelSyncMode maps an empty or unknown mode to ModelSyncModeManual.
 func NormalizeModelSyncMode(mode string) string {
@@ -324,7 +466,21 @@ type ModelMetadata struct {
 	SupportsThinking int    `json:"supports_thinking"`
 	Vendor           string `json:"vendor"`
 	Notes            string `json:"notes"`
-	UpdatedAt        string `json:"updated_at"`
+	// Optional self-set unit prices per 1k tokens, used for cost estimation
+	// and billing (they take precedence over the downstream key's prices).
+	// 0 = fall back to the key price.
+	PricePromptPer1k     float64 `json:"price_prompt_per_1k"`
+	PriceCompletionPer1k float64 `json:"price_completion_per_1k"`
+	PriceCachePer1k      float64 `json:"price_cache_per_1k"`
+	// PricePerRequest bills a flat amount per call, for upstreams that sell
+	// calls rather than tokens. It is added to the token-derived amount.
+	PricePerRequest float64 `json:"price_per_request"`
+	// PriceTiers is a context-length ladder and PriceSchedule a set of
+	// time-of-day windows, both JSON. Empty means flat pricing — the behaviour
+	// of every row written before they existed. See pricing_tiers.go.
+	PriceTiers    string `json:"price_tiers,omitempty"`
+	PriceSchedule string `json:"price_schedule,omitempty"`
+	UpdatedAt     string `json:"updated_at"`
 }
 
 // ---------------------------------------------------------------------------
@@ -382,11 +538,24 @@ type Route struct {
 	StableFirstDenominator     *int    `json:"stable_first_denominator,omitempty"`
 	StableFirstPromoteRequests *int    `json:"stable_first_promote_requests,omitempty"`
 	StableFirstRequests        int     `json:"stable_first_requests,omitempty"`
+	// StickySession overrides session affinity for this model. nil = follow
+	// the global setting (runtime_settings.sticky_enabled / STICKY_ENABLED);
+	// true = always bind a conversation to the channel that served it (prompt
+	// cache and multi-turn continuity); false = never bind, so every request
+	// spreads across the pool. Affinity is a trade-off rather than a strict
+	// win, and which side is right depends on the model: a single fast channel
+	// wants it, an interchangeable fleet does not.
+	StickySession *bool `json:"sticky_session,omitempty"`
 	// ModelGroup is a manual label; an empty value lets the UI use automatic
 	// vendor-family detection from the model name.
-	ModelGroup string    `json:"model_group,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ModelGroup string `json:"model_group,omitempty"`
+	// ImageEditShim opts this route into the chat→edit rewrite: a chat request
+	// carrying an image is re-issued in the model's real protocol and the
+	// result is returned as a chat completion. Off by default — it changes the
+	// wire contract, so it must be a deliberate, per-route decision.
+	ImageEditShim bool      `json:"image_edit_shim,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +593,24 @@ type RouteMember struct {
 	LastError     string     `json:"last_error,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
+	// Optional self-set unit prices per 1k tokens for THIS channel serving
+	// this model — the most specific billing layer (overrides the model's
+	// metadata prices). 0 = fall through to the next layer.
+	PricePromptPer1k     float64 `json:"price_prompt_per_1k,omitempty"`
+	PriceCompletionPer1k float64 `json:"price_completion_per_1k,omitempty"`
+	PriceCachePer1k      float64 `json:"price_cache_per_1k,omitempty"`
+	// Flat amount charged per call, added to the token-derived cost.
+	PricePerRequest float64 `json:"price_per_request,omitempty"`
+	// This member's own context-length ladder and time-of-day windows, JSON;
+	// empty means flat pricing. See pricing_tiers.go.
+	PriceTiers    string `json:"price_tiers,omitempty"`
+	PriceSchedule string `json:"price_schedule,omitempty"`
+	// PriceSource says who owns this member's billing price -- "manual" when an
+	// operator submitted it, "site" when it was adopted from the site's own
+	// price table. Billing itself never reads it; it only explains an invoice.
+	PriceSource string `json:"price_source,omitempty"`
+	// PriceUpdatedAt is when that price last changed, as SQLite datetime text.
+	PriceUpdatedAt string `json:"price_updated_at,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -432,8 +619,13 @@ type RouteMember struct {
 
 // DownstreamKey authenticates downstream clients.
 type DownstreamKey struct {
-	ID        int64  `json:"id"`
-	TokenHash string `json:"-"` // never serialized
+	ID            int64       `json:"id"`
+	UserID        int64       `json:"user_id,omitempty"`
+	TeamPlanID    int64       `json:"team_plan_id,omitempty"`
+	TeamHint      string      `json:"team_hint,omitempty"`
+	TeamDeletedAt string      `json:"-"`
+	TeamAccess    *TeamAccess `json:"-"`
+	TokenHash     string      `json:"-"` // never serialized
 	// TokenEnc is the MASTER_KEY-encrypted plaintext token, kept so operators
 	// can re-view/copy a key after creation. Empty for keys created before
 	// plaintext storage existed. Never serialized in JSON.
@@ -445,12 +637,11 @@ type DownstreamKey struct {
 	QuotaTotalTokens int64 `json:"quota_total_tokens"`
 	// QuotaUsedTokens is the cumulative total tokens charged to this key.
 	QuotaUsedTokens int64 `json:"quota_used_tokens"`
-	// Optional display prices (currency-agnostic units per 1k tokens).
-	PricePromptPer1k     float64 `json:"price_prompt_per_1k"`
-	PriceCompletionPer1k float64 `json:"price_completion_per_1k"`
-	// PriceCachePer1k is the unit price for cache-read tokens. 0 = fall back
-	// to the prompt price (cache-read is billed as prompt).
-	PriceCachePer1k float64 `json:"price_cache_per_1k"`
+	// QuotaTotalCost/QuotaUsedCost are the same budget expressed in money, in
+	// the ledger's unit (USD). 0 total = unlimited. Both limits apply: whichever
+	// runs out first refuses the request.
+	QuotaTotalCost float64 `json:"quota_total_cost"`
+	QuotaUsedCost  float64 `json:"quota_used_cost"`
 	// ModelAllowlist, when non-empty, restricts this key to the listed models.
 	// ModelDenylist blocks the listed models even if they are allowlisted.
 	// Both are comma-separated model names.
@@ -473,13 +664,16 @@ type DownstreamKey struct {
 // KeyGroup is a multi-tenant token group with its own quota and rate limits.
 // QuotaTotalTokens 0 = unlimited; RatePerMinute 0 = no group-level limiting.
 type KeyGroup struct {
-	Name             string    `json:"name"`
-	QuotaTotalTokens int64     `json:"quota_total_tokens"`
-	QuotaUsedTokens  int64     `json:"quota_used_tokens"`
-	RatePerMinute    int       `json:"rate_per_minute"`
-	RateBurst        int       `json:"rate_burst"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	Name             string `json:"name"`
+	QuotaTotalTokens int64  `json:"quota_total_tokens"`
+	QuotaUsedTokens  int64  `json:"quota_used_tokens"`
+	// Money limits, enforced beside the token ones (0 = unlimited).
+	QuotaTotalCost float64   `json:"quota_total_cost"`
+	QuotaUsedCost  float64   `json:"quota_used_cost"`
+	RatePerMinute  int       `json:"rate_per_minute"`
+	RateBurst      int       `json:"rate_burst"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // ---------------------------------------------------------------------------
@@ -488,16 +682,19 @@ type KeyGroup struct {
 
 // ProxyLog records a relayed request (without secrets).
 type ProxyLog struct {
-	ID           int64  `json:"id"`
-	RequestID    string `json:"request_id"`
-	ChannelID    int64  `json:"channel_id"`
-	RouteID      int64  `json:"route_id,omitempty"`
-	RoutePattern string `json:"route_pattern,omitempty"`
-	Model        string `json:"model"`
-	Status       int    `json:"status"`
-	LatencyMs    int    `json:"latency_ms"`
-	Attempt      int    `json:"attempt"`
-	ErrorBrief   string `json:"error_brief,omitempty"`
+	ID                int64  `json:"id"`
+	RequestID         string `json:"request_id"`
+	ChannelID         int64  `json:"channel_id"`
+	RouteID           int64  `json:"route_id,omitempty"`
+	MemberID          int64  `json:"member_id,omitempty"`
+	RequestKind       string `json:"request_kind,omitempty"`
+	CompletionOutcome string `json:"completion_outcome,omitempty"`
+	RoutePattern      string `json:"route_pattern,omitempty"`
+	Model             string `json:"model"`
+	Status            int    `json:"status"`
+	LatencyMs         int    `json:"latency_ms"`
+	Attempt           int    `json:"attempt"`
+	ErrorBrief        string `json:"error_brief,omitempty"`
 	// ErrorDetail is a truncated excerpt of what the upstream actually
 	// returned for a failed attempt (error body text, or the transport error
 	// string when no response arrived). Empty on success.
@@ -532,12 +729,60 @@ type ProxyLog struct {
 	SessionKey     string `json:"session_key,omitempty"`
 	// UpstreamRequestID is the upstream x-request-id header echoed by the
 	// serving channel, enabling cross-referencing with the upstream's logs.
-	UpstreamRequestID string    `json:"upstream_request_id,omitempty"`
-	CreatedAt         time.Time `json:"created_at"`
+	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
+	// UpstreamModel is the model name this attempt actually asked the upstream
+	// for. It equals Model unless the route/member carried a {"real":"…"}
+	// mapping, which is what a shared alias (several upstream models behind one
+	// client-facing name) looks like. The console shows the difference so a
+	// unified route's log rows stay attributable. Empty on rows written before
+	// the column existed.
+	UpstreamModel string    `json:"upstream_model,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	// UpstreamURL is the URL this attempt actually called (scheme + host + path,
+	// query and fragment stripped). It differs from Path whenever a channel
+	// endpoint override/map relocated the request, and it is the only record of
+	// what a custom-path passthrough (/v1/<anything>) reached. Empty on rows
+	// written before the column existed.
+	UpstreamURL string `json:"upstream_url,omitempty"`
+	// UpstreamKeyID is the credentials.id of the key that served this attempt;
+	// 0 on rows written before the column existed, or on attempts that failed
+	// before reaching a key. The secret is never stored — this id plus
+	// KeyFingerprint is the whole record of which key it was.
+	UpstreamKeyID int64 `json:"upstream_key_id,omitempty"`
+	// UpstreamKeyName is the key's display name (credentials.meta_json .name),
+	// resolved at list time rather than stored, so a rename shows through and a
+	// key deleted afterwards simply resolves to empty. Populated only in admin
+	// list responses, like RoutePattern and Cost.
+	UpstreamKeyName string `json:"upstream_key_name,omitempty"`
+	// Cost is the persisted billing amount for this request, joined from
+	// usage_records by request_id. It is populated only in admin list
+	// responses; the proxy_logs table carries no cost column and inserts
+	// never write this field.
+	Cost *float64 `json:"cost,omitempty"`
+	// Billing explains that amount: one entry per metered usage record for the
+	// request, in attempt order, so a request that failed over and billed more
+	// than once shows every decision instead of one summary that could not say
+	// which attempt charged. Like Cost it is a read-time annotation populated
+	// only in admin list responses, and it carries the pricing rule snapshot
+	// rather than any credential.
+	Billing []BillingExplanation `json:"billing,omitempty"`
+}
+
+// BillingExplanation is one usage record's billing decision, attached to an
+// admin proxy-log row at read time. Status is the relay's recorded
+// billing_status ("settled", "explicitly_free", "unpriced", "price_missing",
+// "usage_missing", "estimated", "legacy", "calculation_error"). Evidence is
+// the stored rule snapshot as opaque JSON, or null when the row predates rules
+// or its snapshot was unreadable — a reader decodes only the fields it knows
+// instead of being handed a blob to print.
+type BillingExplanation struct {
+	Status   string          `json:"status"`
+	Evidence json.RawMessage `json:"evidence"`
 }
 
 // UsageRecord is one metered relay completion used for billing summaries.
 type UsageRecord struct {
+	UserID              int64  `json:"user_id,omitempty"`
 	ID                  int64  `json:"id"`
 	RequestID           string `json:"request_id"`
 	DownstreamKeyID     int64  `json:"downstream_key_id"`
@@ -554,7 +799,9 @@ type UsageRecord struct {
 	// Cost is the persisted monetary amount for this relay (key unit prices ×
 	// model ratio), computed at record time so bills never depend on later
 	// price edits.
-	Cost float64 `json:"cost"`
+	Cost            float64 `json:"cost"`
+	BillingStatus   string  `json:"billing_status"`
+	BillingEvidence string  `json:"billing_evidence,omitempty"`
 	// GroupName is the key's tenant group; used only to accrue group quota in
 	// the same transaction (not persisted on the usage row itself).
 	GroupName string    `json:"-"`
@@ -563,11 +810,26 @@ type UsageRecord struct {
 
 // UsageSummary aggregates metered traffic for Admin views.
 type UsageSummary struct {
-	RequestCount     int64   `json:"request_count"`
-	PromptTokens     int64   `json:"prompt_tokens"`
-	CompletionTokens int64   `json:"completion_tokens"`
-	TotalTokens      int64   `json:"total_tokens"`
+	RequestCount        int64 `json:"request_count"`
+	PromptTokens        int64 `json:"prompt_tokens"`
+	CompletionTokens    int64 `json:"completion_tokens"`
+	TotalTokens         int64 `json:"total_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_tokens"`
+	CacheCreationTokens int64 `json:"cache_creation_tokens"`
+	// Status breakdown over the same window, so the overview's result matrix
+	// is an aggregate instead of a tally over whatever rows it managed to load.
+	OkCount          int64   `json:"ok_count"`
+	ClientErrorCount int64   `json:"client_error_count"`
+	ServerErrorCount int64   `json:"server_error_count"`
+	OtherCount       int64   `json:"other_count"`
 	Cost             float64 `json:"cost"`
+	// AvgLatencyMs is the mean latency of the SUCCESSFUL calls in the same
+	// window. It cannot come from usage_records (that table has no latency) but
+	// from proxy_logs, which records one row per attempt — filtering on 2xx is
+	// what makes it per-request rather than per-attempt, since a failed attempt
+	// does not carry a 2xx status. Zero when nothing succeeded; the caller
+	// already has OkCount to tell "no successes" from "instant responses".
+	AvgLatencyMs int64 `json:"avg_latency_ms"`
 }
 
 // ModelRatio is the per-model billing markup (1.0 = no markup).
@@ -579,12 +841,66 @@ type ModelRatio struct {
 
 // RoutingCandidate contains the persisted facts needed to evaluate one member.
 type RoutingCandidate struct {
+	// Filled during selection, when the concrete requested name is known.
+	UpstreamModel    string      `json:"upstream_model,omitempty"`
 	Member           RouteMember `json:"member"`
 	Channel          Channel     `json:"channel"`
 	CredentialUsable bool        `json:"credential_usable"`
-	// ModelPattern is the route's model_pattern, used to scope per-model
-	// adaptive scoring (latency/error EMA is tracked per channel × model).
+	// ModelPattern is the route's model_pattern. Adaptive scoring (latency and
+	// error EMA) is keyed per channel × UPSTREAM model — see UpstreamModelName,
+	// because one route may reach several differently-named models through its
+	// members and they must not share a health record.
 	ModelPattern string `json:"model_pattern,omitempty"`
+}
+
+// MemberRealModel returns the upstream name a member's {"real":"…"} alias
+// redirects to, or "" when the member serves the route's own name.
+func MemberRealModel(mappingJSON string) string {
+	trimmed := strings.TrimSpace(mappingJSON)
+	if trimmed == "" {
+		return ""
+	}
+	var mapping struct {
+		Real string `json:"real"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &mapping); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(mapping.Real)
+}
+
+// UpstreamModelName is the model name a candidate actually sends upstream: its
+// own alias when it carries one, else the route's pattern.
+//
+// This is the key every health record must use. Keying on the route pattern
+// conflates the variants a single route can reach — an alias route whose
+// members point at "cn:x" and "global:x" would share one latency sample, so a
+// fast variant's successes would keep the slow one looking healthy (and the
+// other way round), and both would always score identically no matter which
+// one served the traffic. The forward path already resolved this name for
+// blacklisting; the scoring path resolves it the same way now.
+func UpstreamModelName(candidate RoutingCandidate) string {
+	if candidate.UpstreamModel != "" {
+		return candidate.UpstreamModel
+	}
+	if real := MemberRealModel(candidate.Member.MappingJSON); real != "" {
+		return real
+	}
+	return candidate.ModelPattern
+}
+
+// ResolveUpstreamModel mirrors forwarding precedence, including legacy route
+// aliases and concrete requests matched by wildcard routes. Invalid nonempty
+// member mappings fail open rather than unexpectedly inheriting another map.
+func ResolveUpstreamModel(requested, memberMapping, routeMapping string) string {
+	mapping := strings.TrimSpace(routeMapping)
+	if member := strings.TrimSpace(memberMapping); member != "" {
+		mapping = member
+	}
+	if real := MemberRealModel(mapping); real != "" {
+		return real
+	}
+	return requested
 }
 
 // RouteOverview is the admin-facing route matrix with enriched channel members.

@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	_ "time/tzdata" // embed IANA tz database so CHECKIN_TZ works in minimal containers
+
 	"github.com/lan/meta-gateway/internal/adapters"
 	"github.com/lan/meta-gateway/internal/backup"
 	"github.com/lan/meta-gateway/internal/checkin"
@@ -24,14 +26,20 @@ import (
 	"github.com/lan/meta-gateway/internal/observability"
 	"github.com/lan/meta-gateway/internal/outbound"
 	"github.com/lan/meta-gateway/internal/plugins"
+	"github.com/lan/meta-gateway/internal/selfupdate"
 	"github.com/lan/meta-gateway/internal/store"
 	"github.com/lan/meta-gateway/internal/webdavsync"
-	_ "time/tzdata" // embed IANA tz database so CHECKIN_TZ works in minimal containers
 )
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
+	// One-click container update: when this process boots inside a successor
+	// container (META_SELFUPDATE_SWAP set), it tears the old container down
+	// and recreates the final one with the original ports/name — see
+	// internal/selfupdate. Blocks until the handoff completes; on failure it
+	// rolls the old container back and exits non-zero.
+	selfupdate.SwapIfRequested()
 	if len(os.Args) > 1 && os.Args[1] == "restore" {
 		if len(os.Args) != 4 || os.Args[2] != "--from" || os.Args[3] == "" {
 			logger.Error("usage: meta-gateway restore --from <backup-name>")
@@ -47,7 +55,11 @@ func main() {
 	}
 	cfg, err := config.Load()
 	if err != nil {
-		logger.Error("configuration invalid", "category", "configuration")
+		// The reason goes in the log. A deployment that fails here is usually
+		// failing on one value the operator just typed, and "configuration
+		// invalid" with nothing after it sends them hunting through every
+		// variable they have.
+		logger.Error("configuration invalid", "category", "configuration", "error", err.Error())
 		os.Exit(1)
 	}
 
@@ -101,6 +113,15 @@ func main() {
 		MaxIdleConns:          cfg.OutboundMaxIdleConns,
 		MaxIdleConnsPerHost:   cfg.OutboundMaxIdleConnsPerHost,
 	})
+	// The image endpoints get their own, longer response-header ceiling: they are
+	// slow by nature and never retried, so the chat timeout is the only thing
+	// that can turn a working upstream into a 502.
+	imageClient := outbound.NewClient(outboundPolicy, outbound.ClientOptions{
+		ResponseHeaderTimeout: cfg.OutboundImageHeaderTimeout,
+		TLSHandshakeTimeout:   cfg.OutboundTLSHandshakeTimeout,
+		MaxIdleConns:          cfg.OutboundMaxIdleConns,
+		MaxIdleConnsPerHost:   cfg.OutboundMaxIdleConnsPerHost,
+	})
 	registry := adapters.NewRegistry(outboundClient)
 	checkinService := checkin.New(db, enc, registry)
 	pluginService, err := plugins.NewServiceWithOptions(cfg.PluginsDir, db.Plugin, cfg.PluginCatalogURL, outboundClient)
@@ -109,7 +130,7 @@ func main() {
 		os.Exit(1)
 	}
 	pluginService.SetMarketURLs(cfg.PluginMarketURLs)
-	if err := pluginService.EnsureOfficialModulesInstalled(); err != nil {
+	if err := pluginService.RetireLegacyModules(); err != nil {
 		logger.Error("plugin bootstrap failed", "category", "plugins")
 		os.Exit(1)
 	}
@@ -118,8 +139,20 @@ func main() {
 		// core API. The Store exposes the plugin log and allows disabling it.
 		logger.Error("managed plugin startup failed", "category", "plugins", "error", err)
 	}
+	// Plugin model discovery: plugins that publish their own model names are
+	// re-asked on a slow timer (renames made through the console are picked up
+	// immediately by the config/enable paths, so this only covers plugins that
+	// changed on their own while the gateway runs). Core serving continues if
+	// the loop is cancelled at shutdown.
+	modelDiscoveryCtx, modelDiscoveryCancel := context.WithCancel(context.Background())
+	stopModelDiscovery := pluginService.StartModelDiscovery(modelDiscoveryCtx)
+	defer func() {
+		modelDiscoveryCancel()
+		stopModelDiscovery()
+	}()
 	metrics := observability.NewRegistry()
-	state := observability.NewState()
+	state := new(atomic.Bool)
+	state.Store(true)
 	discoveryService := discovery.New(db, enc, registry)
 	exchangeService := exchange.NewService(db, enc, discoveryService)
 	webdavMaxBytes := cfg.WebDAVMaxBytes
@@ -156,7 +189,6 @@ func main() {
 	if cfg.CheckinTZ != "" {
 		logger.Info("check-in scheduler timezone", "tz", cfg.CheckinTZ)
 	}
-	// Check-in scheduler resync on module toggle is wired in httpapi via runtimeconfig.ResyncCheckin.
 
 	var auditDays atomic.Int64
 	var auditRows atomic.Int64
@@ -164,14 +196,15 @@ func main() {
 	auditRows.Store(int64(cfg.AuditRetentionRows))
 
 	handler := httpapi.NewWithDependencies(cfg, db, enc, httpapi.Dependencies{
-		Registry:         registry,
-		CheckinService:   checkinService,
-		CheckinScheduler: scheduler,
-		DiscoveryService: discoveryService,
-		ExchangeService:  exchangeService,
-		PluginService:    pluginService,
-		OutboundClient:   outboundClient,
-		Logger:           logger, Metrics: metrics, State: state,
+		Registry:            registry,
+		CheckinService:      checkinService,
+		CheckinScheduler:    scheduler,
+		DiscoveryService:    discoveryService,
+		ExchangeService:     exchangeService,
+		PluginService:       pluginService,
+		OutboundClient:      outboundClient,
+		OutboundImageClient: imageClient,
+		Logger:              logger, Metrics: metrics, State: state,
 		BackupService: backup.NewWithRetention(db, cfg.BackupDir, cfg.BackupRetentionCount),
 		WebDAVService: webdavService,
 		SetAuditRetention: func(days, rows int) {
@@ -192,10 +225,8 @@ func main() {
 	switch {
 	case scheduler.Started():
 		logger.Info("check-in scheduler enabled")
-	case cfg.CheckinEnabled && pluginService.IsEnabled("checkin"):
-		logger.Info("check-in scheduler idle: disabled via Admin Settings (override wins over CHECKIN_ENABLED)")
 	case cfg.CheckinEnabled:
-		logger.Info("check-in scheduler idle: activate checkin module or enable via Settings")
+		logger.Info("check-in scheduler idle: disabled via Admin Settings (override wins over CHECKIN_ENABLED)")
 	default:
 		logger.Info("check-in scheduler constructed but not started (CHECKIN_ENABLED=false); Settings can enable without restart")
 	}
@@ -267,7 +298,7 @@ func main() {
 		stop()
 	}
 
-	state.SetReady(false)
+	state.Store(false)
 	cancelMaintenance()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ServerShutdownTimeout)
 	defer cancel()
@@ -296,6 +327,8 @@ func main() {
 	if err := pluginService.StopManaged(shutdownCtx); err != nil {
 		logger.Error("managed plugin shutdown failed", "category", "plugins", "error", err)
 	}
+	modelDiscoveryCancel()
+	stopModelDiscovery()
 	if serverFailed {
 		// A bind/listen failure must be visible to the supervisor; returning
 		// normally would produce a misleading zero exit status.

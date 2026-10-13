@@ -2,8 +2,10 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -18,16 +20,29 @@ type UsageStore struct {
 
 // Insert writes one usage record.
 func (s *UsageStore) Insert(record *domain.UsageRecord) (int64, error) {
+	id, err := insertUsage(s.db, record)
+	if err != nil {
+		return 0, fmt.Errorf("usage insert: %w", err)
+	}
+	return id, nil
+}
+
+// insertUsage writes one usage_records row through ex (the pool or a caller's
+// transaction) and returns the new row id. Both the standalone insert and the
+// relay transaction go through it: the column list and its arguments have to
+// stay in the same order, and two copies of a fourteen-column INSERT is how
+// they stop doing that.
+func insertUsage(ex sqlExecutor, record *domain.UsageRecord) (int64, error) {
 	stream := 0
 	if record.Stream {
 		stream = 1
 	}
-	res, err := s.db.Exec(
+	res, err := ex.Exec(
 		`INSERT INTO usage_records (
 			request_id, downstream_key_id, channel_id, model, path, stream,
 			prompt_tokens, completion_tokens, total_tokens,
-			cache_read_tokens, cache_creation_tokens, status, cost
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			cache_read_tokens, cache_creation_tokens, status, cost, user_id, billing_status, billing_evidence
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		record.RequestID,
 		record.DownstreamKeyID,
 		record.ChannelID,
@@ -41,9 +56,11 @@ func (s *UsageStore) Insert(record *domain.UsageRecord) (int64, error) {
 		record.CacheCreationTokens,
 		record.Status,
 		record.Cost,
+		record.UserID,
+		usageBillingStatus(record), record.BillingEvidence,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("usage insert: %w", err)
+		return 0, err
 	}
 	return res.LastInsertId()
 }
@@ -54,6 +71,36 @@ type UsageFilter struct {
 	ChannelID       *int64
 	Model           string
 	Limit           int
+	// Since/Until bound created_at inclusively (nil = open-ended).
+	Since *time.Time
+	Until *time.Time
+}
+
+// UsageScope narrows an aggregate to one owner.
+//
+// The two dimensions are independent and either may be nil: the console reads a
+// single key's spend, the member app reads everything one account produced
+// across all of that account's keys. They live in one type so every aggregate
+// shares the same "whose rows" predicate instead of each spelling it out —
+// which is how the key and account views would otherwise drift apart.
+type UsageScope struct {
+	DownstreamKeyID *int64
+	UserID          *int64
+}
+
+// clauses renders the ownership predicates for this scope.
+func (s UsageScope) clauses() ([]string, []any) {
+	var where []string
+	var args []any
+	if s.DownstreamKeyID != nil {
+		where = append(where, "downstream_key_id = ?")
+		args = append(args, *s.DownstreamKeyID)
+	}
+	if s.UserID != nil {
+		where = append(where, "user_id = ?")
+		args = append(args, *s.UserID)
+	}
+	return where, args
 }
 
 // List returns newest usage records.
@@ -79,10 +126,14 @@ func (s *UsageStore) List(filter UsageFilter) ([]domain.UsageRecord, error) {
 		where = append(where, "model = ?")
 		args = append(args, model)
 	}
+	if clauses, rangeArgs := createdRange("created_at", filter.Since, filter.Until); len(clauses) > 0 {
+		where = append(where, clauses...)
+		args = append(args, rangeArgs...)
+	}
 	args = append(args, limit)
 	query := `SELECT id, request_id, downstream_key_id, channel_id, model, path, stream,
 	prompt_tokens, completion_tokens, total_tokens,
-	cache_read_tokens, cache_creation_tokens, status, cost, created_at
+	cache_read_tokens, cache_creation_tokens, status, cost, created_at, billing_status, billing_evidence
 	FROM usage_records WHERE ` + strings.Join(where, " AND ") + `
 	ORDER BY id DESC LIMIT ?`
 	rows, err := s.db.Query(query, args...)
@@ -110,6 +161,7 @@ func (s *UsageStore) List(filter UsageFilter) ([]domain.UsageRecord, error) {
 			&record.Status,
 			&record.Cost,
 			scanTime(&record.CreatedAt),
+			&record.BillingStatus, &record.BillingEvidence,
 		); err != nil {
 			return nil, fmt.Errorf("usage scan: %w", err)
 		}
@@ -119,28 +171,41 @@ func (s *UsageStore) List(filter UsageFilter) ([]domain.UsageRecord, error) {
 	return result, rows.Err()
 }
 
-// Summary aggregates usage optionally filtered by downstream key.
-func (s *UsageStore) Summary(downstreamKeyID *int64) (domain.UsageSummary, error) {
-	return s.SummarySince(downstreamKeyID, nil)
+// Summary aggregates usage within a scope.
+func (s *UsageStore) Summary(scope UsageScope) (domain.UsageSummary, error) {
+	return s.SummarySince(scope, nil)
 }
 
 // SummarySince aggregates usage from the optional inclusive UTC timestamp.
-func (s *UsageStore) SummarySince(downstreamKeyID *int64, since *time.Time) (domain.UsageSummary, error) {
+func (s *UsageStore) SummarySince(scope UsageScope, since *time.Time) (domain.UsageSummary, error) {
+	return s.SummaryRange(scope, since, nil)
+}
+
+// SummaryRange aggregates usage over an inclusive [since, until] window; nil
+// bounds are open-ended. The console uses it for arbitrary time selections,
+// which is why the window — not just a lower bound — is expressible.
+func (s *UsageStore) SummaryRange(scope UsageScope, since, until *time.Time) (domain.UsageSummary, error) {
 	query := `SELECT COUNT(*),
 		COALESCE(SUM(prompt_tokens),0),
 		COALESCE(SUM(completion_tokens),0),
 		COALESCE(SUM(total_tokens),0),
+		COALESCE(SUM(cache_read_tokens),0),
+		COALESCE(SUM(cache_creation_tokens),0),
+		COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status >= 400 AND status < 500 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status < 200 OR (status >= 300 AND status < 400) THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(cost),0)
 		FROM usage_records`
 	where := []string{}
 	args := []any{}
-	if downstreamKeyID != nil {
-		where = append(where, "downstream_key_id = ?")
-		args = append(args, *downstreamKeyID)
+	if clauses, scopeArgs := scope.clauses(); len(clauses) > 0 {
+		where = append(where, clauses...)
+		args = append(args, scopeArgs...)
 	}
-	if since != nil {
-		where = append(where, "created_at >= ?")
-		args = append(args, since.UTC().Format("2006-01-02 15:04:05"))
+	if clauses, rangeArgs := createdRange("created_at", since, until); len(clauses) > 0 {
+		where = append(where, clauses...)
+		args = append(args, rangeArgs...)
 	}
 	if len(where) > 0 {
 		query += ` WHERE ` + strings.Join(where, " AND ")
@@ -151,11 +216,383 @@ func (s *UsageStore) SummarySince(downstreamKeyID *int64, since *time.Time) (dom
 		&summary.PromptTokens,
 		&summary.CompletionTokens,
 		&summary.TotalTokens,
+		&summary.CacheReadTokens,
+		&summary.CacheCreationTokens,
+		&summary.OkCount,
+		&summary.ClientErrorCount,
+		&summary.ServerErrorCount,
+		&summary.OtherCount,
 		&summary.Cost,
 	); err != nil {
 		return domain.UsageSummary{}, fmt.Errorf("usage summary: %w", err)
 	}
+	if err := s.attachAvgLatency(&summary, scope, since, until); err != nil {
+		return domain.UsageSummary{}, err
+	}
 	return summary, nil
+}
+
+// attachAvgLatency fills AvgLatencyMs from proxy_logs.
+//
+// Latency is not metered alongside tokens: usage_records has no latency column,
+// because a request can fail over through several upstream attempts while
+// producing one billable record. proxy_logs records one row per attempt, so the
+// average is taken over the rows that actually answered with 2xx — a request
+// that failed over reads once, not twice.
+//
+// The scope is honoured through the two columns proxy_logs shares with the
+// summary: downstream_key_id directly, and user_id by way of the request ids
+// that usage_records assigns to that user (proxy_logs has no user column).
+func (s *UsageStore) attachAvgLatency(summary *domain.UsageSummary, scope UsageScope, since, until *time.Time) error {
+	if summary.OkCount == 0 {
+		// Nothing succeeded in the window: skip the query rather than report a
+		// latency of zero milliseconds.
+		return nil
+	}
+	query := `SELECT CAST(COALESCE(AVG(latency_ms),0) AS INTEGER) FROM proxy_logs`
+	where := []string{"status >= 200", "status < 300"}
+	args := []any{}
+	if scope.DownstreamKeyID != nil {
+		where = append(where, "downstream_key_id = ?")
+		args = append(args, *scope.DownstreamKeyID)
+	}
+	if scope.UserID != nil {
+		where = append(where, "request_id IN (SELECT request_id FROM usage_records WHERE user_id = ?)")
+		args = append(args, *scope.UserID)
+	}
+	if clauses, rangeArgs := createdRange("created_at", since, until); len(clauses) > 0 {
+		where = append(where, clauses...)
+		args = append(args, rangeArgs...)
+	}
+	query += ` WHERE ` + strings.Join(where, " AND ")
+	if err := s.db.QueryRow(query, args...).Scan(&summary.AvgLatencyMs); err != nil {
+		return fmt.Errorf("usage summary latency: %w", err)
+	}
+	return nil
+}
+
+// seriesBucketUnits are the bucket sizes the console chart understands, in
+// seconds (1m, 5m, 15m, 30m, 1h, 3h, 6h, 12h, 1d).
+var seriesBucketUnits = []int{60, 300, 900, 1800, 3600, 10800, 21600, 43200, 86400}
+
+// UsageSeries is a fixed-width time series over usage_records. Buckets are
+// epoch-aligned so consecutive ranges produce adjacent, stable labels; the
+// caller formats them in ITS timezone from Since + BucketSeconds.
+type UsageSeries struct {
+	Since            time.Time `json:"since"`
+	Until            time.Time `json:"until"`
+	BucketSeconds    int       `json:"bucket_seconds"`
+	Requests         []int     `json:"requests"`
+	Failed           []int     `json:"failed"`
+	Tokens           []int64   `json:"tokens"`
+	PromptTokens     []int64   `json:"prompt_tokens"`
+	CompletionTokens []int64   `json:"completion_tokens"`
+	CacheRead        []int64   `json:"cache_read_tokens"`
+	CacheWrite       []int64   `json:"cache_creation_tokens"`
+	Cost             []float64 `json:"cost"`
+}
+
+// Series aggregates usage_records into at most `buckets` epoch-aligned slots.
+// Aggregation happens in SQL, so the chart reflects every row in the window
+// instead of the newest 500 the list endpoint can return.
+func (s *UsageStore) Series(scope UsageScope, since, until time.Time, buckets int) (*UsageSeries, error) {
+	if buckets <= 0 {
+		buckets = 24
+	}
+	if buckets > 1500 {
+		buckets = 1500
+	}
+	if !until.After(since) {
+		until = since.Add(time.Hour)
+	}
+	span := until.Sub(since).Seconds()
+	sec := int(math.Ceil(span / float64(buckets)))
+	if sec < seriesBucketUnits[0] {
+		sec = seriesBucketUnits[0]
+	}
+	for _, unit := range seriesBucketUnits {
+		if sec <= unit {
+			sec = unit
+			break
+		}
+	}
+	if sec > seriesBucketUnits[len(seriesBucketUnits)-1] {
+		sec = seriesBucketUnits[len(seriesBucketUnits)-1]
+	}
+
+	// Align the first bucket to the epoch grid so labels land on clean
+	// wall-clock boundaries (…:00, …:15, midnight).
+	startUnix := since.Unix()
+	startUnix -= startUnix % int64(sec)
+	start := time.Unix(startUnix, 0).UTC()
+	count := int((until.Unix()-startUnix)/int64(sec)) + 1
+	if count < 1 {
+		count = 1
+	}
+	if count > 1500 {
+		count = 1500
+	}
+
+	series := &UsageSeries{
+		Since:            start,
+		Until:            until.UTC(),
+		BucketSeconds:    sec,
+		Requests:         make([]int, count),
+		Failed:           make([]int, count),
+		Tokens:           make([]int64, count),
+		PromptTokens:     make([]int64, count),
+		CompletionTokens: make([]int64, count),
+		CacheRead:        make([]int64, count),
+		CacheWrite:       make([]int64, count),
+		Cost:             make([]float64, count),
+	}
+
+	where := []string{"created_at >= ?", "created_at <= ?"}
+	args := []any{startUnix, int64(sec), sqliteUTC(start), sqliteUTC(until)}
+	if clauses, scopeArgs := scope.clauses(); len(clauses) > 0 {
+		where = append(where, clauses...)
+		args = append(args, scopeArgs...)
+	}
+	rows, err := s.db.Query(
+		`SELECT CAST((CAST(strftime('%s', created_at) AS INTEGER) - ?) / ? AS INTEGER) AS idx,
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(total_tokens), 0),
+			COALESCE(SUM(prompt_tokens), 0),
+			COALESCE(SUM(completion_tokens), 0),
+			COALESCE(SUM(cache_read_tokens), 0),
+			COALESCE(SUM(cache_creation_tokens), 0),
+			COALESCE(SUM(cost), 0)
+		FROM usage_records
+		WHERE `+strings.Join(where, " AND ")+`
+		GROUP BY idx`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("usage series: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var idx, requests, failed int
+		var tokens, prompt, completion, cacheRead, cacheWrite int64
+		var cost float64
+		if err := rows.Scan(&idx, &requests, &failed, &tokens, &prompt, &completion, &cacheRead, &cacheWrite, &cost); err != nil {
+			return nil, fmt.Errorf("usage series scan: %w", err)
+		}
+		if idx < 0 || idx >= count {
+			continue
+		}
+		series.Requests[idx] += requests
+		series.Failed[idx] += failed
+		series.Tokens[idx] += tokens
+		series.PromptTokens[idx] += prompt
+		series.CompletionTokens[idx] += completion
+		series.CacheRead[idx] += cacheRead
+		series.CacheWrite[idx] += cacheWrite
+		series.Cost[idx] += cost
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("usage series rows: %w", err)
+	}
+	return series, nil
+}
+
+// ModelUsage is one row of the per-model usage ranking.
+type ModelUsage struct {
+	Model    string  `json:"model"`
+	Requests int     `json:"requests"`
+	Tokens   int64   `json:"total_tokens"`
+	Cost     float64 `json:"cost"`
+	Failed   int     `json:"failed"`
+}
+
+// TopModels ranks models by token usage inside an inclusive window. Ranking in
+// SQL means a chart over a week is not biased by the list endpoint's row cap.
+func (s *UsageStore) TopModels(scope UsageScope, since, until *time.Time, limit int) ([]ModelUsage, error) {
+	if limit <= 0 {
+		limit = 8
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	where := []string{"model <> ''"}
+	args := []any{}
+	if clauses, scopeArgs := scope.clauses(); len(clauses) > 0 {
+		where = append(where, clauses...)
+		args = append(args, scopeArgs...)
+	}
+	if clauses, rangeArgs := createdRange("created_at", since, until); len(clauses) > 0 {
+		where = append(where, clauses...)
+		args = append(args, rangeArgs...)
+	}
+	args = append(args, limit)
+	rows, err := s.db.Query(
+		`SELECT model, COUNT(*),
+			COALESCE(SUM(total_tokens), 0),
+			COALESCE(SUM(cost), 0),
+			COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), 0)
+		FROM usage_records
+		WHERE `+strings.Join(where, " AND ")+`
+		GROUP BY model
+		ORDER BY 3 DESC, 2 DESC
+		LIMIT ?`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("usage top models: %w", err)
+	}
+	defer rows.Close()
+	var result []ModelUsage
+	for rows.Next() {
+		var row ModelUsage
+		if err := rows.Scan(&row.Model, &row.Requests, &row.Tokens, &row.Cost, &row.Failed); err != nil {
+			return nil, fmt.Errorf("usage top models scan: %w", err)
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+// CostByKey returns the persisted billing total per downstream key (all time).
+// Only keys with usage appear in the map. It replaces the retired key-level
+// unit prices: the authoritative per-key spend is what the relay actually
+// recorded, not a price×token estimate.
+func (s *UsageStore) CostByKey() (map[int64]float64, error) {
+	rows, err := s.db.Query(`SELECT downstream_key_id, COALESCE(SUM(cost), 0) FROM usage_records WHERE downstream_key_id > 0 GROUP BY downstream_key_id`)
+	if err != nil {
+		return nil, fmt.Errorf("usage cost by key: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[int64]float64)
+	for rows.Next() {
+		var id int64
+		var cost float64
+		if err := rows.Scan(&id, &cost); err != nil {
+			return nil, fmt.Errorf("usage cost by key scan: %w", err)
+		}
+		out[id] = cost
+	}
+	return out, rows.Err()
+}
+
+// CostByRequestIDs returns the persisted billing amount for each request id.
+// Missing ids are absent from the map. Batched to stay well within SQLite's
+// bound-parameter limit when a page of logs is annotated in one call.
+func (s *UsageStore) CostByRequestIDs(ids []string) (map[string]float64, error) {
+	out := make(map[string]float64)
+	filtered := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if strings.TrimSpace(id) != "" {
+			filtered = append(filtered, id)
+		}
+	}
+	if len(filtered) == 0 {
+		return out, nil
+	}
+	const chunkSize = 400
+	for start := 0; start < len(filtered); start += chunkSize {
+		end := start + chunkSize
+		if end > len(filtered) {
+			end = len(filtered)
+		}
+		batch := filtered[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			args[i] = id
+		}
+		rows, err := s.db.Query(
+			`SELECT request_id, COALESCE(SUM(cost), 0) FROM usage_records WHERE request_id IN (`+placeholders+`) GROUP BY request_id`,
+			args...,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("usage cost by request: %w", err)
+		}
+		for rows.Next() {
+			var requestID string
+			var cost float64
+			if err := rows.Scan(&requestID, &cost); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("usage cost by request scan: %w", err)
+			}
+			out[requestID] = cost
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("usage cost by request rows: %w", err)
+		}
+	}
+	return out, nil
+}
+
+// BillingByRequestIDs returns the persisted billing decisions for each request
+// id, one entry per usage record in attempt order. Missing ids are absent from
+// the map. Evidence that is empty or not a JSON object is dropped to nil — a
+// caller must never be handed an unreadable blob it would have to print raw.
+// Batched like CostByRequestIDs so a page of logs stays within SQLite's
+// bound-parameter limit.
+func (s *UsageStore) BillingByRequestIDs(ids []string) (map[string][]domain.BillingExplanation, error) {
+	out := make(map[string][]domain.BillingExplanation)
+	filtered := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if strings.TrimSpace(id) != "" {
+			filtered = append(filtered, id)
+		}
+	}
+	if len(filtered) == 0 {
+		return out, nil
+	}
+	const chunkSize = 400
+	for start := 0; start < len(filtered); start += chunkSize {
+		end := start + chunkSize
+		if end > len(filtered) {
+			end = len(filtered)
+		}
+		batch := filtered[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			args[i] = id
+		}
+		rows, err := s.db.Query(
+			`SELECT request_id, billing_status, billing_evidence FROM usage_records WHERE request_id IN (`+placeholders+`) ORDER BY id`,
+			args...,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("usage billing by request: %w", err)
+		}
+		for rows.Next() {
+			var requestID, status, evidence string
+			if err := rows.Scan(&requestID, &status, &evidence); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("usage billing by request scan: %w", err)
+			}
+			out[requestID] = append(out[requestID], domain.BillingExplanation{
+				Status:   status,
+				Evidence: billingEvidenceJSON(evidence),
+			})
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("usage billing by request rows: %w", err)
+		}
+	}
+	return out, nil
+}
+
+// billingEvidenceJSON accepts a stored snapshot only when it is a JSON object.
+// Anything else — an empty legacy row, a truncated write, a scalar — becomes
+// nil, which marshals to null: the caller is told "no snapshot" rather than
+// being handed text it would have to dump verbatim.
+func billingEvidenceJSON(evidence string) json.RawMessage {
+	trimmed := strings.TrimSpace(evidence)
+	if trimmed == "" || trimmed[0] != '{' || !json.Valid([]byte(trimmed)) {
+		return nil
+	}
+	return json.RawMessage(trimmed)
 }
 
 // RecordRelayUsage atomically persists one relay's usage accounting: the
@@ -165,7 +602,7 @@ func (s *UsageStore) SummarySince(downstreamKeyID *int64, since *time.Time) (dom
 // not (or vice versa) and cuts the hot-path write round-trips from three
 // to one. Rows with no measurable tokens are a no-op.
 func (db *DB) RecordRelayUsage(record *domain.UsageRecord, keyID int64) error {
-	if record == nil || record.TotalTokens <= 0 {
+	if record == nil || (record.TotalTokens <= 0 && record.Cost <= 0 && record.BillingStatus == "") {
 		return nil
 	}
 	keyEpoch := db.DownstreamKey.mutationEpochSnapshot()
@@ -177,53 +614,65 @@ func (db *DB) RecordRelayUsage(record *domain.UsageRecord, keyID int64) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	stream := 0
-	if record.Stream {
-		stream = 1
-	}
-	if _, err := tx.Exec(
-		`INSERT INTO usage_records (
-			request_id, downstream_key_id, channel_id, model, path, stream,
-			prompt_tokens, completion_tokens, total_tokens,
-			cache_read_tokens, cache_creation_tokens, status, cost
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		record.RequestID,
-		record.DownstreamKeyID,
-		record.ChannelID,
-		record.Model,
-		record.Path,
-		stream,
-		record.PromptTokens,
-		record.CompletionTokens,
-		record.TotalTokens,
-		record.CacheReadTokens,
-		record.CacheCreationTokens,
-		record.Status,
-		record.Cost,
-	); err != nil {
+	if _, err := insertUsage(tx, record); err != nil {
 		return fmt.Errorf("usage record insert: %w", err)
 	}
 
 	var keyUsage int64
+	var keySpend float64
 	keyUsageUpdated := false
 	if keyID > 0 {
-		err := tx.QueryRow(`UPDATE downstream_keys SET quota_used_tokens = quota_used_tokens + ? WHERE id = ? RETURNING quota_used_tokens`, record.TotalTokens, keyID).Scan(&keyUsage)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		// Both counters are written and returned in ONE statement: the spend
+		// budget accrues in the same row update as the token count, so the two
+		// units can never disagree about a request, and the cache sync below has
+		// the committed values to publish.
+		if err := tx.QueryRow(`UPDATE downstream_keys SET quota_used_tokens = quota_used_tokens + ?, quota_used_cost = quota_used_cost + ? WHERE id = ? RETURNING quota_used_tokens, quota_used_cost`, record.TotalTokens, record.Cost, keyID).Scan(&keyUsage, &keySpend); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("usage record key quota: %w", err)
+		} else {
+			keyUsageUpdated = err == nil
 		}
-		keyUsageUpdated = err == nil
 	}
 
 	// Accrue the tenant group quota in the same transaction (no-op when the
 	// group row does not exist — absent groups are unlimited).
 	var groupUsage int64
+	var groupSpend float64
 	groupUsageUpdated := false
-	if groupName != "" {
-		err := tx.QueryRow(`UPDATE key_groups SET quota_used_tokens = quota_used_tokens + ?, updated_at = datetime('now') WHERE name = ? RETURNING quota_used_tokens`, record.TotalTokens, groupName).Scan(&groupUsage)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("usage record group quota: %w", err)
+	if err := tx.QueryRow(`UPDATE key_groups SET quota_used_tokens = quota_used_tokens + ?, quota_used_cost = quota_used_cost + ?, updated_at = datetime('now') WHERE name = ? RETURNING quota_used_tokens, quota_used_cost`, record.TotalTokens, record.Cost, groupName).Scan(&groupUsage, &groupSpend); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("usage record group quota: %w", err)
+	}
+	groupUsageUpdated = err == nil
+
+	// Account pool accrual: a team account carries its own credit pool, charged
+	// in the same transaction as the key quota so a crash can never spend
+	// without recording. Legacy keys have user_id = 0 and skip it.
+	if record.UserID > 0 {
+		if _, err := tx.Exec(`UPDATE team_users SET quota_used_tokens = quota_used_tokens + ?, quota_used_cost = quota_used_cost + ? WHERE id = ?`, record.TotalTokens, record.Cost, record.UserID); err != nil {
+			return fmt.Errorf("usage record account quota: %w", err)
 		}
-		groupUsageUpdated = err == nil
+	}
+
+	// Channel budget: the same transaction that writes the ledger row accrues the
+	// account's counters and parks the channel when the operator's own limit comes
+	// due. Doing it here (rather than in a sweep) is what makes "reached the limit"
+	// exact: the request that crossed it is the one that turns the channel off.
+	if record.ChannelID > 0 {
+		var usedCost, limitCost float64
+		var usedTokens, limitTokens int64
+		var channelStatus string
+		if err := tx.QueryRow(`UPDATE channels SET usage_used_tokens = usage_used_tokens + ?, usage_used_cost = usage_used_cost + ?
+			WHERE id = ? RETURNING usage_used_tokens, usage_used_cost, usage_limit_tokens, usage_limit_cost, status`,
+			record.TotalTokens, record.Cost, record.ChannelID,
+		).Scan(&usedTokens, &usedCost, &limitTokens, &limitCost, &channelStatus); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("usage record channel budget: %w", err)
+		} else if err == nil && channelStatus == domain.StatusEnabled {
+			if hit := UsageLimitHit(usedCost, usedTokens, limitCost, limitTokens); hit != "" {
+				if _, err := tx.Exec(`UPDATE channels SET status = ?, usage_limit_hit = ?, usage_limit_hit_at = datetime('now')
+					WHERE id = ?`, domain.StatusAutoDisabled, hit, record.ChannelID); err != nil {
+					return fmt.Errorf("usage record channel limit: %w", err)
+				}
+			}
+		}
 	}
 
 	if strings.TrimSpace(record.RequestID) != "" {
@@ -252,10 +701,10 @@ func (db *DB) RecordRelayUsage(record *domain.UsageRecord, keyID int64) error {
 	// Keep hot caches in sync with the absolute committed values. The epoch
 	// check prevents an older callback from undoing a concurrent reset/update.
 	if keyUsageUpdated {
-		db.DownstreamKey.setCachedUsageIfEpoch(keyID, keyUsage, keyEpoch)
+		db.DownstreamKey.setCachedUsageIfEpoch(keyID, keyUsage, keySpend, keyEpoch)
 	}
 	if groupUsageUpdated {
-		db.Group.setCachedUsageIfEpoch(groupName, groupUsage, groupEpoch)
+		db.Group.setCachedUsageIfEpoch(groupName, groupUsage, groupSpend, groupEpoch)
 	}
 	return nil
 }
@@ -364,4 +813,11 @@ func (s *ModelRatioStore) ListRatios() ([]domain.ModelRatio, error) {
 		result = append(result, r)
 	}
 	return result, rows.Err()
+}
+
+func usageBillingStatus(record *domain.UsageRecord) string {
+	if record.BillingStatus == "" {
+		return "legacy"
+	}
+	return record.BillingStatus
 }

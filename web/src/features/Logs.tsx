@@ -1,19 +1,21 @@
-import { RefreshCw, MessagesSquare } from "lucide-react";
+import { RefreshCw, MessagesSquare, SlidersHorizontal, Timer, Download } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { Fragment, useMemo, useEffect, useState } from "react";
+import { Fragment, useMemo, useEffect, useState, type ReactNode } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AuditPanel, DiscoveryPanel } from "./ops";
 import { api } from "../api/client";
-import type { ProxyLog } from "../api/types";
+import type { BillingEvidence, BillingExplanation, ProxyLog } from "../api/types";
 import { EmptyHero } from "../components/EmptyHero";
 import { ListShell } from "../components/ListShell";
 import { PaginationBar } from "../components/PaginationBar";
 import { EntityState } from "../components/EntityState";
 import { TelemetryStrip } from "../components/TelemetryStrip";
+import { TimeRangePicker, useUrlTimeRange } from "../components/TimeRangePicker";
 import { categorizeError } from "../errorCatalog";
 import {
   Button,
   DataTable,
+  ErrorState,
   Page,
   Panel,
   StatusBadge,
@@ -23,158 +25,610 @@ import {
 import { useClientPagination } from "../hooks/useClientPagination";
 import { useI18n } from "../i18n";
 import { useSession } from "../session";
-import { formatCost, logCostUsd } from "../lib/format";
-import { positiveId } from "../lib/positiveId"
+import {
+  ADMIN_LOG_CAPS,
+  MEMBER_LOG_CAPS,
+  type LogsCapabilities,
+  type LogsSource,
+} from "./logs/LogsSource";
+import { memberLogsSource } from "../member/MemberLogsSource";
+import { formatCost, formatUnitPrice } from "../lib/format";
+import { positiveId } from "../lib/positiveId";
+import { downloadText, timestampedName, toCSV } from "../lib/csv";
 import { LiveTracePanel } from "./LiveTracePanel";
+
+/** Latency bucket labels mirror store.LatencyBucketBounds (ms upper bounds). */
+const HISTOGRAM_LABELS = [
+  "<0.25s",
+  "0.5s",
+  "1s",
+  "2s",
+  "3s",
+  "5s",
+  "8s",
+  "13s",
+  "21s",
+  "34s",
+  "34s+",
+];
+
+/** Buckets from index 6 up are >= 5s (the slow threshold). */
+const HISTOGRAM_SLOW_FROM = 6;
+
+/**
+ * How many rows one query may pull. The list paginates in the browser, so this
+ * is the window the operator can page through; 100 used to be the whole window,
+ * which is not enough when one incident spans a few hundred requests.
+ */
+const LOG_LIMITS = [100, 200, 500, 1000] as const;
+
+/**
+ * Rows pulled for the distribution. An explicit window asks for a large sample
+ * so a busy hour is not judged by its newest thousand requests; "all time"
+ * stays small because it has no upper bound to narrow the scan.
+ */
+function histogramSample(bounded: boolean): number {
+  return bounded ? 20000 : 1000;
+}
 
 // Routing decision audit view: fetched on demand when a log row expands.
 // Each attempt row shows the snapshot of ITS OWN selection (matched by
 // attempt number); requests whose snapshots predate per-attempt storage fall
 // back to the latest one.
-function DecisionSnapshotView({
-	requestId,
-	attempt,
-}: {
-	requestId: string;
-	attempt: number;
-}) {
-	const { client } = useSession();
-	const service = api(client!);
-	const { t } = useI18n();
-	const snap = useQuery({
-		queryKey: ["decision-snapshot", requestId, attempt],
-		queryFn: ({ signal }) =>
-			service.decisionSnapshot(requestId, attempt, signal),
-		retry: false,
-	});
-	if (snap.isLoading) {
-		return <p className="log-decision-loading">{t("common.working")}</p>;
-	}
-	const payload = snap.data?.payload;
-	if (!payload) {
-		return <p className="log-decision-empty">{t("logsPage.decisionEmpty")}</p>;
-	}
-	const candidates = payload.candidates ?? [];
-	const selectedID = snap.data?.selected_channel_id;
-	// "Served by" must name the channel this attempt actually picked, not the
-	// highest-priority eligible candidate.
-	const selected =
-		candidates.find((c) => c.candidate?.channel?.id === selectedID)
-			?.candidate?.channel?.name ??
-		candidates.find((c) => c.eligible)?.candidate?.channel?.name;
-	return (
-		<div className="log-decision">
-			<div className="log-decision-head">
-				<strong>{t("logsPage.decisionTitle")}</strong>
-				{selected ? (
-					<span>
-						{t("logsPage.decisionSelected", { channel: selected })}
-					</span>
-				) : null}
-				{payload.routing_mode ? <code>{payload.routing_mode}</code> : null}
-				{payload.sticky_hit ? (
-					<span className="log-decision-sticky">
-						{t("logsPage.decisionStickyHit")}
-					</span>
-				) : null}
-				{payload.sticky_reason ? (
-					<span className="log-decision-sticky">
-						{t("logsPage.decisionStickyMiss", {
-							reason: payload.sticky_reason,
-						})}
-					</span>
-				) : null}
-			</div>
-			<ul className="log-decision-candidates">
-				{candidates.map((candidate, index) => {
-					const isPicked =
-						candidate.candidate?.channel?.id != null &&
-						candidate.candidate.channel.id === selectedID;
-					const cooling = (candidate.reasons ?? []).includes(
-						"cooling_down",
-					);
-					return (
-						<li
-							key={index}
-							className={`${candidate.eligible ? "is-eligible" : "is-skipped"}${isPicked ? " is-picked" : ""}`}
-						>
-							<span className="log-decision-channel">
-								{candidate.candidate?.channel?.name ??
-									`#${candidate.candidate?.channel?.id ?? "?"}`}
-							</span>
-							{candidate.score != null && candidate.score > 0 ? (
-								<code>{Math.round(candidate.score)}</code>
-							) : null}
-							{candidate.eligible ? (
-								<span className="log-decision-tag is-ok">
-									{t("status.enabled")}
-								</span>
-							) : (
-								<span
-									className={`log-decision-tag is-skip${cooling ? " is-cooling" : ""}`}
-								>
-									{(candidate.reasons ?? []).join(", ") ||
-										t("logsPage.decisionSkipped")}
-								</span>
-							)}
-						</li>
-					);
-				})}
-			</ul>
-		</div>
-	);
+function DecisionSnapshotView({ requestId, attempt }: { requestId: string; attempt: number }) {
+  const { client } = useSession();
+  const service = api(client!);
+  const { t } = useI18n();
+  const snap = useQuery({
+    queryKey: ["decision-snapshot", requestId, attempt],
+    queryFn: ({ signal }) => service.decisionSnapshot(requestId, attempt, signal),
+    retry: false,
+  });
+  if (snap.isLoading) {
+    return <p className="log-decision-loading">{t("common.working")}</p>;
+  }
+  const payload = snap.data?.payload;
+  if (!payload) {
+    return <p className="log-decision-empty">{t("logsPage.decisionEmpty")}</p>;
+  }
+  const candidates = payload.candidates ?? [];
+  const selectedID = snap.data?.selected_channel_id;
+  // "Served by" must name the channel this attempt actually picked, not the
+  // highest-priority eligible candidate.
+  const selected = candidates.find((c) => c.candidate?.channel?.id === selectedID)?.candidate
+    ?.channel?.name;
+  return (
+    <div className="log-decision">
+      <div className="log-decision-head">
+        <strong>{t("logsPage.decisionTitle")}</strong>
+        {selected ? (
+          <span>{t("logsPage.decisionSelected", { channel: selected })}</span>
+        ) : (
+          // The attempt's own record is the only authority here. Naming the
+          // highest-priority eligible candidate instead would attribute the
+          // request to a channel that never served it — and saying nothing
+          // leaves the operator unable to tell "not recorded" from "the
+          // panel failed to load".
+          <span className="muted">{t("logsPage.decisionUnavailable")}</span>
+        )}
+        {payload.routing_mode ? <code>{payload.routing_mode}</code> : null}
+        {payload.sticky_hit ? (
+          <span className="log-decision-sticky">{t("logsPage.decisionStickyHit")}</span>
+        ) : null}
+        {payload.sticky_reason ? (
+          <span className="log-decision-sticky">
+            {t("logsPage.decisionStickyMiss", {
+              reason: payload.sticky_reason,
+            })}
+          </span>
+        ) : null}
+      </div>
+      <ul className="log-decision-candidates">
+        {candidates.map((candidate, index) => {
+          const isPicked =
+            candidate.candidate?.channel?.id != null &&
+            candidate.candidate.channel.id === selectedID;
+          const cooling = (candidate.reasons ?? []).includes("cooling_down");
+          return (
+            <li
+              key={index}
+              className={`${candidate.eligible ? "is-eligible" : "is-skipped"}${isPicked ? " is-picked" : ""}`}
+            >
+              <span className="log-decision-channel">
+                {candidate.candidate?.channel?.name ??
+                  `#${candidate.candidate?.channel?.id ?? "?"}`}
+              </span>
+              {candidate.score != null && candidate.score > 0 ? (
+                <code>{Math.round(candidate.score)}</code>
+              ) : null}
+              {candidate.eligible ? (
+                <span className="log-decision-tag is-ok">{t("status.enabled")}</span>
+              ) : (
+                <span className={`log-decision-tag is-skip${cooling ? " is-cooling" : ""}`}>
+                  {(candidate.reasons ?? []).join(", ") || t("logsPage.decisionSkipped")}
+                </span>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
 }
 
-function ProxyLogsPanel() {
-  const { client } = useSession();
-  const { t } = useI18n();
-  const service = api(client!);
-  const [params, setParams] = useSearchParams();
-	const channelId = positiveId(params.get("channel_id"));
-	const modelParam = params.get("model")?.trim() || "";
-	const failedOnly = params.get("status") === "failed";
-	const upstreamIdParam = params.get("upstream_request_id")?.trim() || "";
-	const [modelDraft, setModelDraft] = useState(modelParam);
-	const [upstreamIdDraft, setUpstreamIdDraft] = useState(upstreamIdParam);
-	const [slowOnly, setSlowOnly] = useState(false);
-	const [expandedRequest, setExpandedRequest] = useState<string | null>(null);
-  const [histogram, setHistogram] = useState<{
-    buckets: number[];
-    total: number;
-    slow_count: number;
-    p50_ms: number;
-    p95_ms: number;
-  } | null>(null);
+/**
+ * Latency bar fill as a fraction of a 0–10s scale, floored at 6% so a fast
+ * attempt still draws a visible nub instead of an empty track.
+ */
+function latencyShare(latencyMs: number): number {
+  return Math.min(1, Math.max(0.06, latencyMs / 10000));
+}
 
-	const filters = useMemo(
-		() => ({
-			channel_id: channelId,
-			model: modelParam || undefined,
-			status: failedOnly ? ("failed" as const) : undefined,
-			upstream_request_id: upstreamIdParam || undefined,
-			limit: 100,
-		}),
-		[channelId, failedOnly, modelParam, upstreamIdParam],
-	);
+/** One hop of the chain; `to` turns the value into a link to its owner. */
+function ChainStep({
+  label,
+  value,
+  note,
+  to,
+}: {
+  label: string;
+  value: ReactNode;
+  note?: ReactNode;
+  to?: string;
+}) {
+  return (
+    <div className="log-chain-step">
+      <span className="log-chain-label">{label}</span>
+      {to ? (
+        <Link className="log-chain-value" to={to}>
+          {value}
+        </Link>
+      ) : (
+        <span className="log-chain-value">{value}</span>
+      )}
+      {note ? <span className="log-chain-note">{note}</span> : null}
+    </div>
+  );
+}
+
+/**
+ * The request chain, reconstructed after the fact: client token → ingress path
+ * → route → channel → upstream URL. Every hop links to the object that owns it,
+ * because "which token was this and where did it go" is the first question
+ * about a row the operator does not recognise.
+ */
+function LogChain({
+  log,
+  channelName,
+  keyName,
+}: {
+  log: ProxyLog;
+  channelName: Map<number, string>;
+  keyName: Map<number, string>;
+}) {
+  const { t } = useI18n();
+  const knownTokenName = log.downstream_key_id ? keyName.get(log.downstream_key_id) : undefined;
+  const tokenLabel = knownTokenName ?? (log.downstream_key_id ? `#${log.downstream_key_id}` : null);
+  const ingressNote = [log.client_family, log.stream ? t("logsPage.chainStream") : null]
+    .filter(Boolean)
+    .join(" · ");
+  // proxy_logs.path stores the endpoint relative to the API root (the relay's
+  // own name for it, e.g. "chat/completions"); the client's ingress path has
+  // the /v1 prefix the relay is mounted under.
+  const ingressPath = log.path ? (log.path.startsWith("/") ? log.path : `/v1/${log.path}`) : "—";
+  // The upstream key is stored as an id (the secret itself never is), so the
+  // display name comes from the server-side join. Rows written before that
+  // column existed carry only the fingerprint — say so rather than show a
+  // blank hop, which would read as "no key was used".
+  const keyID = log.upstream_key_id ?? 0;
+  const keyLabel = keyID ? log.upstream_key_name || `#${keyID}` : log.key_fingerprint || "—";
+  const keyNote = keyID
+    ? log.upstream_key_name
+      ? `#${keyID}`
+      : undefined
+    : log.key_fingerprint
+      ? t("logsPage.chainKeyFingerprintOnly")
+      : undefined;
+  const steps: Array<{
+    label: string;
+    value: ReactNode;
+    note?: ReactNode;
+    to?: string;
+  }> = [
+    {
+      label: t("logsPage.token"),
+      value: tokenLabel ?? t("logsPage.chainNoToken"),
+      // The id only rides along when the name carried it; otherwise the value
+      // IS the id and repeating it in the note reads as two facts.
+      note: knownTokenName ? `#${log.downstream_key_id}` : undefined,
+      // The Keys page has no per-row detail view; its search box is the
+      // only way to land on one token, so the hop links there by name.
+      to: knownTokenName ? `/keys?search=${encodeURIComponent(knownTokenName)}` : undefined,
+    },
+    {
+      label: t("logsPage.chainIngress"),
+      value: <code>{ingressPath}</code>,
+      note: ingressNote || undefined,
+    },
+    {
+      label: t("common.route"),
+      value: log.route_id ? `#${log.route_id}` : "—",
+      note: log.route_pattern || t("logsPage.chainUnrouted"),
+      to: log.route_id ? `/models?model=${encodeURIComponent(log.route_pattern ?? "")}` : undefined,
+    },
+    {
+      label: t("common.channel"),
+      value: channelName.get(log.channel_id) ?? `#${log.channel_id}`,
+      to: `/channels?id=${log.channel_id}`,
+    },
+    {
+      label: t("logsPage.chainKey"),
+      value: keyLabel,
+      note: keyNote,
+      // Straight to the key list this name came from (?keys= opens that
+      // channel's key drawer on the connections page).
+      to: keyID ? `/channels?keys=${log.channel_id}` : undefined,
+    },
+    {
+      label: t("logsPage.chainUpstream"),
+      value: <code title={log.upstream_url || undefined}>{log.upstream_url || "—"}</code>,
+      note: t("logsPage.chainAttempt", { n: log.attempt }),
+    },
+  ];
+  return (
+    <div className="log-chain">
+      <strong className="log-chain-head">{t("logsPage.chainTitle")}</strong>
+      <div className="log-chain-steps">
+        {steps.map((step, index) => (
+          <Fragment key={step.label}>
+            {index > 0 ? (
+              <span className="log-chain-arrow" aria-hidden="true">
+                →
+              </span>
+            ) : null}
+            <ChainStep {...step} />
+          </Fragment>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The billing snapshot behind a request's cost, decoded defensively. The stored
+ * evidence is opaque JSON written by whatever relay version metered the call,
+ * so only the known fields are read and an unrecognised snapshot is simply not
+ * shown. The amount itself is the row's `cost`; this block answers "why".
+ */
+function billingEvidence(value: unknown): BillingEvidence | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  return value as BillingEvidence;
+}
+
+const BILLING_STATUS_KEYS: Record<string, string> = {
+  settled: "logsPage.billing.status.settled",
+  explicitly_free: "logsPage.billing.status.explicitlyFree",
+  unpriced: "logsPage.billing.status.unpriced",
+  price_missing: "logsPage.billing.status.priceMissing",
+  usage_missing: "logsPage.billing.status.usageMissing",
+  estimated: "logsPage.billing.status.estimated",
+  legacy: "logsPage.billing.status.legacy",
+  calculation_error: "logsPage.billing.status.calculationError",
+};
+
+const USAGE_SOURCE_KEYS: Record<string, string> = {
+  upstream: "logsPage.billing.usage.upstream",
+  estimated: "logsPage.billing.usage.estimated",
+  missing: "logsPage.billing.usage.missing",
+};
+
+/**
+ * A rate renders only when it is a real number: a missing or malformed rate is
+ * left out, never shown as a zero price. The USD/1k dimensions are scaled to
+ * /1M to match how providers quote; per_request is already per call.
+ */
+function pushRate(
+  items: Array<{ label: string; value: ReactNode }>,
+  label: string,
+  value: number | undefined,
+  scale: number,
+) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return;
+  items.push({ label, value: formatUnitPrice(value * scale) });
+}
+
+function BillingEntry({ explanation }: { explanation: BillingExplanation }) {
+  const { t } = useI18n();
+  const statusKey = BILLING_STATUS_KEYS[explanation.status];
+  const items: Array<{ label: string; value: ReactNode }> = [
+    {
+      label: t("logsPage.billing.status"),
+      value: statusKey ? t(statusKey) : explanation.status,
+    },
+  ];
+  const evidence = billingEvidence(explanation.evidence);
+  if (!evidence) {
+    // A legacy row (predating rules) or one whose snapshot was unreadable. Say
+    // so rather than printing nothing or the raw stored text.
+    items.push({ label: t("logsPage.billing.snapshot"), value: t("logsPage.billing.noSnapshot") });
+  } else {
+    if (typeof evidence.owner === "string") {
+      items.push({ label: t("logsPage.billing.owner"), value: <code>{evidence.owner}</code> });
+    }
+    if (typeof evidence.revision === "number") {
+      items.push({ label: t("logsPage.billing.revision"), value: String(evidence.revision) });
+    }
+    if (typeof evidence.source === "string") {
+      items.push({ label: t("logsPage.billing.source"), value: <code>{evidence.source}</code> });
+    }
+    if (typeof evidence.usage_source === "string") {
+      const usageKey = USAGE_SOURCE_KEYS[evidence.usage_source];
+      items.push({
+        label: t("logsPage.billing.usageSource"),
+        value: usageKey ? t(usageKey) : evidence.usage_source,
+      });
+    }
+    if (
+      typeof evidence.rates === "object" &&
+      evidence.rates !== null &&
+      !Array.isArray(evidence.rates)
+    ) {
+      pushRate(items, t("logsPage.billing.rate.input"), evidence.rates.input_per_1k, 1000);
+      pushRate(items, t("logsPage.billing.rate.output"), evidence.rates.output_per_1k, 1000);
+      pushRate(items, t("logsPage.billing.rate.cacheRead"), evidence.rates.cache_per_1k, 1000);
+      pushRate(
+        items,
+        t("logsPage.billing.rate.cacheWrite"),
+        evidence.rates.cache_write_per_1k,
+        1000,
+      );
+      pushRate(items, t("logsPage.billing.rate.perRequest"), evidence.rates.per_request, 1);
+      if (
+        typeof evidence.rates.multiplier === "number" &&
+        Number.isFinite(evidence.rates.multiplier)
+      )
+        items.push({
+          label: t("logsPage.billing.timeMultiplier"),
+          value: String(evidence.rates.multiplier),
+        });
+      if (typeof evidence.rates.timezone === "string")
+        items.push({ label: t("logsPage.billing.timezone"), value: evidence.rates.timezone });
+    }
+    if (typeof evidence.ordinary_input_tokens === "number")
+      items.push({
+        label: t("logsPage.billing.ordinaryInput"),
+        value: String(evidence.ordinary_input_tokens),
+      });
+    if (typeof evidence.ratio === "number") {
+      items.push({ label: t("logsPage.billing.ratio"), value: String(evidence.ratio) });
+    }
+    if (
+      typeof evidence.cache_read_tokens === "number" ||
+      typeof evidence.cache_write_tokens === "number"
+    ) {
+      items.push({
+        label: t("logsPage.billing.cacheTokens"),
+        value: `${evidence.cache_read_tokens ?? 0} / ${evidence.cache_write_tokens ?? 0}`,
+      });
+    }
+    if (typeof evidence.evaluated_at === "string") {
+      items.push({
+        label: t("logsPage.billing.evaluatedAt"),
+        value: formatDate(evidence.evaluated_at),
+      });
+    }
+  }
+  return (
+    <dl className="log-details-grid">
+      {items.map((item) => (
+        <Fragment key={item.label}>
+          <dt>{item.label}</dt>
+          <dd>{item.value}</dd>
+        </Fragment>
+      ))}
+    </dl>
+  );
+}
+
+/**
+ * The request's billing evidence, collapsed behind a summary: one entry per
+ * metered attempt. It is the REQUEST's settlement, not this attempt's — a
+ * failed attempt meters nothing, and showing the rule here must not read as if
+ * the failed attempt was charged.
+ */
+function BillingDetails({ billing }: { billing: BillingExplanation[] }) {
+  const { t } = useI18n();
+  return (
+    <details className="log-billing">
+      <summary>{t("logsPage.billing.explanation")}</summary>
+      {billing.map((explanation, index) => (
+        <BillingEntry key={index} explanation={explanation} />
+      ))}
+    </details>
+  );
+}
+
+/**
+ * The rest of the row's forensics, in the order they get asked about: what the
+ * upstream called this (ids), what was sent (effort, session), and what it cost
+ * (token split, cache, speed, price, the credential that served it). Nothing
+ * already visible in the collapsed row is repeated.
+ */
+function LogDetails({ log }: { log: ProxyLog }) {
+  const { t } = useI18n();
+  const items: Array<{ label: string; value: ReactNode }> = [];
+  if (log.upstream_request_id) {
+    items.push({
+      label: t("logsPage.upstreamRequestId"),
+      value: <code>{log.upstream_request_id}</code>,
+    });
+  }
+  if (log.reasoning_effort) {
+    items.push({
+      label: t("logsPage.reasoningEffort"),
+      value: (
+        <code>
+          {log.reasoning_effort}
+          {log.mapped_reasoning_effort ? ` → ${log.mapped_reasoning_effort}` : ""}
+        </code>
+      ),
+    });
+  }
+  if (log.session_key) {
+    items.push({
+      label: t("logsPage.detail.session"),
+      value: <code>{log.session_key}</code>,
+    });
+  }
+  // A failed attempt meters nothing; "0 / 0" would read like a model that
+  // answered with no tokens, so the split only appears when it means something.
+  if (log.prompt_tokens || log.completion_tokens) {
+    items.push({
+      label: t("logsPage.detail.tokenSplit"),
+      value: `${log.prompt_tokens ?? 0} / ${log.completion_tokens ?? 0}`,
+    });
+  }
+  if (log.cache_read_tokens || log.cache_creation_tokens) {
+    items.push({
+      label: t("common.cacheTokens"),
+      value: `${log.cache_read_tokens ?? 0} / ${log.cache_creation_tokens ?? 0}`,
+    });
+  }
+  if (log.stream && log.first_byte_ms) {
+    items.push({
+      label: t("common.firstByte"),
+      value: t("common.ms", { n: log.first_byte_ms }),
+    });
+  }
+  if (log.tokens_per_second) {
+    items.push({
+      label: t("logsPage.throughput"),
+      value: `${log.tokens_per_second.toFixed(1)} tok/s`,
+    });
+  }
+  if (log.cost != null) {
+    items.push({ label: t("common.cost"), value: formatCost(log.cost) });
+  }
+  if (log.key_fingerprint) {
+    items.push({
+      label: t("logsPage.detail.keyFingerprint"),
+      value: <code title={t("logsPage.detail.keyFingerprintHint")}>{log.key_fingerprint}</code>,
+    });
+  }
+  return (
+    <div className="log-details">
+      <strong className="log-details-head">{t("logsPage.detailTitle")}</strong>
+      <dl className="log-details-grid">
+        {items.map((item) => (
+          <Fragment key={item.label}>
+            <dt>{item.label}</dt>
+            <dd>{item.value}</dd>
+          </Fragment>
+        ))}
+      </dl>
+      {log.billing?.length ? <BillingDetails billing={log.billing} /> : null}
+    </div>
+  );
+}
+
+export function LogsView({
+  source,
+  caps,
+  member = false,
+}: {
+  source: LogsSource;
+  caps: LogsCapabilities;
+  /** A member sees their own requests: their entry points, not the gateway's. */
+  member?: boolean;
+}) {
+  const { t } = useI18n();
+  const [params, setParams] = useSearchParams();
+  const channelId = caps.upstream ? positiveId(params.get("channel_id")) : undefined;
+  const modelParam = params.get("model")?.trim() || "";
+  const failedOnly = params.get("status") === "failed";
+  const upstreamIdParam = caps.upstream ? params.get("upstream_request_id")?.trim() || "" : "";
+  const keyIdParam = positiveId(params.get("downstream_key_id"));
+  const [modelDraft, setModelDraft] = useState(modelParam);
+  const [upstreamIdDraft, setUpstreamIdDraft] = useState(upstreamIdParam);
+  const queryParam = params.get("q")?.trim() || "";
+  const [queryDraft, setQueryDraft] = useState(queryParam);
+  // How many rows one query pulls. The list paginates in the browser, so this is
+  // the window an operator can page through; 100 used to be the whole window,
+  // which is not enough when one incident spans a few hundred requests. It lives
+  // in the URL, so a shared link opens the same window.
+  const limitParam = Number(params.get("limit"));
+  const limit = (LOG_LIMITS as readonly number[]).includes(limitParam) ? limitParam : LOG_LIMITS[0];
+  const [slowOnly, setSlowOnly] = useState(false);
+  const [showExactFilters, setShowExactFilters] = useState(
+    Boolean(modelParam || upstreamIdParam || keyIdParam),
+  );
+  const [expandedRequest, setExpandedRequest] = useState<string | null>(null);
+  useEffect(() => setModelDraft(modelParam), [modelParam]);
+  useEffect(() => setUpstreamIdDraft(upstreamIdParam), [upstreamIdParam]);
+  useEffect(() => setQueryDraft(queryParam), [queryParam]);
+  const hasFilters = Boolean(
+    channelId ||
+    keyIdParam ||
+    modelParam ||
+    upstreamIdParam ||
+    queryParam ||
+    modelDraft ||
+    upstreamIdDraft ||
+    queryDraft ||
+    failedOnly ||
+    slowOnly,
+  );
+  const range = useUrlTimeRange(params, setParams);
+  const sample = histogramSample(Boolean(range.since || range.until));
+
+  const filters = useMemo(
+    () => ({
+      channel_id: channelId,
+      downstream_key_id: keyIdParam,
+      model: modelParam || undefined,
+      status: failedOnly ? ("failed" as const) : undefined,
+      upstream_request_id: upstreamIdParam || undefined,
+      q: queryParam || undefined,
+      since: range.since,
+      until: range.until,
+      limit,
+    }),
+    [
+      channelId,
+      keyIdParam,
+      failedOnly,
+      modelParam,
+      upstreamIdParam,
+      queryParam,
+      range.since,
+      range.until,
+      limit,
+    ],
+  );
 
   const logs = useQuery({
-    queryKey: ["proxy-logs", filters],
-    queryFn: ({ signal }) => service.proxyLogs(filters, signal),
+    queryKey: ["proxy-logs", filters, caps.upstream ? "admin" : "member"],
+    queryFn: ({ signal }) => source.logs(filters, signal),
   });
-  // AAH-style latency histogram: load once on mount and with manual refresh.
-  const loadHistogram = () => {
-    service
-      .proxyLogLatencyHistogram(1000)
-      .then(setHistogram)
-      .catch(() => undefined);
-  };
-  useEffect(() => {
-    loadHistogram();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // The distribution follows the same window as the list, so "what happened
+  // just now" and "what is slow" can never disagree about the time span.
+  const histogram = useQuery({
+    queryKey: [
+      "proxy-log-histogram",
+      { since: range.since, until: range.until, sample, scope: caps.upstream ? "admin" : "member" },
+    ],
+    // Sources provide the same histogram contract. A source without it
+    // retains time filters, but must not fabricate a distribution.
+    enabled: Boolean(source.latencyHistogram),
+    queryFn: ({ signal }) =>
+      source.latencyHistogram!(sample, signal, {
+        since: range.since,
+        until: range.until,
+      }),
+  });
   const channels = useQuery({
-    queryKey: ["channels"],
-    queryFn: ({ signal }) => service.channels(signal),
+    queryKey: ["channels", caps.upstream ? "admin" : "member"],
+    queryFn: ({ signal }) => (source.channels ? source.channels(signal) : Promise.resolve([])),
   });
   const channelName = useMemo(() => {
     const map = new Map<number, string>();
@@ -183,50 +637,25 @@ function ProxyLogsPanel() {
     }
     return map;
   }, [channels.data]);
-
-  // Downstream-key pricing: per-1k prompt/completion unit prices set on the
-  // key that issued the request. Used to render a per-log cost column.
+  // Client tokens: a log row stores the id, so both the filter label and the
+  // expanded "which token was this" line need the name from the token list.
   const keys = useQuery({
-    queryKey: ["keys"],
-    queryFn: ({ signal }) => service.keys(signal),
+    queryKey: ["keys", caps.upstream ? "admin" : "member"],
+    queryFn: ({ signal }) => source.keys(signal),
   });
-	const priceMap = useMemo(() => {
-		const map = new Map<
-			number,
-			{ prompt: number; completion: number; cache: number }
-		>();
-		for (const k of keys.data ?? []) {
-			if (k.price_prompt_per_1k || k.price_completion_per_1k || k.price_cache_per_1k) {
-				map.set(k.id, {
-					prompt: k.price_prompt_per_1k ?? 0,
-					completion: k.price_completion_per_1k ?? 0,
-					cache: k.price_cache_per_1k ?? 0,
-				});
-			}
-		}
-		return map;
-	}, [keys.data]);
-	const logCost = (log: ProxyLog): number | null => {
-		if (log.downstream_key_id == null) return null;
-		const price = priceMap.get(log.downstream_key_id);
-		if (!price) return null;
-		return logCostUsd({
-			promptTokens: log.prompt_tokens ?? 0,
-			completionTokens: log.completion_tokens ?? 0,
-			cacheReadTokens: log.cache_read_tokens ?? 0,
-			pricePromptPer1k: price.prompt,
-			priceCompletionPer1k: price.completion,
-			priceCachePer1k: price.cache,
-		});
-	};
+  const keyName = useMemo(() => {
+    const map = new Map<number, string>();
+    for (const key of keys.data ?? []) {
+      map.set(key.id, key.name);
+    }
+    return map;
+  }, [keys.data]);
 
   const rows = logs.data ?? [];
-  const pagination = useClientPagination(
-    slowOnly ? rows.filter((log) => log.latency_ms >= 5000) : rows,
-    20,
-  );
+  const visibleRows = slowOnly ? rows.filter((log) => log.latency_ms >= 5000) : rows;
+  const pagination = useClientPagination(visibleRows, 20);
   const pageRows = pagination.pageItems;
-  const failedCount = rows.filter((log) => log.status >= 400).length;
+  const failedCount = visibleRows.filter((log) => log.status >= 400).length;
 
   // Rows are newest-first; a row was retried when a newer row of the same
   // request carries a higher attempt number.
@@ -256,168 +685,404 @@ function ProxyLogsPanel() {
     setParams(next, { replace: true });
   };
 
+  // One definition for both entry points (the Clear button and the
+  // filtered-empty state), so the two can never drift apart.
+  const clearFilters = () => {
+    setModelDraft("");
+    setUpstreamIdDraft("");
+    setQueryDraft("");
+    setSlowOnly(false);
+    setFilter({
+      channel_id: null,
+      downstream_key_id: null,
+      model: null,
+      status: null,
+      upstream_request_id: null,
+      q: null,
+    });
+  };
+
+  const histogramData = histogram.data;
+  const sampled = histogramData?.total ?? 0;
+  const slowShare = sampled > 0 ? (histogramData?.slow_count ?? 0) / sampled : 0;
+  const maxBucket = Math.max(1, ...(histogramData?.buckets ?? [1]));
+  // Older gateways omit matched/p99; treat them as "the sample is the window".
+  const matched = histogramData?.matched ?? sampled;
+  const p50 = histogramData?.p50_ms ?? 0;
+  const p95 = histogramData?.p95_ms ?? 0;
+  const p99 = histogramData?.p99_ms ?? 0;
+
+  /**
+   * Export exactly what the current filters matched (not just the visible
+   * page) — the usual reason to open this page is to hand the evidence to
+   * someone else.
+   */
+  const exportCSV = () => {
+    const header = [
+      t("common.time"),
+      t("common.model"),
+      ...(caps.upstream ? [t("common.route"), t("common.channel")] : []),
+      t("common.status"),
+      t("logsPage.reasoningEffort"),
+      t("common.tokens"),
+      t("common.cacheTokens"),
+      t("common.latency"),
+      t("common.firstByte"),
+      t("common.cost"),
+      t("common.clientFamily"),
+      ...(caps.upstream ? [t("logsPage.upstreamRequestId")] : []),
+      "request_id",
+      ...(caps.upstream ? [t("logsPage.errorDetail")] : []),
+    ];
+    const body = visibleRows.map((log) => [
+      log.created_at,
+      log.model,
+      ...(caps.upstream
+        ? [log.route_pattern || "", channelName.get(log.channel_id) ?? `#${log.channel_id}`]
+        : []),
+      log.status,
+      log.reasoning_effort ?? "",
+      log.total_tokens ?? 0,
+      `${log.cache_read_tokens ?? 0}/${log.cache_creation_tokens ?? 0}`,
+      log.latency_ms,
+      log.first_byte_ms ?? "",
+      log.cost ?? "",
+      log.client_family ?? "",
+      ...(caps.upstream ? [log.upstream_request_id ?? ""] : []),
+      log.request_id,
+      ...(caps.upstream ? [log.error_detail ?? log.error_brief ?? ""] : []),
+    ]);
+    downloadText(timestampedName("meta-gateway-logs", "csv"), toCSV([header, ...body]));
+  };
+
   return (
     <>
-      <div
-        className="toolbar log-filter-toolbar"
-        style={{ marginBottom: 12, flexWrap: "wrap", gap: 8 }}
-      >
-        <div className="log-filter-switches">
-          <label className="check marginless">
-            <input
-              type="checkbox"
-              checked={failedOnly}
-              onChange={(e) =>
-                setFilter({ status: e.target.checked ? "failed" : null })
-              }
-            />
-            <span>{t("logsPage.failedOnly")}</span>
-          </label>
-          <label className="check marginless">
-            <input
-              type="checkbox"
-              checked={slowOnly}
-              onChange={(e) => setSlowOnly(e.target.checked)}
-            />
-            <span>{t("logsPage.slowOnly")}</span>
-          </label>
-        </div>
-        <Button
-          variant="secondary"
-          icon={<RefreshCw size={16} />}
-          onClick={() => {
-            void logs.refetch();
-            loadHistogram();
-          }}
-        >
-          {t("common.refresh")}
-        </Button>
-      </div>
-      <TelemetryStrip
-        items={[
-          {
-            label: t("logsPage.stat.shown"),
-            value: logs.isPending ? "—" : rows.length,
-            tone: "primary",
-          },
-          {
-            label: t("logsPage.stat.failed"),
-            value: logs.isPending ? "—" : failedCount,
-            tone: "danger",
-          },
-          {
-            label: t("logsPage.stat.failRate"),
-            value:
-              logs.isPending || rows.length === 0
-                ? "—"
-                : `${Math.round((failedCount / rows.length) * 100)}%`,
-            tone: rows.length === 0 || failedCount / Math.max(1, rows.length) < 0.05 ? "success" : "warning",
-          },
-        ]}
-      />
-
-      {histogram ? (
-        <div className="latency-histogram">
-          <div className="latency-histogram-head">
-            <strong>{t("logsPage.histogram")}</strong>
-            <span className="is-quiet">
-              {t("logsPage.histogramStats", {
-                total: histogram.total,
-                slow: histogram.slow_count,
-                p50: histogram.p50_ms,
-                p95: histogram.p95_ms,
-              })}
-            </span>
-          </div>
-          <div
-            className={`latency-histogram-bars${histogram.total === 0 ? " is-empty" : ""}`}
+      {/* 读数条先行：这一页现在有多少条、错了几条，是打开页面第一个问题。 */}
+      <div className="logs-overview">
+        <TelemetryStrip
+          items={[
+            {
+              label: t("logsPage.stat.shown"),
+              value: logs.isPending ? "—" : visibleRows.length,
+              tone: "primary",
+            },
+            {
+              label: t("logsPage.stat.failed"),
+              value: logs.isPending ? "—" : failedCount,
+              tone: "danger",
+            },
+            {
+              label: t("logsPage.stat.failRate"),
+              value:
+                logs.isPending || visibleRows.length === 0
+                  ? "—"
+                  : `${Math.round((failedCount / visibleRows.length) * 100)}%`,
+              tone:
+                visibleRows.length === 0 || failedCount / Math.max(1, visibleRows.length) < 0.05
+                  ? "success"
+                  : "warning",
+            },
+            // The two figures a member actually reconciles: what this page of
+            // requests cost, and how long it took. Both are computed over the
+            // rows on screen and labelled as such — a range total would be a
+            // different number, and the strip must not imply it has one.
+            ...(caps.pricing
+              ? [
+                  {
+                    label: t("logsPage.stat.cost"),
+                    value: logs.isPending
+                      ? "—"
+                      : formatCost(visibleRows.reduce((sum, row) => sum + (row.cost ?? 0), 0)),
+                    tone: "info" as const,
+                  },
+                ]
+              : []),
+            {
+              label: t("logsPage.stat.avgLatency"),
+              value:
+                logs.isPending || visibleRows.length === 0
+                  ? "—"
+                  : `${Math.round(
+                      visibleRows.reduce((sum, row) => sum + (row.latency_ms ?? 0), 0) /
+                        visibleRows.length,
+                    )} ms`,
+              tone: "primary",
+            },
+          ]}
+        />
+        <div className="logs-overview-actions">
+          <Button
+            variant="secondary"
+            icon={<Download size={15} />}
+            disabled={visibleRows.length === 0}
+            onClick={exportCSV}
           >
-            {histogram.buckets.map((count, index) => {
-              const max = Math.max(...histogram.buckets, 1);
-              const slow = index >= 6; // buckets 6+ = >= 5s
-              return (
+            {t("logsPage.export")}
+          </Button>
+          <Button
+            variant="secondary"
+            icon={<RefreshCw size={16} className={logs.isFetching ? "spin" : ""} />}
+            onClick={() => {
+              // Re-anchor a rolling window first: "刷新" means "show me the
+              // latest", and refetching with the window as of the last minute
+              // tick would leave a request made a second ago outside it — the
+              // button would look dead exactly when the operator just sent
+              // something. Re-anchoring moves the query keys, so the fetch
+              // follows; only a window that CANNOT move (a custom range, or "all
+              // time") needs the forced fetch.
+              range.refresh();
+              if (!range.rolling) {
+                void logs.refetch();
+                if (source.latencyHistogram) void histogram.refetch();
+              }
+            }}
+          >
+            {t("common.refresh")}
+          </Button>
+        </div>
+      </div>
+
+      {/* 延迟分布 — 一等公民面板，紧跟读数条（原为页面底部的折叠条）。 */}
+      <Panel className="latency-panel">
+        <div className="panel-header latency-panel-header">
+          <div className="cockpit-panel-title">
+            <Timer size={14} />
+            <strong>
+              {t(source.latencyHistogram ? "logsPage.histogram" : "logsPage.timeWindow")}
+            </strong>
+          </div>
+          <span className="panel-muted latency-panel-scope">
+            {/* A bounded window is already spelled out by the picker's own
+                caption; only the unbounded case needs a sample note. */}
+            {!source.latencyHistogram || range.since || range.until
+              ? null
+              : t(caps.upstream ? "logsPage.histogramScope" : "logsPage.memberHistogramScope", {
+                  n: sample.toLocaleString(),
+                })}
+          </span>
+          <TimeRangePicker
+            range={range}
+            compact
+            onRefresh={() => {
+              void logs.refetch();
+              if (source.latencyHistogram) void histogram.refetch();
+            }}
+          />
+        </div>
+        {!source.latencyHistogram ? null : histogram.isPending ? (
+          <p className="dashboard-empty">{t("common.working")}</p>
+        ) : histogram.isError ? (
+          <ErrorState error={histogram.error} retry={() => void histogram.refetch()} />
+        ) : !histogramData || histogramData.total === 0 ? (
+          <p className="dashboard-empty">{t("logsPage.histogramEmpty")}</p>
+        ) : (
+          <>
+            <div
+              className="latency-histogram-bars"
+              role="img"
+              aria-label={t("logsPage.histogramStats", {
+                total: histogramData.total,
+                slow: histogramData.slow_count,
+                p50,
+                p95,
+                p99,
+              })}
+            >
+              {histogramData.buckets.map((count, index) => (
                 <div
                   key={index}
-                  className={`latency-histogram-bar${slow ? " is-slow" : ""}`}
-                  style={{ height: `${Math.max(4, (count / max) * 100)}%` }}
-                  title={`${count} 次`}
+                  className={`latency-histogram-bar${
+                    index >= HISTOGRAM_SLOW_FROM ? " is-slow" : ""
+                  }`}
+                  style={{ height: `${Math.max(4, (count / maxBucket) * 100)}%` }}
+                  title={t("logsPage.histogramBucket", {
+                    n: count,
+                    share: `${((count / Math.max(1, histogramData.total)) * 100).toFixed(1)}%`,
+                  })}
                 />
-              );
-            })}
-          </div>
-          <div className="latency-histogram-labels">
-            {["<0.25s", "0.5s", "1s", "2s", "3s", "5s", "8s", "13s", "21s", "34s", "34s+"].map(
-              (label, index) => (
+              ))}
+            </div>
+            <div className="latency-histogram-labels">
+              {HISTOGRAM_LABELS.map((label, index) => (
                 <span key={index}>{label}</span>
-              ),
-            )}
-          </div>
-        </div>
-      ) : null}
+              ))}
+            </div>
+            <div className="latency-readouts">
+              <div className="latency-readout">
+                <span>{t("logsPage.stat.total")}</span>
+                <strong>{histogramData.total.toLocaleString()}</strong>
+              </div>
+              <div className="latency-readout">
+                <span>{t("logsPage.stat.slow")}</span>
+                <strong>{histogramData.slow_count.toLocaleString()}</strong>
+              </div>
+              <div className={`latency-readout${slowShare >= 0.05 ? " is-warn" : ""}`}>
+                <span>{t("logsPage.histogramSlowShare")}</span>
+                <strong>{(slowShare * 100).toFixed(1)}%</strong>
+              </div>
+              <div className="latency-readout">
+                <span>p50</span>
+                <strong>{p50} ms</strong>
+              </div>
+              <div className="latency-readout">
+                <span>p95</span>
+                <strong>{p95} ms</strong>
+              </div>
+              <div className="latency-readout">
+                <span>p99</span>
+                <strong>{p99} ms</strong>
+              </div>
+              <div className="latency-readout is-coverage">
+                <span>{t("logsPage.coverage")}</span>
+                <strong>
+                  {matched <= sampled
+                    ? t("logsPage.histogramCovered", {
+                        matched: matched.toLocaleString(),
+                      })
+                    : t("logsPage.histogramCoverage", {
+                        matched: matched.toLocaleString(),
+                        sample: sampled.toLocaleString(),
+                      })}
+                </strong>
+              </div>
+            </div>
+            <p className="latency-panel-hint">{t("logsPage.rangeScope")}</p>
+          </>
+        )}
+      </Panel>
 
       <div className="logs-split">
         <Panel className="ops-list-panel">
-          <div className="filter-bar log-filter-bar">
-            <select
-              aria-label={t("ops.filterChannel")}
-              value={channelId ?? 0}
-              onChange={(e) => {
-                const value = Number(e.target.value);
-                setFilter({
-                  channel_id: value > 0 ? String(value) : null,
-                });
-              }}
-            >
-              <option value={0}>{t("ops.allChannels")}</option>
-              {(channels.data ?? []).map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name}
-                </option>
-              ))}
-            </select>
-			<input
-				value={modelDraft}
-				placeholder={t("common.model")}
-				onChange={(e) => setModelDraft(e.target.value)}
-				onKeyDown={(e) => {
-					if (e.key === "Enter") {
-						setFilter({ model: modelDraft.trim() || null });
-					}
-				}}
-			/>
-			<input
-				value={upstreamIdDraft}
-				placeholder={t("logsPage.upstreamRequestId")}
-				onChange={(e) => setUpstreamIdDraft(e.target.value)}
-				onKeyDown={(e) => {
-					if (e.key === "Enter") {
-						setFilter({ upstream_request_id: upstreamIdDraft.trim() || null });
-					}
-				}}
-			/>
+          <form
+            className="filter-bar log-filter-bar"
+            onSubmit={(event) => {
+              event.preventDefault();
+              setFilter({
+                model: modelDraft.trim() || null,
+                q: queryDraft.trim() || null,
+                upstream_request_id: upstreamIdDraft.trim() || null,
+              });
+            }}
+          >
+            {caps.upstream ? (
+              <select
+                aria-label={t("logsPage.loadLimit")}
+                value={limit}
+                onChange={(e) => setFilter({ limit: e.target.value })}
+              >
+                {LOG_LIMITS.map((value) => (
+                  <option key={value} value={value}>
+                    {t("logsPage.loadLimitOption", { count: value })}
+                  </option>
+                ))}
+              </select>
+            ) : null}
+            {caps.upstream ? (
+              <select
+                aria-label={t("ops.filterChannel")}
+                value={channelId ?? 0}
+                onChange={(e) => {
+                  const value = Number(e.target.value);
+                  setFilter({
+                    channel_id: value > 0 ? String(value) : null,
+                  });
+                }}
+              >
+                <option value={0}>{t("ops.allChannels")}</option>
+                {(channels.data ?? []).map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            ) : null}
+            <input
+              className="log-search-input"
+              aria-label={t("logsPage.search")}
+              value={queryDraft}
+              placeholder={t("logsPage.search")}
+              onChange={(e) => setQueryDraft(e.target.value)}
+            />
             <Button
               variant="secondary"
-              onClick={() => setFilter({ model: modelDraft.trim() || null })}
+              icon={<SlidersHorizontal size={14} />}
+              aria-expanded={showExactFilters}
+              aria-controls="proxy-log-exact-filters"
+              onClick={() => setShowExactFilters((value) => !value)}
             >
+              {t("logsPage.moreFilters")}
+            </Button>
+            <Button variant="secondary" type="submit">
               {t("common.apply")}
             </Button>
-			{(channelId || modelParam || upstreamIdParam || !failedOnly) && (
-				<Button
-					variant="quiet"
-					onClick={() => {
-						setModelDraft("");
-						setUpstreamIdDraft("");
-						setFilter({
-							channel_id: null,
-							model: null,
-							status: null,
-							upstream_request_id: null,
-						});
-					}}
-              >
+            {hasFilters && (
+              <Button variant="quiet" onClick={clearFilters}>
                 {t("common.clearFilters")}
               </Button>
             )}
+            <div
+              className="log-exact-filters"
+              id="proxy-log-exact-filters"
+              hidden={!showExactFilters}
+            >
+              <input
+                value={modelDraft}
+                aria-label={t("common.model")}
+                placeholder={t("common.model")}
+                onChange={(e) => setModelDraft(e.target.value)}
+              />
+              {caps.upstream ? (
+                <input
+                  value={upstreamIdDraft}
+                  aria-label={t("logsPage.upstreamRequestId")}
+                  placeholder={t("logsPage.upstreamRequestId")}
+                  onChange={(e) => setUpstreamIdDraft(e.target.value)}
+                />
+              ) : null}
+              <select
+                aria-label={t("logsPage.token")}
+                value={keyIdParam ?? 0}
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  setFilter({ downstream_key_id: value > 0 ? String(value) : null });
+                }}
+              >
+                <option value={0}>{t("logsPage.filterAllTokens")}</option>
+                {/* A filter pointing at a token that no longer exists must stay
+				    visible: silently dropping it back to "all" would show other
+				    tokens' rows under a filter the user still sees in the URL. */}
+                {keyIdParam && !keyName.has(keyIdParam) ? (
+                  <option value={keyIdParam}>
+                    {t("logsPage.filterMissingToken", { id: keyIdParam })}
+                  </option>
+                ) : null}
+                {(keys.data ?? []).map((key) => (
+                  <option key={key.id} value={key.id}>
+                    {key.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </form>
+          <div className="log-quick-filters">
+            <div className="log-filter-switches">
+              <label className="check marginless">
+                <input
+                  type="checkbox"
+                  checked={failedOnly}
+                  onChange={(e) => setFilter({ status: e.target.checked ? "failed" : null })}
+                />
+                <span>{t("logsPage.failedOnly")}</span>
+              </label>
+              <label className="check marginless">
+                <input
+                  type="checkbox"
+                  checked={slowOnly}
+                  onChange={(e) => setSlowOnly(e.target.checked)}
+                />
+                <span>{t("logsPage.slowOnly")}</span>
+              </label>
+            </div>
           </div>
 
           <EntityState
@@ -426,24 +1091,47 @@ function ProxyLogsPanel() {
             error={logs.error}
             isEmpty={!rows.length}
             empty={
-              <EmptyHero
-                kicker={t("logsPage.emptyKicker")}
-                title={t("logsPage.emptyTitle")}
-                body={t("logsPage.empty")}
-                actions={
-                  <>
-						<Link className="button button-primary" to="/channels">
-							{t("logsPage.ctaChannels")}
-						</Link>
-                    <Link
-                      className="button button-secondary"
-                      to="/keys?create=1"
-                    >
-                      {t("logsPage.ctaKeys")}
-                    </Link>
-                  </>
-                }
-              />
+              hasFilters ? (
+                // "No proxy traffic yet" would be a lie here: rows exist, they
+                // just do not match. Say which one it is, and offer the exit.
+                <EmptyHero
+                  kicker={t("logsPage.emptyFilteredKicker")}
+                  title={t("logsPage.emptyFilteredTitle")}
+                  body={t("logsPage.emptyFiltered")}
+                  actions={
+                    <Button variant="secondary" onClick={clearFilters}>
+                      {t("common.clearFilters")}
+                    </Button>
+                  }
+                />
+              ) : (
+                <EmptyHero
+                  kicker={t("logsPage.emptyKicker")}
+                  title={t("logsPage.emptyTitle")}
+                  body={t("logsPage.empty")}
+                  actions={
+                    member ? (
+                      <>
+                        <Link className="button button-primary" to="/keys?create=1">
+                          {t("logsPage.ctaMemberToken")}
+                        </Link>
+                        <Link className="button button-secondary" to="/workbench">
+                          {t("logsPage.ctaWorkbench")}
+                        </Link>
+                      </>
+                    ) : (
+                      <>
+                        <Link className="button button-primary" to="/channels">
+                          {t("logsPage.ctaChannels")}
+                        </Link>
+                        <Link className="button button-secondary" to="/keys?create=1">
+                          {t("logsPage.ctaKeys")}
+                        </Link>
+                      </>
+                    )
+                  }
+                />
+              )
             }
             retry={() => logs.refetch()}
           >
@@ -463,147 +1151,204 @@ function ProxyLogsPanel() {
                 />
               }
             >
-							<DataTable
-								headers={[
-									t("common.time"),
-									t("common.model"),
-									t("logsPage.reasoningEffort"),
-									t("common.route"),
-									t("common.channel"),
-									t("common.status"),
-									t("common.tokens"),
-									t("common.cacheTokens"),
-									t("common.latency"),
-									t("common.firstByte"),
-									t("common.cost"),
-									t("common.clientFamily"),
-								]}
-							>
-								{pageRows.map((log) => {
-									return (
-										<Fragment key={log.id}>
-										<tr
-											className={`${log.status >= 400 ? "row-failed" : ""} log-row-clickable${expandedRequest === log.request_id ? " is-expanded" : ""}`}
-									onClick={() =>
-										setExpandedRequest((current) =>
-											current === log.request_id ? null : log.request_id,
-										)
-									}
-									title={t("logsPage.decisionHint")}
-								>
-									<td>{formatDate(log.created_at)}</td>
-									<td>
-										<strong className="log-model-name">{log.model}</strong>
-										<small className="mono">{log.request_id}</small>
-									</td>
-									<td>
-										{log.reasoning_effort ? (
-											<code className="log-effort">
-												{log.reasoning_effort}
-											</code>
-										) : (
-											"—"
-										)}
-									</td>
-									<td>
-										{log.route_id ? (
-											<Link
-												to={`/models?model=${encodeURIComponent(
-													log.route_pattern ?? "",
-												)}`}
-												title={log.route_pattern || undefined}
-											>
-												<code>#{log.route_id}</code>
-											</Link>
-										) : (
-											"—"
-										)}
-									</td>
-									<td>
-										<Link
-											to={`/channels?id=${log.channel_id}`}
-											title={t("logsPage.openConnection")}
-										>
-											{channelName.get(log.channel_id) ??
-												`#${log.channel_id}`}
-										</Link>
-									</td>
-									<td className="log-status-cell">
-										<span className="log-status-line">
-											<span className={`log-status-light${log.status >= 400 ? " is-bad" : log.status >= 300 ? " is-warn" : " is-ok"}`} aria-hidden="true" />
-											<StatusBadge
-												value={
-													log.status >= 400 ? "failed" : String(log.status)
-												}
-											/>
-											{log.error_brief ? (
-												<span
-													className="log-error-label"
-													title={log.error_brief}
-												>
-													{errorLabel(log.error_brief)}
-												</span>
-											) : null}
-											{retriedRowIds.has(log.id) ? (
-												<span
-													className="log-retry-mark"
-													title={t("logsPage.retried")}
-												>
-													{t("logsPage.retried")}
-												</span>
-											) : null}
-										</span>
-									</td>
-									<td>{log.total_tokens ? log.total_tokens : "—"}</td>
-									<td>
-										{log.cache_read_tokens || log.cache_creation_tokens
-											? `${log.cache_read_tokens ?? 0} / ${log.cache_creation_tokens ?? 0}`
-											: "—"}
-									</td>
-									<td className="log-latency-cell">
-										<span className="log-latency-bar" aria-hidden="true">
-											<span
-												className={log.latency_ms >= 5000 ? "is-slow" : log.latency_ms >= 1000 ? "is-warn" : ""}
-												style={{ transform: `scaleX(${Math.min(1, Math.max(0.06, log.latency_ms / 10000))})` }}
-											/>
-										</span>
-										{t("common.ms", { n: log.latency_ms })}
-									</td>
-									<td>
-										{log.stream && log.first_byte_ms
-											? t("common.ms", { n: log.first_byte_ms })
-											: "—"}
-									</td>
-									<td className="log-cost">
-										{logCost(log) != null ? formatCost(logCost(log)!) : "—"}
-									</td>
-									<td>{log.client_family || "—"}</td>
-									</tr>
-										{expandedRequest === log.request_id ? (
-											<tr className="log-decision-row">
-												<td colSpan={12}>
-													<div className="log-expand-grid">
-														{log.error_detail ? (
-															<div className="log-error-detail">
-																<div className="log-error-detail-head">
-																	<strong>{t("logsPage.errorDetail")}</strong>
-																	<code>HTTP {log.status}</code>
-																</div>
-																<pre>{log.error_detail}</pre>
-															</div>
-														) : null}
-														<DecisionSnapshotView
-															requestId={log.request_id}
-															attempt={log.attempt}
-														/>
-													</div>
-												</td>
-											</tr>
-										) : null}
-										</Fragment>
-									);
-								})}
-							</DataTable>
+              <DataTable
+                headers={[
+                  t("common.time"),
+                  t("common.model"),
+                  t("logsPage.reasoningEffort"),
+                  // The operator's view of a row: which route and which
+                  // channel served it, and what it cost. A member sees their
+                  // own requests — the same table without the site's internals.
+                  ...(caps.upstream ? [t("common.route"), t("common.channel")] : []),
+                  t("common.status"),
+                  t("common.tokens"),
+                  t("common.cacheTokens"),
+                  t("common.latency"),
+                  t("common.firstByte"),
+                  ...(caps.pricing ? [t("common.cost")] : []),
+                  t("common.clientFamily"),
+                ]}
+              >
+                {pageRows.map((log) => {
+                  return (
+                    <Fragment key={log.id}>
+                      <tr
+                        className={`${log.status >= 400 ? "row-failed" : ""} log-row-clickable${expandedRequest === log.request_id ? " is-expanded" : ""}`}
+                        onClick={() =>
+                          setExpandedRequest((current) =>
+                            current === log.request_id ? null : log.request_id,
+                          )
+                        }
+                        title={t("logsPage.decisionHint")}
+                      >
+                        <td>{formatDate(log.created_at)}</td>
+                        <td>
+                          <strong className="log-model-name" title={log.model}>
+                            {log.model}
+                          </strong>
+                          {log.upstream_model &&
+                          log.upstream_model !== log.model &&
+                          caps.upstream ? (
+                            // Shared aliases: one client-facing name served by
+                            // several real upstream models. Without this the row
+                            // cannot be attributed after the fact.
+                            <span
+                              className="log-upstream-model"
+                              title={t("logsPage.upstreamModelHint")}
+                            >
+                              {t("routing.memberOrigin", {
+                                model: log.upstream_model,
+                              })}
+                            </span>
+                          ) : null}
+                          <small className="mono" title={log.request_id}>
+                            {log.request_id}
+                          </small>
+                        </td>
+                        <td>
+                          {log.reasoning_effort ? (
+                            <code className="log-effort">{log.reasoning_effort}</code>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        {caps.upstream ? (
+                          <td>
+                            {log.route_id ? (
+                              <Link
+                                to={`/models?model=${encodeURIComponent(log.route_pattern ?? "")}`}
+                                title={log.route_pattern || undefined}
+                              >
+                                <code>#{log.route_id}</code>
+                              </Link>
+                            ) : (
+                              "—"
+                            )}
+                          </td>
+                        ) : null}
+                        {caps.upstream ? (
+                          <td>
+                            <Link
+                              to={`/channels?id=${log.channel_id}`}
+                              title={t("logsPage.openConnection")}
+                            >
+                              {channelName.get(log.channel_id) ?? `#${log.channel_id}`}
+                            </Link>
+                            {/* The endpoint this attempt actually called. It differs from the
+										    client path whenever a channel endpoint override/map or a
+										    custom-path passthrough relocated the request, and it is the
+										    only place that shows a per-model retarget. */}
+                            {log.upstream_url ? (
+                              <small
+                                className="mono log-upstream-url"
+                                title={t("logsPage.upstreamUrlHint")}
+                              >
+                                {log.upstream_url}
+                              </small>
+                            ) : null}
+                          </td>
+                        ) : null}
+                        <td className="log-status-cell">
+                          <span className="log-status-line">
+                            <span
+                              className={`log-status-light${log.status >= 400 ? " is-bad" : log.status >= 300 ? " is-warn" : " is-ok"}`}
+                              aria-hidden="true"
+                            />
+                            <StatusBadge
+                              value={log.status >= 400 ? "failed" : String(log.status)}
+                            />
+                            {log.error_brief ? (
+                              <span className="log-error-label" title={log.error_brief}>
+                                {errorLabel(log.error_brief)}
+                              </span>
+                            ) : null}
+                            {retriedRowIds.has(log.id) ? (
+                              <span className="log-retry-mark" title={t("logsPage.retried")}>
+                                {t("logsPage.retried")}
+                              </span>
+                            ) : null}
+                          </span>
+                        </td>
+                        <td>{log.total_tokens ? log.total_tokens : "—"}</td>
+                        <td>
+                          {log.cache_read_tokens || log.cache_creation_tokens
+                            ? `${log.cache_read_tokens ?? 0} / ${log.cache_creation_tokens ?? 0}`
+                            : "—"}
+                        </td>
+                        <td className="log-latency-cell">
+                          {/* A zero-latency attempt (a failure before any wait) drew
+										    the empty track as a stray grey line. */}
+                          {log.latency_ms > 0 ? (
+                            <span
+                              className="log-latency-bar"
+                              aria-hidden="true"
+                              title={t("logsPage.latencyBarHint", {
+                                n: log.latency_ms,
+                                pct: Math.round(latencyShare(log.latency_ms) * 100),
+                              })}
+                            >
+                              <span
+                                className={
+                                  log.latency_ms >= 5000
+                                    ? "is-slow"
+                                    : log.latency_ms >= 1000
+                                      ? "is-warn"
+                                      : ""
+                                }
+                                style={{ transform: `scaleX(${latencyShare(log.latency_ms)})` }}
+                              />
+                            </span>
+                          ) : null}
+                          {t("common.ms", { n: log.latency_ms })}
+                        </td>
+                        <td className="log-ttfb-cell">
+                          {log.stream && log.first_byte_ms
+                            ? t("common.ms", { n: log.first_byte_ms })
+                            : "—"}
+                        </td>
+                        {caps.pricing ? (
+                          <td className="log-cost">
+                            {log.cost != null ? formatCost(log.cost) : "—"}
+                          </td>
+                        ) : null}
+                        <td>{log.client_family || "—"}</td>
+                      </tr>
+                      {expandedRequest === log.request_id ? (
+                        <tr className="log-decision-row">
+                          <td colSpan={caps.upstream ? 12 : caps.pricing ? 11 : 10}>
+                            <div className="log-expand">
+                              {/* Where the request came from and where it went, before the
+													    forensics: "who called, through what" is what an
+													    operator asks first about a row they do not recognise. */}
+                              {caps.upstream ? (
+                                <LogChain log={log} channelName={channelName} keyName={keyName} />
+                              ) : null}
+                              <div className="log-expand-grid">
+                                {log.error_detail ? (
+                                  <div className="log-error-detail">
+                                    <div className="log-error-detail-head">
+                                      <strong>{t("logsPage.errorDetail")}</strong>
+                                      <code>HTTP {log.status}</code>
+                                    </div>
+                                    <pre>{log.error_detail}</pre>
+                                  </div>
+                                ) : null}
+                                <LogDetails log={log} />
+                                {caps.decision ? (
+                                  <DecisionSnapshotView
+                                    requestId={log.request_id}
+                                    attempt={log.attempt}
+                                  />
+                                ) : null}
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      ) : null}
+                    </Fragment>
+                  );
+                })}
+              </DataTable>
             </ListShell>
           </EntityState>
         </Panel>
@@ -613,18 +1358,41 @@ function ProxyLogsPanel() {
 }
 
 export function Logs() {
+  const { client, role } = useSession();
   const { t } = useI18n();
+  const member = role === "member";
+  const service = useMemo(() => api(client!), [client]);
+  // One binding per role: staff see every upstream view, a member sees their
+  // own requests through the member source. The tab list below is filtered to
+  // match, because the discovery and audit panels are the gateway's business.
+  const source = useMemo<LogsSource>(
+    () =>
+      member
+        ? memberLogsSource
+        : {
+            logs: (filters, signal) => service.proxyLogs(filters, signal),
+            latencyHistogram: (sample, signal, window) =>
+              service.proxyLogLatencyHistogram(sample, signal, window),
+            channels: (signal) => service.channels(signal),
+            keys: (signal) => service.keys(signal) as never,
+            decisionSnapshot: (requestId, attempt, signal) =>
+              service.decisionSnapshot(requestId, attempt, signal),
+          },
+    [member, service],
+  );
   const [params, setParams] = useSearchParams();
   const rawTab = params.get("tab");
   const tabItems = [
     { value: "proxy", label: t("logsPage.tab.proxy") },
-    { value: "live", label: t("logsPage.tab.live"), icon: <MessagesSquare size={14} /> },
-    { value: "discovery", label: t("logsPage.tab.discovery") },
-    { value: "audit", label: t("logsPage.tab.audit") },
+    ...(member
+      ? []
+      : [
+          { value: "live", label: t("logsPage.tab.live"), icon: <MessagesSquare size={14} /> },
+          { value: "discovery", label: t("logsPage.tab.discovery") },
+          { value: "audit", label: t("logsPage.tab.audit") },
+        ]),
   ];
-  const active = tabItems.some((item) => item.value === rawTab)
-    ? (rawTab as string)
-    : "proxy";
+  const active = tabItems.some((item) => item.value === rawTab) ? (rawTab as string) : "proxy";
 
   const changeTab = (value: string) => {
     const next = new URLSearchParams(params);
@@ -641,13 +1409,18 @@ export function Logs() {
 
   return (
     <Page
-      kicker={t("logsPage.kicker")}
       title={t("logsPage.title")}
-      description={t("logsPage.hubDescription")}
+      description={t(member ? "logsPage.memberDescription" : "logsPage.hubDescription")}
     >
       <div className="ops-canvas">
         <Tabs items={tabItems} active={active} onChange={changeTab} />
-        {active === "proxy" ? <ProxyLogsPanel /> : null}
+        {active === "proxy" ? (
+          <LogsView
+            source={source}
+            caps={member ? MEMBER_LOG_CAPS : ADMIN_LOG_CAPS}
+            member={member}
+          />
+        ) : null}
         {active === "live" ? <LiveTracePanel /> : null}
         {active === "discovery" ? <DiscoveryPanel /> : null}
         {active === "audit" ? <AuditPanel /> : null}

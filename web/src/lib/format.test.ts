@@ -1,73 +1,30 @@
-import { describe, expect, it } from "vitest";
-import { logCostUsd } from "./format";
-
-describe("logCostUsd", () => {
-  it("bills cache-read at prompt price when no cache price configured", () => {
-    const cost = logCostUsd({
-      promptTokens: 1000,
-      completionTokens: 500,
-      cacheReadTokens: 300,
-      pricePromptPer1k: 1,
-      priceCompletionPer1k: 2,
-    });
-    // uncached 700/1000*1 + cache 300/1000*1 + completion 500/1000*2
-    expect(cost).toBeCloseTo(0.7 + 0.3 + 1.0);
-  });
-
-  it("bills cache-read at its own price when configured", () => {
-    const cost = logCostUsd({
-      promptTokens: 1000,
-      completionTokens: 0,
-      cacheReadTokens: 400,
-      pricePromptPer1k: 2,
-      priceCompletionPer1k: 0,
-      priceCachePer1k: 0.1,
-    });
-    // uncached 600/1000*2 + cache 400/1000*0.1
-    expect(cost).toBeCloseTo(1.2 + 0.04);
-  });
-
-  it("full cache hit costs only the cache price", () => {
-    const cost = logCostUsd({
-      promptTokens: 800,
-      completionTokens: 200,
-      cacheReadTokens: 800,
-      pricePromptPer1k: 3,
-      priceCompletionPer1k: 6,
-      priceCachePer1k: 0.3,
-    });
-    // 0.8*0.3 + 0.2*6
-    expect(cost).toBeCloseTo(0.24 + 1.2);
-  });
-
-  it("returns null when no pricing configured", () => {
-    expect(
-      logCostUsd({ promptTokens: 100, completionTokens: 50, cacheReadTokens: 0 }),
-    ).toBeNull();
-  });
-
-  it("returns null when cost is zero", () => {
-    expect(
-      logCostUsd({
-        promptTokens: 0,
-        completionTokens: 0,
-        cacheReadTokens: 0,
-        pricePromptPer1k: 1,
-        priceCompletionPer1k: 1,
-      }),
-    ).toBeNull();
-  });
-
-  it("clamps negative token counts", () => {
-    const cost = logCostUsd({
-      promptTokens: -5,
-      completionTokens: 1000,
-      cacheReadTokens: 99999,
-      pricePromptPer1k: 1,
-      priceCompletionPer1k: 2,
-    });
-    // uncached 0 (cache >= prompt) + cache... cache clamped to prompt? no:
-    // cache = 99999, prompt = 0 → uncached = 0, cache billed at prompt price
-    expect(cost).toBeCloseTo(0 + 2.0);
-  });
+import { act, renderHook } from "@testing-library/react";
+import { beforeEach, expect, it } from "vitest";
+import { formatLatency, formatUnitPrice, setCurrency, useCurrency } from "./format";
+beforeEach(() => setCurrency({ symbol: "$", rate: 1 }));
+it("preserves nonzero tiny prices and large fractional prices", () => {
+  expect(formatUnitPrice(0.0000001)).toBe("$1e-7");
+  expect(formatUnitPrice(1234.56789)).toBe("$1,234.56789");
+  expect(formatUnitPrice(0)).toBe("$0.00");
+});
+it("notifies mounted prices when display currency arrives without altering ledger input", () => {
+  const { result, unmount } = renderHook(() => useCurrency());
+  act(() => setCurrency({ symbol: "¥", rate: 7 }));
+  expect(result.current).toEqual({ symbol: "¥", rate: 7 });
+  expect(formatUnitPrice(1)).toBe("¥7.00");
+  unmount();
+});
+// An average response time can be milliseconds or minutes, and the reader should
+// not have to divide by a thousand to know which.
+it("prints latency at the scale the number is actually at", () => {
+  expect(formatLatency(348)).toBe("348 ms");
+  expect(formatLatency(999)).toBe("999 ms");
+  expect(formatLatency(1450)).toBe("1.45 s");
+  expect(formatLatency(12480)).toBe("12.5 s");
+  expect(formatLatency(125000)).toBe("2m 5s");
+  expect(formatLatency(60000)).toBe("1m");
+  // No sample is not a latency of zero.
+  expect(formatLatency(0)).toBe("0 ms");
+  expect(formatLatency(Number.NaN)).toBe("—");
+  expect(formatLatency(-1)).toBe("—");
 });

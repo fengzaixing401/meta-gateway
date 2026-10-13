@@ -52,6 +52,14 @@ func TestVendorUnifyKey(t *testing.T) {
 		"/leading":          "/leading",
 		// Several segments: only the last survives.
 		"a/b/model-x": "model-x",
+		// A colon namespace is the same problem the slash form solves: a channel
+		// that prefixes with "cn:" produces duplicates no other rule can
+		// reconcile, because ":" is just another character in the name.
+		"cn:deepseek-v4.1-flash": "deepseek-v4.1-flash",
+		"cn:glm-5.3-flash":       "glm-5.3-flash",
+		// The LAST separator wins, whichever character it happens to be.
+		"openrouter:deepseek/deepseek-v4": "deepseek-v4",
+		"a:b/model":                       "model",
 	}
 	for input, want := range cases {
 		if got := vendorUnifyKey(input); got != want {
@@ -343,6 +351,36 @@ func TestBuildUnifyPreviewVendorGroups(t *testing.T) {
 	}
 }
 
+// A colon namespace must land in the same group as the bare name. This is the
+// same duplicate problem the slash form solves, and the rule has to see it: to
+// every other rule the colon is just another character in the name.
+func TestBuildUnifyPreviewVendorGroupsWithColonPrefix(t *testing.T) {
+	channels := []domain.Channel{
+		{ID: 1, Name: "C1", Status: domain.StatusEnabled},
+		{ID: 2, Name: "C2", Status: domain.StatusEnabled},
+	}
+	models := []domain.DiscoveredModel{
+		{ChannelID: 1, ModelName: "cn:deepseek-v4.1-flash", Available: true},
+		{ChannelID: 2, ModelName: "deepseek-v4.1-flash", Available: true},
+	}
+	overviews := []domain.RouteOverview{
+		overview(1, "cn:deepseek-v4.1-flash", domain.RouteMember{ID: 1, ChannelID: 1, Enabled: true}),
+		overview(2, "deepseek-v4.1-flash", domain.RouteMember{ID: 2, ChannelID: 2, Enabled: true}),
+	}
+	preview := buildUnifyPreview(channels, models, overviews, allRules())
+
+	if len(preview.Groups) != 1 {
+		t.Fatalf("expected 1 vendor group, got %+v", preview.Groups)
+	}
+	group := preview.Groups[0]
+	if group.Canonical != "deepseek-v4.1-flash" || len(group.Variants) != 2 {
+		t.Fatalf("unexpected vendor group: %+v", group)
+	}
+	if !containsRule(group.Rules, RuleVendorPrefix) {
+		t.Errorf("expected the vendor rule to be reported, got %v", group.Rules)
+	}
+}
+
 func TestBuildUnifyPreview(t *testing.T) {
 	channels := []domain.Channel{
 		{ID: 1, Name: "C1", Status: domain.StatusEnabled},
@@ -457,7 +495,7 @@ func TestBuildUnifyPreviewDisabledBindingsNotAdopted(t *testing.T) {
 }
 
 func TestApplyUnifyIdempotent(t *testing.T) {
-	db, err := store.Open(t.TempDir())
+	db, err := store.OpenTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,7 +551,7 @@ func TestApplyUnifyIdempotent(t *testing.T) {
 // Re-applying must not create a second route for a name that already exists,
 // even when that route was disabled — GetByModel only sees enabled rows.
 func TestApplyUnifyReusesDisabledRoute(t *testing.T) {
-	db, err := store.Open(t.TempDir())
+	db, err := store.OpenTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,6 +630,40 @@ func TestBuildUnifyPreviewKeepsGroupWithExposedOriginal(t *testing.T) {
 	}
 	if group.MappedCount != 2 {
 		t.Fatalf("mapped_count = %d, want 2", group.MappedCount)
+	}
+}
+
+// A parked (disabled) leftover is the other way an original survives: batches
+// applied before originals were deleted simply switched them off. It is still a
+// duplicate name in the model list, so the group must stay visible for the next
+// apply to remove it.
+func TestBuildUnifyPreviewKeepsGroupWithParkedOriginal(t *testing.T) {
+	channels := []domain.Channel{
+		{ID: 1, Name: "C1", Status: domain.StatusEnabled},
+		{ID: 2, Name: "C2", Status: domain.StatusEnabled},
+	}
+	models := []domain.DiscoveredModel{
+		{ChannelID: 1, ModelName: "[A]GEMINI", Available: true},
+		{ChannelID: 2, ModelName: "GEMINI", Available: true},
+	}
+	parked := overview(11, "[A]GEMINI", domain.RouteMember{ID: 3, ChannelID: 1, Enabled: true})
+	parked.Route.Enabled = false
+	overviews := []domain.RouteOverview{
+		overview(10, "gemini",
+			domain.RouteMember{ID: 1, ChannelID: 1, Enabled: true, MappingJSON: `{"real":"[A]GEMINI"}`},
+			domain.RouteMember{ID: 2, ChannelID: 2, Enabled: true, MappingJSON: `{"real":"GEMINI"}`}),
+		parked,
+	}
+	preview := buildUnifyPreview(channels, models, overviews, allRules())
+
+	if len(preview.Groups) != 1 {
+		t.Fatalf("a parked original must keep its group visible, got %+v", preview.Groups)
+	}
+	if got := preview.Groups[0].ExposedOriginals; got != 1 {
+		t.Fatalf("exposed_originals = %d, want 1", got)
+	}
+	if preview.Groups[0].MappedCount != 2 {
+		t.Fatalf("mapped_count = %d, want 2", preview.Groups[0].MappedCount)
 	}
 }
 

@@ -2,6 +2,7 @@ package store
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,17 @@ import (
 var ErrModelChangeConflict = errors.New("model change selection is stale or incompatible")
 var ErrModelChangeInvalid = errors.New("invalid model change request")
 
+const (
+	// ModelChangeConfirmSynces is how many consecutive successful syncs beyond
+	// the detection round must lack the model before a "suspected removal"
+	// stops being suspected. Detection alone is one bad upstream list away
+	// from a false positive; confirmation requires sustained absence.
+	ModelChangeConfirmSynces = 3
+	// modelChangeFlapWindow is how recently a model must have been resolved
+	// for a fresh removal to count as a repeat (churn) rather than a new one.
+	modelChangeFlapWindow = 30 * 24 * time.Hour
+)
+
 func recordModelChanges(tx sqlExecutor, input ReconcileInput, old []string) error {
 	var baseline int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM discovery_snapshots WHERE channel_id=?`, input.ChannelID).Scan(&baseline); err != nil {
@@ -25,6 +37,24 @@ func recordModelChanges(tx sqlExecutor, input ReconcileInput, old []string) erro
 	}
 	for _, m := range input.Models {
 		after[m] = true
+	}
+	// Sustained-absence counter: every successful, complete snapshot that
+	// still lacks the model advances the pending removal toward "confirmed".
+	// A partial snapshot (some keys silent) is unreliable evidence and must
+	// not confirm anything on its own.
+	if !input.PartialDiscovery {
+		bump := `UPDATE model_changes SET miss_count = miss_count + 1 WHERE channel_id=? AND kind='removed' AND status='pending'`
+		if len(after) == 0 {
+			if _, err := tx.Exec(bump, input.ChannelID); err != nil {
+				return err
+			}
+		} else {
+			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(after)), ",")
+			args := append([]any{input.ChannelID}, modelArgs(after)...)
+			if _, err := tx.Exec(bump+` AND model_name NOT IN (`+placeholders+`)`, args...); err != nil {
+				return err
+			}
+		}
 	}
 	additions := []string{}
 	for m := range after {
@@ -51,6 +81,20 @@ func recordModelChanges(tx sqlExecutor, input ReconcileInput, old []string) erro
 			if _, err := tx.Exec(`UPDATE model_changes SET status='resolved' WHERE channel_id=? AND model_name=? AND status='pending'`, input.ChannelID, m); err != nil {
 				return err
 			}
+			if kind == "removed" {
+				flap, err := flapCount(tx, input, m)
+				if err != nil {
+					return err
+				}
+				partial := 0
+				if input.PartialDiscovery {
+					partial = 1
+				}
+				if _, err := tx.Exec(`INSERT INTO model_changes(channel_id,model_name,kind,detected_at,candidates_json,flap_count,partial_keys) VALUES(?,?,?,?,?,?,?)`, input.ChannelID, m, kind, input.CheckedAt.UTC().Format(time.RFC3339Nano), string(candidates), flap, partial); err != nil {
+					return err
+				}
+				continue
+			}
 			if _, err := tx.Exec(`INSERT INTO model_changes(channel_id,model_name,kind,detected_at,candidates_json) VALUES(?,?,?,?,?)`, input.ChannelID, m, kind, input.CheckedAt.UTC().Format(time.RFC3339Nano), string(candidates)); err != nil {
 				return err
 			}
@@ -58,6 +102,36 @@ func recordModelChanges(tx sqlExecutor, input ReconcileInput, old []string) erro
 	}
 	_, err := tx.Exec(`INSERT INTO discovery_snapshots(channel_id,revision) VALUES(?,1) ON CONFLICT(channel_id) DO UPDATE SET revision=revision+1`, input.ChannelID)
 	return err
+}
+
+func modelArgs(models map[string]bool) []any {
+	out := make([]any, 0, len(models))
+	for m := range models {
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].(string) < out[j].(string) })
+	return out
+}
+
+// flapCount reports the churn counter for a fresh removal: one more than the
+// previous removal spell when that one was resolved recently, so a model
+// oscillating between list and missing reads as one flapping entry instead of
+// an endless stream of unrelated rows. A removal after a long quiet period
+// starts from zero.
+func flapCount(tx sqlExecutor, input ReconcileInput, model string) (int, error) {
+	var flap int
+	var detected string
+	err := tx.QueryRow(`SELECT flap_count, detected_at FROM model_changes WHERE channel_id=? AND model_name=? AND kind='removed' AND status IN ('resolved','applied','ignored') ORDER BY id DESC LIMIT 1`, input.ChannelID, model).Scan(&flap, &detected)
+	if err == nil {
+		if previous, parseErr := time.Parse(time.RFC3339Nano, detected); parseErr == nil && input.CheckedAt.UTC().Sub(previous) <= modelChangeFlapWindow {
+			return flap + 1, nil
+		}
+		return 0, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return 0, err
 }
 
 type ModelChangeMember struct {
@@ -68,8 +142,13 @@ type ModelChangeMember struct {
 	ChannelID     int64  `json:"channel_id"`
 	UpstreamModel string `json:"upstream_model"`
 	GroupName     string `json:"group_name"`
-	mapping       string
-	routeMapping  string
+	// Deletable is false for a wildcard binding without a constant rewrite:
+	// it answers for every model the pattern matches, so deleting it would
+	// take unrelated models down as well. Such a member cannot be discarded
+	// until the route pins the upstream name.
+	Deletable    bool `json:"deletable"`
+	mapping      string
+	routeMapping string
 }
 type ModelChange struct {
 	ID          int64               `json:"id"`
@@ -81,6 +160,23 @@ type ModelChange struct {
 	DetectedAt  string              `json:"detected_at"`
 	Candidates  []string            `json:"candidates"`
 	Members     []ModelChangeMember `json:"members"`
+	// Confidence signals for removals. Confirmed means the model has been
+	// missing from ModelChangeConfirmSynces consecutive complete snapshots;
+	// PartialKeys flags snapshots taken with only some API keys answering
+	// (possible false positive); FlapCount counts re-disappearances inside
+	// the flap window; RuntimeBlocked mirrors the channel_model_blocks
+	// blacklist the relay writes when the upstream itself reports the model
+	// as unknown.
+	Confirmed      bool   `json:"confirmed"`
+	MissCount      int    `json:"miss_count"`
+	PartialKeys    bool   `json:"partial_keys"`
+	FlapCount      int    `json:"flap_count"`
+	RuntimeBlocked bool   `json:"runtime_blocked"`
+	BlockedAt      string `json:"blocked_at,omitempty"`
+	// Adopted marks a pending addition whose model is already wired into this
+	// channel's routing — the operator acted on the change, the reminder is
+	// stale until the next reconcile resolves it.
+	Adopted bool `json:"adopted,omitempty"`
 }
 type ModelChanges struct {
 	Items   []ModelChange `json:"items"`
@@ -88,6 +184,7 @@ type ModelChanges struct {
 		Added          int `json:"added"`
 		Removed        int `json:"removed"`
 		AffectedRoutes int `json:"affected_routes"`
+		Confirmed      int `json:"confirmed"`
 	} `json:"summary"`
 }
 
@@ -118,25 +215,31 @@ func changeMembers(q sqlExecutor) ([]ModelChangeMember, error) {
 		if m.UpstreamModel == "" && !strings.ContainsAny(m.ModelPattern, "*?[") {
 			m.UpstreamModel = m.ModelPattern
 		}
+		m.Deletable = !strings.ContainsAny(m.ModelPattern, "*?[") || alias.Real != ""
 		out = append(out, m)
 	}
 	return out, rows.Err()
 }
 func listModelChanges(q sqlExecutor) (ModelChanges, error) {
 	out := ModelChanges{Items: []ModelChange{}}
-	rows, err := q.Query(`SELECT x.id,x.channel_id,c.name,x.model_name,x.kind,x.status,x.detected_at,x.candidates_json FROM model_changes x JOIN channels c ON c.id=x.channel_id ORDER BY x.id DESC`)
+	rows, err := q.Query(`SELECT x.id,x.channel_id,c.name,x.model_name,x.kind,x.status,x.detected_at,x.candidates_json,x.miss_count,x.flap_count,x.partial_keys FROM model_changes x JOIN channels c ON c.id=x.channel_id ORDER BY x.id DESC`)
 	if err != nil {
 		return out, err
 	}
 	for rows.Next() {
 		var x ModelChange
 		var candidates string
-		if err := rows.Scan(&x.ID, &x.ChannelID, &x.ChannelName, &x.ModelName, &x.Kind, &x.Status, &x.DetectedAt, &candidates); err != nil {
+		var miss, flap, partial int
+		if err := rows.Scan(&x.ID, &x.ChannelID, &x.ChannelName, &x.ModelName, &x.Kind, &x.Status, &x.DetectedAt, &candidates, &miss, &flap, &partial); err != nil {
 			rows.Close()
 			return out, err
 		}
 		x.Candidates = []string{}
 		x.Members = []ModelChangeMember{}
+		x.MissCount = miss
+		x.FlapCount = flap
+		x.PartialKeys = partial != 0
+		x.Confirmed = miss >= ModelChangeConfirmSynces
 		if err := json.Unmarshal([]byte(candidates), &x.Candidates); err != nil {
 			rows.Close()
 			return out, err
@@ -148,19 +251,27 @@ func listModelChanges(q sqlExecutor) (ModelChanges, error) {
 	if err != nil {
 		return out, err
 	}
+	blocks, err := runtimeBlocks(q)
+	if err != nil {
+		return out, err
+	}
 	members, err := changeMembers(q)
 	if err != nil {
 		return out, err
 	}
 	routes := map[int64]bool{}
+	servesModel := func(member ModelChangeMember, channelID int64, model string) bool {
+		if member.ChannelID != channelID {
+			return false
+		}
+		return member.UpstreamModel == model ||
+			(member.UpstreamModel == "" && MatchModelPattern(member.ModelPattern, model))
+	}
 	for i := range out.Items {
 		x := &out.Items[i]
 		if x.Kind == "removed" {
 			for _, m := range members {
-				if m.ChannelID != x.ChannelID {
-					continue
-				}
-				if m.UpstreamModel == x.ModelName || (m.UpstreamModel == "" && matchModelPattern(m.ModelPattern, x.ModelName)) {
+				if servesModel(m, x.ChannelID, x.ModelName) {
 					m.UpstreamModel = x.ModelName
 					x.Members = append(x.Members, m)
 					if x.Status == "pending" {
@@ -168,17 +279,220 @@ func listModelChanges(q sqlExecutor) (ModelChanges, error) {
 					}
 				}
 			}
+			if blockedAt, ok := blocks[channelModelKey{channel: x.ChannelID, model: x.ModelName}]; ok {
+				x.RuntimeBlocked = true
+				x.BlockedAt = blockedAt
+			}
 		}
 		if x.Status == "pending" {
 			if x.Kind == "added" {
-				out.Summary.Added++
+				// An addition the operator already wired into routing has been
+				// acted upon — count it separately from actionable reminders.
+				for _, m := range members {
+					if servesModel(m, x.ChannelID, x.ModelName) {
+						x.Adopted = true
+						break
+					}
+				}
+				if !x.Adopted {
+					out.Summary.Added++
+				}
 			} else {
 				out.Summary.Removed++
+				if x.Confirmed {
+					out.Summary.Confirmed++
+				}
 			}
 		}
 	}
 	out.Summary.AffectedRoutes = len(routes)
 	return out, nil
+}
+
+type channelModelKey struct {
+	channel int64
+	model   string
+}
+
+// runtimeBlocks maps the relay-maintained model-not-found blacklist for quick
+// lookup. A block is the strongest removal evidence available: the upstream
+// itself rejected the model at request time, not just at list time.
+func runtimeBlocks(q sqlExecutor) (map[channelModelKey]string, error) {
+	rows, err := q.Query(`SELECT channel_id, model, created_at FROM channel_model_blocks`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[channelModelKey]string{}
+	for rows.Next() {
+		var channel int64
+		var model, created string
+		if err := rows.Scan(&channel, &model, &created); err != nil {
+			return nil, err
+		}
+		out[channelModelKey{channel: channel, model: model}] = created
+	}
+	return out, rows.Err()
+}
+
+// ResolveAdoptedModelChanges closes pending additions whose model is already
+// wired into the channel's routing: the reminder did its job. Runs on the
+// daily sweep; the live view marks such rows immediately.
+func (s *DB) ResolveAdoptedModelChanges() (int64, error) {
+	tx, err := s.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT id, channel_id, model_name FROM model_changes WHERE kind='added' AND status='pending'`)
+	if err != nil {
+		return 0, err
+	}
+	type candidate struct {
+		id      int64
+		channel int64
+		model   string
+	}
+	pending := []candidate{}
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.channel, &c.model); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		pending = append(pending, c)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	if len(pending) == 0 {
+		return 0, nil
+	}
+	members, err := changeMembers(tx)
+	if err != nil {
+		return 0, err
+	}
+	var resolved int64
+	for _, c := range pending {
+		adopted := false
+		for _, m := range members {
+			if m.ChannelID != c.channel {
+				continue
+			}
+			if m.UpstreamModel == c.model ||
+				(m.UpstreamModel == "" && MatchModelPattern(m.ModelPattern, c.model)) {
+				adopted = true
+				break
+			}
+		}
+		if !adopted {
+			continue
+		}
+		res, err := tx.Exec(`UPDATE model_changes SET status='resolved' WHERE id=? AND kind='added' AND status='pending'`, c.id)
+		if err != nil {
+			return 0, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		resolved += n
+	}
+	if resolved == 0 {
+		return 0, nil
+	}
+	return resolved, tx.Commit()
+}
+
+// PruneModelChanges deletes finished (non-pending) entries older than the
+// retention window; pending rows are active reminders and never age out.
+func (s *DB) PruneModelChanges(retentionDays int) (int64, error) {
+	if retentionDays <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Format(time.RFC3339Nano)
+	result, err := s.Exec(`DELETE FROM model_changes WHERE status != 'pending' AND detected_at < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("model changes prune: %w", err)
+	}
+	return result.RowsAffected()
+}
+
+// AutoIgnoreHarmlessModelChanges flips pending removals older than maxAgeDays
+// that carry no route-member impact to "ignored". They are the bulk of the
+// reminder noise (candidate-list churn with nothing to remap); ignoring keeps
+// them inspectable while clearing the summary.
+func (s *DB) AutoIgnoreHarmlessModelChanges(maxAgeDays int) (int64, error) {
+	if maxAgeDays <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -maxAgeDays)
+	tx, err := s.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT id, channel_id, model_name FROM model_changes WHERE kind='removed' AND status='pending'`)
+	if err != nil {
+		return 0, err
+	}
+	type candidate struct {
+		id      int64
+		channel int64
+		model   string
+	}
+	pending := []candidate{}
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.channel, &c.model); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		pending = append(pending, c)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	if len(pending) == 0 {
+		return 0, nil
+	}
+	members, err := changeMembers(tx)
+	if err != nil {
+		return 0, err
+	}
+	var ignored int64
+	for _, c := range pending {
+		harmless := true
+		for _, m := range members {
+			if m.ChannelID != c.channel {
+				continue
+			}
+			if m.UpstreamModel == c.model || (m.UpstreamModel == "" && MatchModelPattern(m.ModelPattern, c.model)) {
+				harmless = false
+				break
+			}
+		}
+		if !harmless {
+			continue
+		}
+		res, err := tx.Exec(`UPDATE model_changes SET status='ignored' WHERE id=? AND kind='removed' AND status='pending' AND detected_at < ?`, c.id, cutoff.Format(time.RFC3339Nano))
+		if err != nil {
+			return 0, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		ignored += n
+	}
+	if ignored == 0 {
+		return 0, nil
+	}
+	return ignored, tx.Commit()
 }
 func (s *DB) ModelChanges() (ModelChanges, error) {
 	tx, err := s.Begin()
@@ -246,6 +560,53 @@ type ModelChangePreviewItem struct {
 type ModelChangePreview struct {
 	Items        []ModelChangePreviewItem `json:"items"`
 	PreviewToken string                   `json:"preview_token"`
+}
+
+// rowSnapshot serializes one whole row without depending on schema column
+// order. It is what lets a preview token catch edits made in the window
+// between preview and apply (route pins, credentials, member prices).
+func rowSnapshot(q sqlExecutor, table string, id int64) ([]any, error) {
+	rows, err := q.Query(`SELECT * FROM `+table+` WHERE id=?`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	values := make([]any, len(columns))
+	ptrs := make([]any, len(columns))
+	for i := range values {
+		ptrs[i] = &values[i]
+	}
+	if !rows.Next() {
+		return nil, ErrModelChangeConflict
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		return nil, err
+	}
+	return values, rows.Err()
+}
+
+// routeMemberIDs lists a route's members. Discarding decides whether the route
+// row itself goes away, so the full membership is part of the preview token:
+// a member added between preview and apply would otherwise be deleted silently.
+func routeMemberIDs(q sqlExecutor, routeID int64) ([]int64, error) {
+	rows, err := q.Query(`SELECT id FROM route_members WHERE route_id=? ORDER BY id`, routeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func previewModelChanges(q sqlExecutor, req ModelChangeRequest) (ModelChangePreview, error) {
@@ -356,26 +717,7 @@ func previewModelChanges(q sqlExecutor, req ModelChangeRequest) (ModelChangePrev
 			table string
 			id    int64
 		}{{"route_members", id}, {"routes", m.RouteID}, {"channels", m.ChannelID}, {"channels", req.TargetChannelID}} {
-			rows, err := q.Query(`SELECT * FROM `+tableID.table+` WHERE id=?`, tableID.id)
-			if err != nil {
-				return out, err
-			}
-			columns, err := rows.Columns()
-			if err != nil {
-				rows.Close()
-				return out, err
-			}
-			values := make([]any, len(columns))
-			ptrs := make([]any, len(columns))
-			for i := range values {
-				ptrs[i] = &values[i]
-			}
-			if !rows.Next() {
-				rows.Close()
-				return out, ErrModelChangeConflict
-			}
-			err = rows.Scan(ptrs...)
-			rows.Close()
+			values, err := rowSnapshot(q, tableID.table, tableID.id)
 			if err != nil {
 				return out, err
 			}
@@ -454,4 +796,198 @@ func (s *DB) ApplyModelChanges(req ModelChangeRequest) (int, error) {
 		return 0, err
 	}
 	return len(preview.Items), nil
+}
+
+// A removed model can also be resolved by deleting its binding instead of
+// repointing it: the upstream retired the model, so the member is dead weight
+// and the public route name is one nobody should keep calling. Deleting the
+// route's LAST member deletes the route row too — a route with no members is
+// still a callable name, which is exactly the dead entry the console is meant
+// not to accumulate.
+type ModelChangeDiscardRequest struct {
+	ChangeIDs    []int64 `json:"change_ids"`
+	MemberIDs    []int64 `json:"member_ids"`
+	PreviewToken string  `json:"preview_token,omitempty"`
+}
+
+type ModelChangeDiscardItem struct {
+	MemberID     int64  `json:"member_id"`
+	RouteID      int64  `json:"route_id"`
+	RouteName    string `json:"route_name"`
+	ModelPattern string `json:"model_pattern"`
+	GroupName    string `json:"group_name"`
+	ChannelID    int64  `json:"channel_id"`
+	// UpstreamModel is the name this binding actually asks the upstream for.
+	UpstreamModel string `json:"upstream_model"`
+	// RouteMembers is the route's total member count, this one included.
+	RouteMembers int `json:"route_members"`
+	// RouteDeleted marks this member as one of the route's last ones, so the
+	// route row disappears with it.
+	RouteDeleted bool `json:"route_deleted"`
+}
+
+type ModelChangeDiscardPreview struct {
+	Items []ModelChangeDiscardItem `json:"items"`
+	// Routes counts the route rows that go away because every one of their
+	// members is being discarded.
+	Routes       int    `json:"routes"`
+	PreviewToken string `json:"preview_token"`
+}
+
+// DiscardResult reports what an applied discard actually removed.
+type ModelChangeDiscardResult struct {
+	Removed int `json:"removed"`
+	Routes  int `json:"routes"`
+}
+
+func previewModelDiscard(q sqlExecutor, req ModelChangeDiscardRequest) (ModelChangeDiscardPreview, error) {
+	out := ModelChangeDiscardPreview{Items: []ModelChangeDiscardItem{}}
+	if !validChangeIDs(req.ChangeIDs) || !validChangeIDs(req.MemberIDs) {
+		return out, ErrModelChangeInvalid
+	}
+	changes, err := listModelChanges(q)
+	if err != nil {
+		return out, err
+	}
+	selected := map[int64]bool{}
+	for _, id := range req.ChangeIDs {
+		selected[id] = true
+	}
+	eligible := map[int64]ModelChangeMember{}
+	found := 0
+	for _, x := range changes.Items {
+		if !selected[x.ID] {
+			continue
+		}
+		found++
+		if x.Status != "pending" || x.Kind != "removed" {
+			return out, ErrModelChangeConflict
+		}
+		for _, m := range x.Members {
+			eligible[m.MemberID] = m
+		}
+	}
+	if found != len(selected) {
+		return out, ErrModelChangeConflict
+	}
+	ids := append([]int64(nil), req.MemberIDs...)
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	changeIDs := append([]int64(nil), req.ChangeIDs...)
+	sort.Slice(changeIDs, func(i, j int) bool { return changeIDs[i] < changeIDs[j] })
+	perRoute := map[int64]int{}
+	for _, id := range ids {
+		m, ok := eligible[id]
+		if !ok {
+			return out, ErrModelChangeConflict
+		}
+		if !m.Deletable {
+			return out, ErrModelChangeConflict
+		}
+		perRoute[m.RouteID]++
+	}
+	fingerprint := []any{changeIDs}
+	for _, id := range ids {
+		m := eligible[id]
+		memberRow, err := rowSnapshot(q, "route_members", id)
+		if err != nil {
+			return out, err
+		}
+		routeRow, err := rowSnapshot(q, "routes", m.RouteID)
+		if err != nil {
+			return out, err
+		}
+		siblings, err := routeMemberIDs(q, m.RouteID)
+		if err != nil {
+			return out, err
+		}
+		item := ModelChangeDiscardItem{
+			MemberID: id, RouteID: m.RouteID, RouteName: m.RouteName, ModelPattern: m.ModelPattern,
+			GroupName: m.GroupName, ChannelID: m.ChannelID, UpstreamModel: m.UpstreamModel,
+			RouteMembers: len(siblings), RouteDeleted: len(siblings) == perRoute[m.RouteID],
+		}
+		out.Items = append(out.Items, item)
+		fingerprint = append(fingerprint, item, memberRow, routeRow, siblings)
+	}
+	routes := map[int64]bool{}
+	for _, item := range out.Items {
+		if item.RouteDeleted {
+			routes[item.RouteID] = true
+		}
+	}
+	out.Routes = len(routes)
+	raw, err := json.Marshal(fingerprint)
+	if err != nil {
+		return out, err
+	}
+	sum := sha256.Sum256(raw)
+	out.PreviewToken = hex.EncodeToString(sum[:])
+	return out, nil
+}
+
+func (s *DB) PreviewModelDiscard(req ModelChangeDiscardRequest) (ModelChangeDiscardPreview, error) {
+	tx, err := s.Begin()
+	if err != nil {
+		return ModelChangeDiscardPreview{}, err
+	}
+	defer tx.Rollback()
+	return previewModelDiscard(tx, req)
+}
+
+func (s *DB) ApplyModelDiscard(req ModelChangeDiscardRequest) (ModelChangeDiscardResult, error) {
+	out := ModelChangeDiscardResult{}
+	if req.PreviewToken == "" {
+		return out, ErrModelChangeConflict
+	}
+	tx, err := s.Begin()
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback()
+	preview, err := previewModelDiscard(tx, req)
+	if err != nil {
+		return out, err
+	}
+	if preview.PreviewToken != req.PreviewToken {
+		return out, ErrModelChangeConflict
+	}
+	affected := map[int64]bool{}
+	for _, item := range preview.Items {
+		if err := deleteRouteMember(tx, item.MemberID); err != nil {
+			return out, err
+		}
+		affected[item.RouteID] = true
+	}
+	for routeID := range affected {
+		var remaining int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM route_members WHERE route_id=?`, routeID).Scan(&remaining); err != nil {
+			return out, err
+		}
+		if remaining > 0 {
+			continue
+		}
+		if err := deleteRoute(tx, routeID); err != nil {
+			return out, err
+		}
+		out.Routes++
+	}
+	remaining, err := listModelChanges(tx)
+	if err != nil {
+		return out, err
+	}
+	// The removal stops being pending once nothing is bound to the vanished
+	// model any more — the same rule the replacement path applies.
+	for _, id := range req.ChangeIDs {
+		for _, x := range remaining.Items {
+			if x.ID == id && len(x.Members) == 0 {
+				if _, err := tx.Exec(`UPDATE model_changes SET status='applied' WHERE id=? AND status='pending'`, id); err != nil {
+					return out, err
+				}
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return out, err
+	}
+	out.Removed = len(preview.Items)
+	return out, nil
 }

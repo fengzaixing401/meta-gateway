@@ -7,15 +7,93 @@ on:
 
 permissions:
   contents: write
+  # Needed by wait-for-ci to read the CI run for this commit. `contents: write`
+  # alone does not grant it, and the API call would fail closed with a 403.
+  actions: read
 
 jobs:
+  # Gate the release on CI. Without this, the two workflows run in PARALLEL on a
+  # tag push, so a tag whose CI is red still publishes images: v3.4.1 shipped a
+  # mount-prefix regression to Docker Hub exactly this way (Release `success`,
+  # CI `failure` at the same second), and the broken `:3.4.1` / `:3.4` / `:latest`
+  # tags had to be superseded by a patch release.
+  #
+  # `workflow_run` is not used because it only triggers on the default branch's
+  # workflow; instead this job waits on the CI run CI itself started for the same
+  # commit, via the API, and fails the release when that run is not green.
+  wait-for-ci:
+    runs-on: ubuntu-latest
+    # Must stay comfortably above CI's own wall time. After store.OpenTest the
+    # race step is the long pole at ~8 minutes locally, so a full CI run is well
+    # under 20 minutes; 45 minutes leaves room for a slow runner without letting
+    # this job outlive a genuinely stuck CI.
+    timeout-minutes: 45
+    steps:
+      - name: Require a green CI run for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          # A tag push and a branch push of the same commit both start a CI run,
+          # so matching on the SHA alone is ambiguous and `sort_by(created_at) |
+          # last` would be a coin flip between them. CI reports the REF as
+          # head_branch (the tag name for a tag push), so match that too.
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # CI runs for the same push, so allow a short window for the run to
+          # appear before treating its absence as a failure.
+          run_id=""
+          for _ in $(seq 1 30); do
+            # A tag push and a branch push of the same commit each start a CI
+            # run, so matching the SHA alone is ambiguous. The ref is passed with
+            # `jq --arg` rather than spliced into the jq program: nested quoting
+            # inside `gh api --jq` is a syntax-error trap (it was one twice).
+            # The API lists runs newest-first, so index 0 is the latest for REF.
+            runs_json="$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=50")" || runs_json=""
+            run_id="$(printf '%s' "$runs_json" | jq -r --arg ref "$REF" \
+              '[.workflow_runs[] | select(.name == "CI" and .event == "push" and .head_branch == $ref)] | .[0].id // empty' 2>/dev/null)" || true
+            [ -n "$run_id" ] && break
+            sleep 10
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::No push CI run found for $SHA; refusing to publish an image"
+            exit 1
+          fi
+          echo "Waiting for CI run $run_id - https://github.com/$REPO/actions/runs/$run_id"
+
+          # Poll the conclusion rather than using `gh run watch --exit-status`,
+          # which needs a newer gh than every runner image ships.
+          # 80 x 30s = 40 minutes of polling, matching the timeout above: the
+          # window has to outlast CI, not just the median CI run.
+          for _ in $(seq 1 80); do
+            status="$(gh api "repos/$REPO/actions/runs/$run_id" --jq '.status')"
+            if [ "$status" = "completed" ]; then
+              conclusion="$(gh api "repos/$REPO/actions/runs/$run_id" --jq '.conclusion')"
+              if [ "$conclusion" != "success" ]; then
+                echo "::error::CI concluded '$conclusion' for $SHA; refusing to publish an image"
+                exit 1
+              fi
+              echo "CI is green for $SHA; proceeding with the release"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::CI did not finish within the wait window for $SHA"
+          exit 1
+
   release:
+    needs: wait-for-ci
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -26,15 +104,39 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Classify release channel
+        id: channel
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Expected vX.Y.Z or vX.Y.Z-beta.N"
+            exit 1
+          fi
+
       - name: Derive image tags
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: zichuanlan/meta-gateway
+          flavor: latest=false
+          # `latest` only moves for stable releases. `beta` moves for every
+          # release on purpose: the beta channel is documented as receiving
+          # prereleases AND the stable releases that follow them. The failure
+          # mode to watch here is the opposite one — an out-of-band patch on an
+          # older stable line moves both floating tags backwards. That is why
+          # the apply endpoint refuses any target that is not newer than the
+          # running build, and why the verification step below exists.
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=semver,pattern={{major}}.{{minor}},enable=${{ steps.channel.outputs.prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ steps.channel.outputs.prerelease == 'false' }}
+            type=raw,value=beta
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -50,7 +152,70 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The release body is the version's CHANGELOG section, so the notes carry
+      # the actual changes instead of the generated "Full Changelog" line alone.
+      - name: Extract changelog section
+        id: changelog
+        run: |
+          set -euo pipefail
+          # CHANGELOG headings keep the tag's "v" prefix (## [v2.5.2]).
+          tag="${GITHUB_REF_NAME}"
+          awk -v ver="$tag" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ -s release-notes.md ]; then
+            prev="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+            if [ -n "$prev" ]; then
+              printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
+                "$GITHUB_REPOSITORY" "$prev" "$GITHUB_REF_NAME" >> release-notes.md
+            fi
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No [$tag] section in CHANGELOG.md; falling back to generated notes"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "--- release-notes.md ---"
+          cat release-notes.md
+
       - name: Create GitHub release
+        if: steps.changelog.outputs.found == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          prerelease: ${{ steps.channel.outputs.prerelease == 'true' }}
+          make_latest: ${{ steps.channel.outputs.prerelease == 'true' && 'false' || 'true' }}
+
+      - name: Create GitHub release (generated notes)
+        if: steps.changelog.outputs.found != 'true'
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          prerelease: ${{ steps.channel.outputs.prerelease == 'true' }}
+          make_latest: ${{ steps.channel.outputs.prerelease == 'true' && 'false' || 'true' }}
+
+      # The image and the release are two different publication channels and the
+      # console's update check reads the second one. v4.0.0-beta.6 shipped here:
+      # the run is green, `:4.0.0-beta.6` and the floating `:beta` tag are on
+      # Docker Hub, and there is no release for the tag — so the beta channel kept
+      # offering beta.5, and an operator who installed it watched for a version
+      # the executor would never report. A green run that published nothing is
+      # unreadable from the outside, so assert the release exists and is public.
+      - name: Verify the release is published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          draft=""
+          if ! draft="$(gh api "repos/$REPO/releases/tags/$TAG" --jq '.draft')"; then
+            echo "::error::no GitHub release for $TAG; the console update check cannot see this build"
+            exit 1
+          fi
+          if [ "$draft" != "false" ]; then
+            echo "::error::release for $TAG is a draft; publish it or the update check will keep offering the previous build"
+            exit 1
+          fi
+          echo "release $TAG is published"

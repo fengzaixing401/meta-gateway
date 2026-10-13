@@ -86,17 +86,40 @@ type ModelPrice struct {
 	Ratio float64 `json:"ratio,omitempty"`
 	// CompletionRatio is the raw New-API completion_ratio (output × ratio).
 	CompletionRatio float64 `json:"completion_ratio,omitempty"`
+	// HasCompletionRatio records whether the site published completion_ratio at
+	// all. A missing ratio means "same as input" while an explicit 0 means a free
+	// output — the two must not collapse into each other.
+	HasCompletionRatio bool `json:"-"`
 	// QuotaType mirrors New-API quota_type: 0 = token billing, 1 = per-call.
 	QuotaType int `json:"quota_type,omitempty"`
+	// HasQuotaType records whether quota_type was published. Absent means the
+	// legacy heuristic applies; a present 0 is authoritative token billing and
+	// must not be re-read as per-call from a residual model_price.
+	HasQuotaType bool `json:"-"`
 	// ModelPrice is the raw model_price (per-call fixed price when QuotaType=1).
 	ModelPrice float64 `json:"model_price,omitempty"`
+	// CacheRatio / CacheWriteRatio are the raw New-API cache_ratio /
+	// cache_creation_ratio, each a multiple of the input price. The Has* flags
+	// say whether the site published them: a missing cache price is not a free
+	// one.
+	CacheRatio         float64 `json:"cache_ratio,omitempty"`
+	HasCacheRatio      bool    `json:"-"`
+	CacheWriteRatio    float64 `json:"cache_creation_ratio,omitempty"`
+	HasCacheWriteRatio bool    `json:"-"`
 	// TokenUSD is the direct USD/1M price when the site has no ratio semantics.
 	TokenUSD *TokenUSDPerMillion `json:"token_usd,omitempty"`
 	// GroupRatio is the user-group multiplier from the pricing response
 	// (defaults to 1 when the site has no group ratios).
-	GroupRatio float64 `json:"group_ratio,omitempty"`
+	GroupRatio    float64            `json:"group_ratio,omitempty"`
+	GroupRatios   map[string]float64 `json:"-"`
+	UnknownGroup  bool               `json:"unknown_group,omitempty"`
+	UpstreamGroup string             `json:"upstream_group,omitempty"`
 	// QuotaPer1M is the raw quota price per 1M tokens (legacy map format).
 	QuotaPer1M float64 `json:"quota_per_1m,omitempty"`
+	// BillingExpr is the raw tiered billing expression some forks publish
+	// (billing_mode=tiered_expr). When present it is the authoritative price and
+	// the plain ratios beside it are placeholders; NormalizePrice parses it.
+	BillingExpr string `json:"billing_expr,omitempty"`
 }
 
 // TokenUSDPerMillion is a direct USD-per-1M-token price for sites without
@@ -106,6 +129,10 @@ type TokenUSDPerMillion struct {
 	Output     float64 `json:"output,omitempty"`
 	CacheRead  float64 `json:"cache_read,omitempty"`
 	CacheWrite float64 `json:"cache_write,omitempty"`
+	// HasCacheRead / HasCacheWrite preserve whether the site published a cache
+	// price: a missing one is not a free one.
+	HasCacheRead  bool `json:"-"`
+	HasCacheWrite bool `json:"-"`
 }
 
 // AccountAdapter probes user identity and lists API keys for relay attachment.
@@ -184,6 +211,13 @@ func (a *NewAPIAccountAdapter) Pricing(ctx context.Context, input AccountInput) 
 	if status < 200 || status >= 300 {
 		return nil, &Error{Kind: ErrorStatus, Status: status, RetryAfter: retryAfter}
 	}
+	return ParsePricingPayload(body)
+}
+
+// ParsePricingPayload parses a New-API /api/pricing body into per-model price
+// items. Exported because the site-probe collector reads the very same public
+// endpoint without credentials, and a second parser would be a second truth.
+func ParsePricingPayload(body []byte) ([]ModelPrice, error) {
 	var envelope struct {
 		Success *bool           `json:"success"`
 		Data    json.RawMessage `json:"data"`
@@ -199,17 +233,14 @@ func (a *NewAPIAccountAdapter) Pricing(ctx context.Context, input AccountInput) 
 	if len(envelope.Data) == 0 {
 		return nil, nil
 	}
-	// Resolve the user-group multiplier: prefer "default", else the first
-	// group ratio present, else 1 (mirrors AAH resolveGroupRatio).
-	groupRatio := 1.0
-	if ratio, ok := envelope.GroupRatio["default"]; ok && ratio > 0 {
-		groupRatio = ratio
-	} else {
-		for _, ratio := range envelope.GroupRatio {
-			if ratio > 0 {
-				groupRatio = ratio
-				break
-			}
+	// Public pricing uses only an actual default group; never a random map
+	// entry. Account callers resolve their verified token group later.
+	groupRatio, unknownGroup := 1.0, false
+	if len(envelope.GroupRatio) > 0 {
+		if ratio, ok := envelope.GroupRatio["default"]; ok && ratio >= 0 {
+			groupRatio = ratio
+		} else {
+			unknownGroup = true
 		}
 	}
 	var table map[string]json.RawMessage
@@ -239,19 +270,25 @@ func (a *NewAPIAccountAdapter) Pricing(ctx context.Context, input AccountInput) 
 		return out, nil
 	}
 	// New API v0.13+ list form: [{model_name, model_price, model_ratio, ...}]
-	// with optional token_price_usd_per_million and top-level group_ratio.
+	// with optional token_price_usd_per_million, billing_expr, cache ratios, and
+	// top-level group_ratio. Pointer fields below preserve presence: a missing
+	// value and an explicit 0 are different (a missing completion_ratio means
+	// "same as input", an explicit one means what it says).
 	var list []struct {
-		ModelName               string  `json:"model_name"`
-		ModelPrice              float64 `json:"model_price"`
-		ModelRatio              float64 `json:"model_ratio"`
-		CompletionRatio         float64 `json:"completion_ratio"`
-		QuotaType               int     `json:"quota_type"`
-		Currency                string  `json:"currency"`
+		ModelName               string   `json:"model_name"`
+		ModelPrice              float64  `json:"model_price"`
+		ModelRatio              float64  `json:"model_ratio"`
+		CompletionRatio         *float64 `json:"completion_ratio"`
+		QuotaType               *int     `json:"quota_type"`
+		Currency                string   `json:"currency"`
+		BillingExpr             string   `json:"billing_expr"`
+		CacheRatio              *float64 `json:"cache_ratio"`
+		CacheCreationRatio      *float64 `json:"cache_creation_ratio"`
 		TokenPriceUSDPerMillion *struct {
-			Input      float64 `json:"input"`
-			Output     float64 `json:"output"`
-			CacheRead  float64 `json:"cache_read"`
-			CacheWrite float64 `json:"cache_write"`
+			Input      float64  `json:"input"`
+			Output     float64  `json:"output"`
+			CacheRead  *float64 `json:"cache_read"`
+			CacheWrite *float64 `json:"cache_write"`
 		} `json:"token_price_usd_per_million"`
 	}
 	if err := json.Unmarshal(envelope.Data, &list); err != nil || len(list) == 0 {
@@ -263,37 +300,78 @@ func (a *NewAPIAccountAdapter) Pricing(ctx context.Context, input AccountInput) 
 		if name == "" {
 			continue
 		}
-		// Unpriced (both 0 and no direct USD) → skip.
 		var direct *TokenUSDPerMillion
 		if item.TokenPriceUSDPerMillion != nil {
 			direct = &TokenUSDPerMillion{
-				Input:      item.TokenPriceUSDPerMillion.Input,
-				Output:     item.TokenPriceUSDPerMillion.Output,
-				CacheRead:  item.TokenPriceUSDPerMillion.CacheRead,
-				CacheWrite: item.TokenPriceUSDPerMillion.CacheWrite,
+				Input:         item.TokenPriceUSDPerMillion.Input,
+				Output:        item.TokenPriceUSDPerMillion.Output,
+				CacheRead:     floatValue(item.TokenPriceUSDPerMillion.CacheRead),
+				CacheWrite:    floatValue(item.TokenPriceUSDPerMillion.CacheWrite),
+				HasCacheRead:  item.TokenPriceUSDPerMillion.CacheRead != nil,
+				HasCacheWrite: item.TokenPriceUSDPerMillion.CacheWrite != nil,
 			}
 		}
-		if item.ModelPrice <= 0 && item.ModelRatio <= 0 && (direct == nil || direct.Input <= 0) {
+		// Unpriced (no plain price/ratio, no direct USD, no billing expression)
+		// → skip. An expression-only row is a real price and must reach
+		// NormalizePrice; its plain columns are placeholders.
+		hasDirect := direct != nil && direct.Input > 0
+		if item.ModelPrice <= 0 && item.ModelRatio <= 0 && !hasDirect && strings.TrimSpace(item.BillingExpr) == "" {
 			continue
 		}
+		// quota_type is authoritative when present: 0 is token billing, 1 is
+		// per-call. Only an absent quota_type falls back to the legacy
+		// "model_price without a ratio means per-call" heuristic.
 		mode := "token"
-		if item.QuotaType == 1 || item.ModelPrice > 0 && item.ModelRatio <= 0 {
+		switch {
+		case item.QuotaType != nil:
+			if *item.QuotaType == 1 {
+				mode = "fixed"
+			}
+		case item.ModelPrice > 0 && item.ModelRatio <= 0:
 			mode = "fixed"
 		}
 		out = append(out, ModelPrice{
-			Model:           name,
-			Currency:        strings.TrimSpace(item.Currency),
-			PriceUSD:        item.ModelPrice, // fixed: site currency per request
-			Ratio:           item.ModelRatio,
-			CompletionRatio: item.CompletionRatio,
-			QuotaType:       item.QuotaType,
-			ModelPrice:      item.ModelPrice,
-			TokenUSD:        direct,
-			GroupRatio:      groupRatio,
-			Mode:            mode,
+			Model:              name,
+			Currency:           strings.TrimSpace(item.Currency),
+			PriceUSD:           item.ModelPrice, // fixed: site currency per request
+			Ratio:              item.ModelRatio,
+			CompletionRatio:    floatValue(item.CompletionRatio),
+			HasCompletionRatio: item.CompletionRatio != nil,
+			QuotaType:          intValue(item.QuotaType),
+			HasQuotaType:       item.QuotaType != nil,
+			ModelPrice:         item.ModelPrice,
+			CacheRatio:         floatValue(item.CacheRatio),
+			HasCacheRatio:      item.CacheRatio != nil,
+			CacheWriteRatio:    floatValue(item.CacheCreationRatio),
+			HasCacheWriteRatio: item.CacheCreationRatio != nil,
+			TokenUSD:           direct,
+			GroupRatio:         groupRatio,
+			GroupRatios:        envelope.GroupRatio,
+			UnknownGroup:       unknownGroup,
+			UpstreamGroup:      "default",
+			Mode:               mode,
+			BillingExpr:        strings.TrimSpace(item.BillingExpr),
 		})
 	}
 	return out, nil
+}
+
+// floatValue dereferences an optional JSON number, treating absence as 0; the
+// caller pairs it with a presence flag where the difference matters.
+func floatValue(value *float64) float64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+// intValue dereferences an optional JSON integer, treating absence as 0; the
+// caller pairs it with a presence flag where the difference matters.
+func intValue(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 // ListTokenGroups returns every group the account may use, from the New-API
@@ -408,7 +486,7 @@ func (a *NewAPIAccountAdapter) ProbeSelf(ctx context.Context, input AccountInput
 	if payload.Success != nil && !*payload.Success {
 		return AccountSelf{}, &Error{Kind: ErrorPayload}
 	}
-	userID, ok := coercePositiveInt64(payload.Data.ID)
+	userID, ok := CoercePlatformUserID(payload.Data.ID)
 	if !ok || strings.TrimSpace(payload.Data.Username) == "" {
 		// Some hosts omit success and nest fields at the top level.
 		var flat struct {
@@ -421,7 +499,7 @@ func (a *NewAPIAccountAdapter) ProbeSelf(ctx context.Context, input AccountInput
 		if err := json.Unmarshal(body, &flat); err != nil || strings.TrimSpace(flat.Username) == "" {
 			return AccountSelf{}, &Error{Kind: ErrorPayload}
 		}
-		userID, ok = coercePositiveInt64(flat.ID)
+		userID, ok = CoercePlatformUserID(flat.ID)
 		if !ok {
 			return AccountSelf{}, &Error{Kind: ErrorPayload}
 		}
@@ -880,6 +958,24 @@ func looksMasked(secret string) bool {
 	return false
 }
 
+// CoercePlatformUserID normalizes a decoded JSON platform user id to a
+// positive int64. AAH exports may quote the value ("1544"), so numeric
+// strings are accepted alongside numbers.
+func CoercePlatformUserID(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case nil:
+		return 0, false
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64)
+		if err != nil || parsed <= 0 {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return coercePositiveInt64(value)
+	}
+}
+
 func coercePositiveInt64(value any) (int64, bool) {
 	switch typed := value.(type) {
 	case float64:
@@ -912,4 +1008,25 @@ func coercePositiveInt64(value any) (int64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// WithPricingGroup selects only the declared upstream group. A missing or
+// unusable multiplier is unknown, not an opportunity to pick another group.
+func WithPricingGroup(item ModelPrice, group string) ModelPrice {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		group = "default"
+	}
+	item.UpstreamGroup = group
+	if len(item.GroupRatios) == 0 {
+		item.GroupRatio = 1
+		item.UnknownGroup = false
+		return item
+	}
+	ratio, ok := item.GroupRatios[group]
+	item.UnknownGroup = !ok || ratio < 0
+	if ok && ratio >= 0 {
+		item.GroupRatio = ratio
+	}
+	return item
 }

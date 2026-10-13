@@ -1,32 +1,20 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { Route, RoutingCandidate } from "../../api/types";
+import type { ModelMatchMode, Route, RoutingCandidate } from "../../api/types";
 import { api } from "../../api/client";
-import {
-  Button,
-  Dialog,
-  ErrorState,
-  Field,
-  InfoTip,
-} from "../../components/ui";
+import { Button, Dialog, ErrorState, Field, InfoTip } from "../../components/ui";
 import { useI18n } from "../../i18n";
 import { useSession } from "../../session";
+import { MatchScopeFieldset } from "./MatchScopeFieldset";
 
-const REASONING_LEVELS = [
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-];
+const REASONING_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 export function RouteDialog({
   value,
   members,
   pending,
   error,
+  stickyGlobalDefault,
   onClose,
   onSave,
 }: {
@@ -34,11 +22,18 @@ export function RouteDialog({
   members: RoutingCandidate[];
   pending: boolean;
   error: unknown;
+  /**
+   * The gateway-wide sticky-session default, so the "inherit" option can name
+   * what it actually inherits instead of leaving the operator to guess. Null
+   * while that setting is still loading.
+   */
+  stickyGlobalDefault?: boolean | null;
   onClose: () => void;
   onSave: (
     value: Partial<Route> & {
       pin_priority?: boolean;
       auto_match_channel_ids?: number[];
+      auto_match_mode?: ModelMatchMode;
     },
   ) => void;
 }) {
@@ -46,17 +41,21 @@ export function RouteDialog({
   const { client } = useSession();
   const service = api(client!);
   const [form, setForm] = useState(value);
+  const globalState = t(stickyGlobalDefault ? "common.enabled" : "common.disabled");
   const [advanced, setAdvanced] = useState(false);
   // Auto-match only exists at creation: the edit dialog manages members
   // through the member list instead.
   const isCreate = value.id == null;
   const [autoMatch, setAutoMatch] = useState(true);
+  // Which channels the auto-match accepts: the exact name, or its -siblings
+  // too (the member then forwards the sibling name it found).
+  const [matchMode, setMatchMode] = useState<ModelMatchMode>("contains");
   const pattern = (form.model_pattern ?? "").trim();
   // Live candidates: enabled channels serving this pattern, so the checkbox
   // states its consequence before saving instead of surprising afterwards.
   const matches = useQuery({
-    queryKey: ["model-channels", pattern],
-    queryFn: ({ signal }) => service.modelChannels(pattern, signal),
+    queryKey: ["model-channels", pattern, matchMode],
+    queryFn: ({ signal }) => service.modelChannels(pattern, matchMode, signal),
     enabled: isCreate && autoMatch && pattern.length > 0,
     placeholderData: (previous) => previous,
   });
@@ -77,32 +76,32 @@ export function RouteDialog({
     else next.add(id);
     setSelection({ pattern, ids: next });
   };
-  const patch = (partial: Partial<Route>) =>
-    setForm((current) => ({ ...current, ...partial }));
+  const patch = (partial: Partial<Route>) => setForm((current) => ({ ...current, ...partial }));
   // Model-level overrides use the same convention as the channel advanced
   // form: an empty field inherits the channel default, a filled field
   // overrides it. Empty input maps to null so the backend keeps NULL = inherit.
   const allPinned =
-    members.length > 0 &&
-    members.every((candidate) => candidate.member.manual_override);
+    members.length > 0 && members.every((candidate) => candidate.member.manual_override);
   const [pinPriority, setPinPriority] = useState(allPinned);
   return (
     <Dialog
       title={value.id ? t("routing.editRoute") : t("routing.addRoute")}
       onClose={onClose}
+      busy={pending}
       actions={
         <>
           <Button variant="secondary" onClick={onClose}>
             {t("common.cancel")}
           </Button>
           <Button
+            loading={pending}
             disabled={pending || !form.model_pattern}
             onClick={() =>
               onSave({
                 ...form,
                 pin_priority: pinPriority,
-                auto_match_channel_ids:
-                  isCreate && autoMatch ? [...selectedMatches] : undefined,
+                auto_match_channel_ids: isCreate && autoMatch ? [...selectedMatches] : undefined,
+                auto_match_mode: isCreate && autoMatch ? matchMode : undefined,
               })
             }
           >
@@ -117,9 +116,7 @@ export function RouteDialog({
       <Field label={t("routing.exactModel")}>
         <input
           value={form.model_pattern ?? ""}
-          onChange={(event) =>
-            setForm({ ...form, model_pattern: event.target.value })
-          }
+          onChange={(event) => setForm({ ...form, model_pattern: event.target.value })}
           placeholder="gpt-4o-mini"
         />
       </Field>
@@ -127,9 +124,7 @@ export function RouteDialog({
         <input
           type="checkbox"
           checked={form.enabled ?? false}
-          onChange={(event) =>
-            setForm({ ...form, enabled: event.target.checked })
-          }
+          onChange={(event) => setForm({ ...form, enabled: event.target.checked })}
         />
         <span>{t("routing.routeEnabled")}</span>
       </label>
@@ -147,6 +142,17 @@ export function RouteDialog({
             </span>
           </label>
           {autoMatch && pattern ? (
+            <MatchScopeFieldset
+              radioName="route-match-mode"
+              pattern={pattern}
+              value={matchMode}
+              onChange={(next) => {
+                setMatchMode(next);
+                setSelection(null);
+              }}
+            />
+          ) : null}
+          {autoMatch && pattern ? (
             matches.isPending ? (
               <p className="ops-panel-context" role="status">
                 {t("common.loading")}
@@ -163,10 +169,7 @@ export function RouteDialog({
                     total: matchItems.length,
                   })}
                 </p>
-                <div
-                  className="selection-list"
-                  style={{ maxHeight: 220, overflowY: "auto" }}
-                >
+                <div className="selection-list scroll-list">
                   {matchItems.map((item) => (
                     <label className="check" key={item.channel_id}>
                       <input
@@ -175,6 +178,13 @@ export function RouteDialog({
                         onChange={() => toggleMatch(item.channel_id)}
                       />
                       <span>{item.channel_name}</span>
+                      {item.model && item.model !== pattern ? (
+                        <span className="pg-chip mono">
+                          {t("modelsPage.autoMatch.matchesModel", {
+                            model: item.model,
+                          })}
+                        </span>
+                      ) : null}
                     </label>
                   ))}
                 </div>
@@ -187,14 +197,11 @@ export function RouteDialog({
           ) : null}
         </>
       ) : null}
-      <div className="ops-panel-context" style={{ marginTop: 12 }}>
+      <div className="ops-panel-context is-spaced">
         <span>{t("routing.retryOverrideTitle")}</span>
       </div>
       <div className="form-grid">
-        <Field
-          label={t("routing.retryRounds")}
-          hint={t("routing.retryRoundsHint")}
-        >
+        <Field label={t("routing.retryRounds")} hint={t("routing.retryRoundsHint")}>
           <input
             type="number"
             min={0}
@@ -210,10 +217,7 @@ export function RouteDialog({
             }}
           />
         </Field>
-        <Field
-          label={t("routing.channelRetry")}
-          hint={t("routing.channelRetryHint")}
-        >
+        <Field label={t("routing.channelRetry")} hint={t("routing.channelRetryHint")}>
           <input
             type="number"
             min={0}
@@ -235,19 +239,14 @@ export function RouteDialog({
         className={`advanced-toggle${advanced ? " is-open" : ""}`}
         onClick={() => setAdvanced((current) => !current)}
       >
-        {advanced
-          ? t("modelsPage.hideOverrides")
-          : t("modelsPage.showOverrides")}
+        {advanced ? t("modelsPage.hideOverrides") : t("modelsPage.showOverrides")}
       </button>
       {advanced ? (
         <section className="advanced-fields">
           <div className="ops-panel-context">
             <span>{t("modelsPage.overrideHint")}</span>
           </div>
-          <Field
-            label={t("modelsPage.modelGroup")}
-            hint={t("modelsPage.modelGroupHint")}
-          >
+          <Field label={t("modelsPage.modelGroup")} hint={t("modelsPage.modelGroupHint")}>
             <input
               value={form.model_group ?? ""}
               placeholder={t("modelsPage.modelGroupAuto")}
@@ -260,8 +259,7 @@ export function RouteDialog({
                 value={form.max_reasoning_effort ?? ""}
                 onChange={(event) =>
                   patch({
-                    max_reasoning_effort:
-                      event.target.value === "" ? null : event.target.value,
+                    max_reasoning_effort: event.target.value === "" ? null : event.target.value,
                   })
                 }
               >
@@ -297,8 +295,7 @@ export function RouteDialog({
               placeholder="http://127.0.0.1:7897"
               onChange={(event) =>
                 patch({
-                  proxy_url:
-                    event.target.value === "" ? null : event.target.value,
+                  proxy_url: event.target.value === "" ? null : event.target.value,
                 })
               }
             />
@@ -310,8 +307,7 @@ export function RouteDialog({
               placeholder='{"User-Agent":"…"}'
               onChange={(event) =>
                 patch({
-                  header_override:
-                    event.target.value === "" ? null : event.target.value,
+                  header_override: event.target.value === "" ? null : event.target.value,
                 })
               }
             />
@@ -321,8 +317,7 @@ export function RouteDialog({
               value={form.system_prompt ?? ""}
               onChange={(event) =>
                 patch({
-                  system_prompt:
-                    event.target.value === "" ? null : event.target.value,
+                  system_prompt: event.target.value === "" ? null : event.target.value,
                 })
               }
             />
@@ -333,11 +328,20 @@ export function RouteDialog({
               value={form.retry_config ?? ""}
               onChange={(event) =>
                 patch({
-                  retry_config:
-                    event.target.value === "" ? null : event.target.value,
+                  retry_config: event.target.value === "" ? null : event.target.value,
                 })
               }
             />
+          </Field>
+          <Field label={t("routing.imageEditShim")} hint={t("routing.imageEditShimHint")}>
+            <label className="check marginless">
+              <input
+                type="checkbox"
+                checked={form.image_edit_shim ?? false}
+                onChange={(event) => patch({ image_edit_shim: event.target.checked })}
+              />
+              <span>{t("routing.imageEditShimEnable")}</span>
+            </label>
           </Field>
           <Field label={t("channels.payloadRules")}>
             <textarea
@@ -345,28 +349,38 @@ export function RouteDialog({
               value={form.payload_rules ?? ""}
               onChange={(event) =>
                 patch({
-                  payload_rules:
-                    event.target.value === "" ? null : event.target.value,
+                  payload_rules: event.target.value === "" ? null : event.target.value,
                 })
               }
             />
           </Field>
           <div className="form-grid">
+            <Field label={t("modelsPage.stickySession")} hint={t("modelsPage.stickySessionHint")}>
+              <select
+                value={form.sticky_session == null ? "inherit" : form.sticky_session ? "on" : "off"}
+                onChange={(event) =>
+                  patch({
+                    sticky_session:
+                      event.target.value === "inherit" ? null : event.target.value === "on",
+                  })
+                }
+              >
+                <option value="inherit">
+                  {stickyGlobalDefault == null
+                    ? t("modelsPage.inherit")
+                    : t("modelsPage.inheritCurrent", { state: globalState })}
+                </option>
+                <option value="on">{t("common.enabled")}</option>
+                <option value="off">{t("common.disabled")}</option>
+              </select>
+            </Field>
             <Field label={t("modelsPage.grayEnabled")}>
               <select
-                value={
-                  form.stable_first == null
-                    ? "inherit"
-                    : form.stable_first
-                      ? "on"
-                      : "off"
-                }
+                value={form.stable_first == null ? "inherit" : form.stable_first ? "on" : "off"}
                 onChange={(event) =>
                   patch({
                     stable_first:
-                      event.target.value === "inherit"
-                        ? null
-                        : event.target.value === "on",
+                      event.target.value === "inherit" ? null : event.target.value === "on",
                   })
                 }
               >
@@ -385,9 +399,7 @@ export function RouteDialog({
                 onChange={(event) =>
                   patch({
                     stable_first_denominator:
-                      event.target.value === ""
-                        ? null
-                        : Number(event.target.value),
+                      event.target.value === "" ? null : Number(event.target.value),
                   })
                 }
               />
@@ -402,9 +414,7 @@ export function RouteDialog({
                 onChange={(event) =>
                   patch({
                     stable_first_promote_requests:
-                      event.target.value === ""
-                        ? null
-                        : Number(event.target.value),
+                      event.target.value === "" ? null : Number(event.target.value),
                   })
                 }
               />

@@ -8,11 +8,15 @@ data
 *.db-wal
 web/node_modules
 web/coverage
+docs/node_modules
+docs/.vitepress/dist
+docs/.vitepress/cache
 
 # Host binaries, logs, tool artifacts (keep the build context lean)
 *.exe
 *.log
 .workbuddy
+.tmp-*
 web/.impeccable
 web/.gitignore
 web/shots

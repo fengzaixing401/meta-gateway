@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   AlertTriangle,
   Activity,
@@ -10,48 +10,58 @@ import {
   CheckCircle2,
   Coins,
   Copy,
-  Cpu,
   Database,
-  HeartPulse,
+  Play,
   ScrollText,
+  Timer,
   TrendingUp,
   Wallet,
   Zap,
 } from "lucide-react";
 import { api } from "../api/client";
-import type { ProxyLog, UsageRecord } from "../api/types";
+import type {
+  ChannelOverview,
+  ModelUsage,
+  ProxyLog,
+  UsageSeries,
+  UsageSummary,
+} from "../api/types";
 import { useI18n } from "../i18n";
 import { useSession } from "../session";
 import { SetupGuide } from "./SetupGuide";
 import { TelemetrySecondary, TelemetryStrip } from "../components/TelemetryStrip";
+import { TimeRangePicker, describeRange, useUrlTimeRange } from "../components/TimeRangePicker";
 import { HourlyTrafficChart } from "../components/charts";
 import { Button, Page, Panel } from "../components/ui";
-import { formatCost, formatTokens } from "../lib/format";
+import { formatCost, formatLatency, formatTokens, relativeTime } from "../lib/format";
 import { channelHealthState } from "./channelHealth";
+import { DashboardAura } from "../components/DashboardAura";
+import { GatewayPreview } from "../components/GatewayTransition";
+import { MemberHome } from "../member/MemberHome";
+import { SiteNewsPanel } from "./SiteNewsPanel";
 
-const HOUR_24 = 24 * 3600 * 1000;
-
-/** Chart window options: hourly buckets over the last N hours. */
-const WINDOWS = [
-  { hours: 24, labelKey: "dashboard.window24h" },
-  { hours: 48, labelKey: "dashboard.window48h" },
-] as const;
-
-function relativeTime(
-  iso: string,
-  t: (key: string, vars?: Record<string, string | number>) => string,
-) {
-  const ms = Date.now() - new Date(iso).getTime();
-  if (ms < 60_000) return t("dashboard.justNow");
-  if (ms < 3600_000)
-    return t("dashboard.minutesAgo", { n: Math.floor(ms / 60_000) });
-  if (ms < HOUR_24)
-    return t("dashboard.hoursAgo", { n: Math.floor(ms / 3600_000) });
-  return t("dashboard.daysAgo", { n: Math.floor(ms / HOUR_24) });
+/** Bucket labels are formatted here so they follow the viewer's timezone. */
+function seriesLabels(since: string, bucketSeconds: number, count: number): string[] {
+  const start = new Date(since).getTime();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return Array.from({ length: count }, (_, i) => {
+    const d = new Date(start + i * bucketSeconds * 1000);
+    if (bucketSeconds >= 86400) return `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    if (bucketSeconds >= 3600) return `${pad(d.getHours())}:00`;
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  });
 }
 
-/** HTTP status → semantic tone for log badges. */
-function statusTone(status: number): "ok" | "warn" | "danger" | "neutral" {
+/** Localized bucket-size caption ("1 hour", "6 h", "15 min"). */
+function granularity(seconds: number): { key: string; n: number } {
+  if (seconds >= 86400) return { key: "dashboard.unitDay", n: Math.round(seconds / 86400) };
+  if (seconds >= 3600) return { key: "dashboard.unitHour", n: Math.round(seconds / 3600) };
+  return { key: "dashboard.unitMinute", n: Math.max(1, Math.round(seconds / 60)) };
+}
+
+/** HTTP status → semantic tone for log badges. */ function statusTone(
+  status: number,
+): "ok" | "warn" | "danger" | "neutral" {
   if (status >= 200 && status < 300) return "ok";
   if (status >= 400 && status < 500) return "warn";
   if (status >= 500) return "danger";
@@ -87,9 +97,7 @@ function EndpointStrip() {
       <span className="endpoint-mono" aria-hidden="true">
         POST
       </span>
-      <span
-        className={`endpoint-dot${ready.data === true ? " is-healthy" : ""}`}
-      />
+      <span className={`endpoint-dot${ready.data === true ? " is-healthy" : ""}`} />
       <div className="endpoint-copy">
         <strong>{t("dashboard.endpoint")}</strong>
         <code>{endpoint}</code>
@@ -165,187 +173,248 @@ function ResultDistribution({
   );
 }
 
-export function Dashboard() {
-  const { client } = useSession();
-  const s = api(client!);
-  const { t } = useI18n();
+/** Drill-down target: a bucket of the main series. */
+type Zoom = { since: string; until: string; label: string };
 
-  const summary = useQuery({
-    queryKey: ["usage-summary"],
-    queryFn: ({ signal }) => s.usageSummary(undefined, signal),
+/** The smallest previous-window base that makes a trend percentage meaningful. */
+const MIN_TREND_BASE = 10;
+
+/**
+ * What the overview needs from its host.
+ *
+ * The console reads the whole gateway; a member reads their own account. Both
+ * render this same component, so the data access is injected rather than
+ * reached for — the split the keys and logs pages already use, and the reason
+ * the member app can mount a page this elaborate at all.
+ */
+export interface DashboardSource {
+  summary: (
+    query: { since?: string; until?: string },
+    signal?: AbortSignal,
+  ) => Promise<UsageSummary>;
+  series: (
+    query: { since?: string; until?: string; buckets: number },
+    signal?: AbortSignal,
+  ) => Promise<UsageSeries>;
+  topModels: (
+    query: { since?: string; until?: string; limit: number },
+    signal?: AbortSignal,
+  ) => Promise<ModelUsage[]>;
+  recent: (
+    query: { limit: number; since?: string; until?: string },
+    signal?: AbortSignal,
+  ) => Promise<ProxyLog[]>;
+  /** Channel health: the gateway's own internals, absent for a member. */
+  channels?: (signal?: AbortSignal) => Promise<ChannelOverview[]>;
+}
+
+export interface DashboardCapabilities {
+  /** The channel-health matrix. */
+  channels: boolean;
+  /** The upstream-site notice board: a fleet fact, not the reader's own. */
+  siteNews: boolean;
+  /** The first-run setup guide, which configures the gateway itself. */
+  setup: boolean;
+  /** Links into the console's own pages (connections, models). */
+  consoleLinks: boolean;
+  /**
+   * This is somebody's own account rather than the gateway's: the page opens
+   * with the member's own band (identity, budget, the way in) instead of the
+   * operator's endpoint strip, and it drops the operator's flourishes.
+   */
+  memberHome: boolean;
+}
+
+export const ADMIN_DASHBOARD_CAPS: DashboardCapabilities = {
+  channels: true,
+  siteNews: true,
+  setup: true,
+  consoleLinks: true,
+  memberHome: false,
+};
+
+/**
+ * The member's overview: same cards and chart, no site internals.
+ *
+ * There is deliberately no channel matrix here — a member buys model access,
+ * not insight into which upstreams the gateway runs — and no setup guide, which
+ * would be instructions for configuring somebody else's gateway.
+ */
+export const MEMBER_DASHBOARD_CAPS: DashboardCapabilities = {
+  channels: false,
+  siteNews: false,
+  setup: false,
+  consoleLinks: false,
+  memberHome: true,
+};
+
+/**
+ * The overview, for whoever is signed in.
+ *
+ * Staff read the gateway (every endpoint, channel-health matrix included); a
+ * member reads their own account through /me/usage/*, which the member source
+ * owns. One page, one component — the difference is which source it is handed,
+ * exactly as on the token and log pages.
+ */
+export function Dashboard() {
+  const { client, role } = useSession();
+  const { t } = useI18n();
+  const member = role === "member";
+  // The member's home is titled with their own name, so the page heading has to
+  // know who is reading it. Same query key as the band below, so this costs no
+  // extra request — react-query serves both from one.
+  const account = useQuery({
+    queryKey: ["me", "account"],
+    queryFn: ({ signal }) => accountRequest<Account>("/me", { signal }),
+    enabled: member,
+  });
+  const source = useMemo<DashboardSource>(() => {
+    if (member) return memberDashboardSource;
+    const s = api(client!);
+    return {
+      summary: (query, signal) => s.usageSummary(undefined, signal, query.since, query.until),
+      series: (query, signal) => s.usageSeries(query, signal),
+      topModels: (query, signal) => s.usageTopModels(query, signal),
+      recent: (query, signal) => s.proxyLogs(query, signal),
+      channels: (signal) => s.channelOverviews(signal),
+    };
+  }, [client, member]);
+  const memberTitle = member
+    ? account.data
+      ? t("member.home.greeting", {
+          name: account.data.user.name || account.data.user.username,
+        })
+      : undefined
+    : undefined;
+  return (
+    <DashboardView
+      source={source}
+      caps={member ? MEMBER_DASHBOARD_CAPS : ADMIN_DASHBOARD_CAPS}
+      title={memberTitle}
+    />
+  );
+}
+
+import { memberDashboardSource } from "../member/MemberDashboardSource";
+import { accountRequest } from "../team/transport";
+import type { Account } from "../team/types";
+
+export function DashboardView({
+  source,
+  caps,
+  title,
+}: {
+  source: DashboardSource;
+  caps: DashboardCapabilities;
+  /** A host that knows who is reading may replace the page's own heading. */
+  title?: string;
+}) {
+  const [replayEntrance, setReplayEntrance] = useState(false);
+  const { t } = useI18n();
+  const [params, setParams] = useSearchParams();
+  const range = useUrlTimeRange(params, setParams);
+  const [zoom, setZoom] = useState<Zoom | null>(null);
+
+  // All-time totals stay available so "how many requests has this gateway ever
+  // served" does not depend on the selected window.
+  const allTime = useQuery({
+    queryKey: ["usage-summary", "all"],
+    queryFn: ({ signal }) => source.summary({}, signal),
     refetchInterval: 30_000,
   });
-  const recentSummary = useQuery({
-    queryKey: ["usage-summary", "24h"],
-    queryFn: ({ signal }) =>
-      s.usageSummary(
-        undefined,
+  // Everything else is windowed: the cards, the matrix, the chart, the ranking.
+  const rangeSummary = useQuery({
+    queryKey: ["usage-summary", "range", { since: range.since, until: range.until }],
+    queryFn: ({ signal }) => source.summary({ since: range.since, until: range.until }, signal),
+    refetchInterval: 30_000,
+  });
+  // The equal-length window immediately before, for an honest trend badge.
+  const previous = useQuery({
+    queryKey: ["usage-summary", "previous", { since: range.since, until: range.until }],
+    enabled: Boolean(range.since && range.until),
+    queryFn: ({ signal }) => {
+      const from = new Date(range.since!).getTime();
+      const span = new Date(range.until!).getTime() - from;
+      return source.summary(
+        { since: new Date(from - span).toISOString(), until: range.since },
         signal,
-        new Date(Date.now() - HOUR_24).toISOString(),
-      ),
-    refetchInterval: 30_000,
+      );
+    },
+    refetchInterval: 60_000,
   });
-  const usage = useQuery({
-    queryKey: ["usage-latest"],
-    queryFn: ({ signal }) => s.usageRecords({ limit: 500 }, signal),
+  const zoomSummary = useQuery({
+    queryKey: ["usage-summary", "range", { since: zoom?.since, until: zoom?.until }],
+    enabled: zoom != null,
+    queryFn: ({ signal }) => source.summary({ since: zoom!.since, until: zoom!.until }, signal),
+  });
+  const series = useQuery({
+    queryKey: [
+      "usage-series",
+      zoom
+        ? { since: zoom.since, until: zoom.until, buckets: 12 }
+        : { since: range.since, until: range.until, buckets: 48 },
+    ],
+    queryFn: ({ signal }) =>
+      zoom
+        ? source.series({ since: zoom.since, until: zoom.until, buckets: 12 }, signal)
+        : source.series({ since: range.since, until: range.until, buckets: 48 }, signal),
+    refetchInterval: zoom ? false : 30_000,
+  });
+  const topModels = useQuery({
+    queryKey: ["usage-top-models", { since: range.since, until: range.until }],
+    queryFn: ({ signal }) =>
+      source.topModels({ since: range.since, until: range.until, limit: 6 }, signal),
     refetchInterval: 30_000,
   });
   const channels = useQuery({
     queryKey: ["channel-overviews"],
-    queryFn: ({ signal }) => s.channelOverviews(signal),
+    queryFn: ({ signal }) => source.channels!(signal),
+    // A host without channel data (the member app) must not fire the query at
+    // all — there is no endpoint behind it.
+    enabled: caps.channels && !!source.channels,
     refetchInterval: 30_000,
   });
   const logs = useQuery({
-    queryKey: ["proxy-logs", { limit: 6 }],
-    queryFn: ({ signal }) => s.proxyLogs({ limit: 6 }, signal),
+    queryKey: ["proxy-logs", { limit: 8, since: range.since, until: range.until }],
+    queryFn: ({ signal }) =>
+      source.recent({ limit: 8, since: range.since, until: range.until }, signal),
     refetchInterval: 15_000,
   });
-
-  const [windowHours, setWindowHours] = useState<24 | 48>(24);
-  const [selectedHour, setSelectedHour] = useState<number | null>(null);
-  const now = Date.now();
-  const recent = useMemo(() => {
-    const cutoff = now - HOUR_24;
-    return (usage.data ?? []).filter(
-      (row) => new Date(row.created_at).getTime() >= cutoff,
-    );
-  }, [usage.data, now]);
 
   const channelCounts = useMemo(() => {
     const all = channels.data ?? [];
     const enabled = all.filter((c) => c.channel.status === "enabled").length;
-    const healthy = all.filter(
-      (c) => channelHealthState(c) === "healthy",
-    ).length;
+    const healthy = all.filter((c) => channelHealthState(c) === "healthy").length;
     return { total: all.length, enabled, healthy };
   }, [channels.data]);
 
-  /** Wall-clock hourly buckets (oldest → newest) for the overview chart. */
-  const hourly = useMemo(() => {
-    const n = windowHours;
-    const currentHour = new Date(now);
-    currentHour.setMinutes(0, 0, 0);
-    const firstStart = currentHour.getTime() - (n - 1) * 3600_000;
-    const starts = Array.from(
-      { length: n },
-      (_, i) => firstStart + i * 3600_000,
-    );
-    const buckets = Array.from({ length: n }, () => ({
-      req: 0,
-      tok: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-    }));
-    for (const row of usage.data ?? []) {
-      const index = Math.floor(
-        (new Date(row.created_at).getTime() - firstStart) / 3600_000,
-      );
-      if (index >= 0 && index < n) {
-        buckets[index]!.req += 1;
-        buckets[index]!.tok += row.total_tokens ?? 0;
-        buckets[index]!.cacheRead += row.cache_read_tokens ?? 0;
-        buckets[index]!.cacheWrite += row.cache_creation_tokens ?? 0;
-      }
-    }
-    return {
-      requests: buckets.map((b) => b.req),
-      tokens: buckets.map((b) => b.tok),
-      cacheRead: buckets.map((b) => b.cacheRead),
-      cacheWrite: buckets.map((b) => b.cacheWrite),
-      labels: starts.map((ms) => {
-        const d = new Date(ms);
-        return `${String(d.getHours()).padStart(2, "0")}:00`;
-      }),
-      starts,
-    };
-  }, [usage.data, now, windowHours]);
+  const summary = rangeSummary.data;
+  const matrix = (zoom ? zoomSummary.data : undefined) ?? summary;
 
-  /** Detailed minute buckets for the selected hour. */
-  const detail = useMemo(() => {
-    if (selectedHour == null) return null;
-    const hourStart = hourly.starts[selectedHour];
-    if (hourStart == null) return null;
-    const buckets = Array.from({ length: 12 }, () => ({ req: 0, tok: 0 }));
-    for (const row of usage.data ?? []) {
-      const ms = new Date(row.created_at).getTime();
-      if (ms >= hourStart && ms < hourStart + 3600_000) {
-        const index = Math.floor((ms - hourStart) / (5 * 60_000));
-        if (index >= 0 && index < 12) {
-          buckets[index]!.req += 1;
-          buckets[index]!.tok += row.total_tokens ?? 0;
-        }
-      }
-    }
-    return {
-      requests: buckets.map((b) => b.req),
-      tokens: buckets.map((b) => b.tok),
-      labels: Array.from({ length: 12 }, (_, i) => {
-        const d = new Date(hourStart + i * 5 * 60_000);
-        return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-      }),
-      start: hourStart,
-    };
-  }, [selectedHour, hourly.starts, usage.data]);
-
-  const recentRequests =
-    recentSummary.data?.request_count ??
-    recent.length;
-  const recentTokens =
-    recentSummary.data?.total_tokens ??
-    recent.reduce((sum, row) => sum + (row.total_tokens ?? 0), 0);
-  const prev24 =
-    (summary.data?.request_count ?? 0) - recentRequests;
-  const recentCost =
-    recentSummary.data?.cost ??
-    recentSummary.data?.estimated_cost ??
-    recent.reduce((sum, row) => sum + (row.cost ?? 0), 0);
-  const cacheRead24h = recent.reduce(
-    (sum, row) => sum + (row.cache_read_tokens ?? 0),
-    0,
-  );
+  const windowRequests = summary?.request_count ?? 0;
+  const previousRequests = previous.data?.request_count ?? 0;
+  // A percentage against a window that held a handful of requests is arithmetic,
+  // not information: a quiet previous period is what turns an ordinary day into
+  // "+15800%". The badge waits until the base is big enough to mean something.
   const requestTrend =
-    recentRequests > 0 && prev24 > 0 ? recentRequests / prev24 - 1 : null;
-  const healthyRatio =
-    channelCounts.total > 0 ? channelCounts.healthy / channelCounts.total : 1;
-  const healthTone =
-    channelCounts.total === 0
-      ? "warning"
-      : healthyRatio >= 1
-        ? "success"
-        : healthyRatio >= 0.5
-          ? "warning"
-          : "danger";
-
-  // Status-code buckets over the visible chart window or selected hour.
-  const windowRows = useMemo(() => {
-    const cutoff = now - windowHours * 3600_000;
-    return (usage.data ?? []).filter(
-      (row) => new Date(row.created_at).getTime() >= cutoff,
-    );
-  }, [usage.data, now, windowHours]);
-  const chartRows = useMemo(() => {
-    if (detail == null) return windowRows;
-    return (usage.data ?? []).filter((row) => {
-      const ms = new Date(row.created_at).getTime();
-      return ms >= detail.start && ms < detail.start + 3600_000;
-    });
-  }, [detail, usage.data, windowRows]);
-  const breakdown = useMemo(() => {
-    const buckets = { ok: 0, clientError: 0, serverError: 0, other: 0 };
-    for (const row of chartRows) {
-      const s = row.status;
-      if (s >= 200 && s < 300) buckets.ok += 1;
-      else if (s >= 400 && s < 500) buckets.clientError += 1;
-      else if (s >= 500) buckets.serverError += 1;
-      else buckets.other += 1;
-    }
-    return buckets;
-  }, [chartRows]);
-  const successRate =
-    recentRequests > 0
-      ? recent.filter((row) => row.status >= 200 && row.status < 300).length /
-        recentRequests
+    range.since && previousRequests >= MIN_TREND_BASE && windowRequests > 0
+      ? windowRequests / previousRequests - 1
       : null;
+
+  // 2xx share. Older gateways omit the breakdown, so fall back to "total minus
+  // everything that is not 2xx".
+  const okCount =
+    matrix == null
+      ? 0
+      : (matrix.ok_count ??
+        Math.max(
+          0,
+          matrix.request_count -
+            (matrix.client_error_count ?? 0) -
+            (matrix.server_error_count ?? 0) -
+            (matrix.other_count ?? 0),
+        ));
+  const successRate = matrix && matrix.request_count > 0 ? okCount / matrix.request_count : null;
   const successTone =
     successRate === null
       ? "primary"
@@ -355,71 +424,94 @@ export function Dashboard() {
           ? "warning"
           : "danger";
 
-  // Model usage ranking over the visible 24h window.
-  const topModels = useMemo(() => {
-    const map = new Map<string, { requests: number; tokens: number }>();
-    for (const row of recent) {
-      const entry = map.get(row.model) ?? { requests: 0, tokens: 0 };
-      entry.requests += 1;
-      entry.tokens += row.total_tokens ?? 0;
-      map.set(row.model, entry);
-    }
-    return [...map.entries()]
-      .sort(
-        (a, b) =>
-          b[1].tokens - a[1].tokens || b[1].requests - a[1].requests,
-      )
-      .slice(0, 6)
-      .map(([model, stats]) => ({ model, ...stats }));
-  }, [recent]);
-  const maxModelRequests = Math.max(1, ...topModels.map((m) => m.requests));
+  const bucketSeconds = series.data?.bucket_seconds ?? 3600;
+  const labels = useMemo(
+    () =>
+      series.data
+        ? seriesLabels(series.data.since, series.data.bucket_seconds, series.data.requests.length)
+        : [],
+    [series.data],
+  );
+  const windowTokens = (series.data?.tokens ?? []).reduce((sum, n) => sum + n, 0);
+  const grain = granularity(bucketSeconds);
 
+  const openBucket = (index: number) => {
+    if (!series.data) return;
+    const start = new Date(series.data.since).getTime() + index * series.data.bucket_seconds * 1000;
+    setZoom({
+      since: new Date(start).toISOString(),
+      until: new Date(start + series.data.bucket_seconds * 1000).toISOString(),
+      label: labels[index] ?? "",
+    });
+  };
+
+  const ranked = topModels.data ?? [];
+  const maxModelRequests = Math.max(1, ...ranked.map((m) => m.requests));
   const recentLogs = logs.data ?? [];
+  const rangeCaption = describeRange(range.since, range.until, t);
 
   return (
     <Page
-      kicker={t("dashboard.kicker")}
-      title={t("dashboard.title")}
-      description={t("dashboard.description")}
+      className="dashboard-page"
+      title={title ?? t("dashboard.title")}
+      // A host without the channel matrix gets a description that does not
+      // promise it: the panel is not its to show (see DashboardCapabilities).
+      description={caps.channels ? t("dashboard.description") : t("dashboard.descriptionMember")}
+      actions={
+        // Replaying the brand entrance is the operator's flourish; a member's own
+        // home is a place to check a balance and leave, not to watch an animated
+        // gateway. Staff keep it.
+        caps.memberHome ? undefined : (
+          <Button variant="quiet" icon={<Play size={14} />} onClick={() => setReplayEntrance(true)}>
+            {t("motion.replay")}
+          </Button>
+        )
+      }
     >
+      <DashboardAura />
+      {replayEntrance ? <GatewayPreview onClose={() => setReplayEntrance(false)} /> : null}
       <div className="cockpit-stack">
-        <SetupGuide />
+        {/* The member's own band answers "where do I connect, what is left, what
+            next" in one place; the endpoint strip below it is the operator's
+            version of the same line, so a host renders one or the other. */}
+        {caps.memberHome ? <MemberHome /> : null}
+        {caps.setup ? <SetupGuide /> : null}
 
-        {/* 1. 终端接入端点条 (Gateway Endpoint Strip) */}
-        <EndpointStrip />
+        {caps.memberHome ? null : <EndpointStrip />}
 
         {/* 2. 一体化遥测读数条 (Instrument Telemetry Band) */}
         <div className="telemetry-stack">
+          {/* 四张卡回答的是个人运维真正在看的四件事：用了多少次、花了多少钱、
+              烧了多少 token、失败没有。累计请求与健康渠道属于网关自身的指标，
+              它们在同页的流量图与渠道健康面板里都有，不占这四个格子。 */}
           <TelemetryStrip
             items={[
               {
-                label: t("dashboard.totalRequests"),
-                value: summary.data?.request_count ?? "—",
-                hint: t("dashboard.totalRequestsHint"),
-                icon: <Activity size={13} />,
-                tone: "primary",
-              },
-              {
                 label: t("dashboard.recentRequests"),
-                value: summary.isPending ? "—" : recentRequests,
+                value: rangeSummary.isPending ? "—" : windowRequests,
                 hint: t("dashboard.recentRequestsHint"),
                 icon: <ScrollText size={13} />,
-                tone: "success",
+                tone: "primary",
                 trend: requestTrend,
               },
               {
-                label: t("dashboard.healthyChannels"),
-                value: channels.isPending
-                  ? "—"
-                  : `${channelCounts.healthy}/${channelCounts.total}`,
-                hint: t("dashboard.healthyChannelsHint"),
-                icon: <HeartPulse size={13} />,
-                tone: healthTone,
+                label: t("dashboard.rangeCost"),
+                value: rangeSummary.isPending ? "—" : formatCost(summary?.cost ?? 0),
+                hint: t("dashboard.rangeCostHint"),
+                icon: <Wallet size={13} />,
+                tone: "success",
+              },
+              {
+                label: t("dashboard.rangeTokensLabel"),
+                value: rangeSummary.isPending ? "—" : formatTokens(summary?.total_tokens ?? 0),
+                hint: t("dashboard.rangeTokensHint"),
+                icon: <Coins size={13} />,
+                tone: "primary",
               },
               {
                 label: t("dashboard.successRate"),
                 value:
-                  summary.isPending || successRate === null
+                  rangeSummary.isPending || successRate === null
                     ? "—"
                     : `${Math.round(successRate * 100)}%`,
                 hint: t("dashboard.successRateHint"),
@@ -431,22 +523,23 @@ export function Dashboard() {
           <TelemetrySecondary
             items={[
               {
-                label: t("dashboard.totalTokens"),
-                value: summary.data
-                  ? formatTokens(summary.data.total_tokens)
-                  : "—",
-                hint: t("dashboard.totalTokensHint"),
-                icon: <Coins size={13} />,
+                label: t("dashboard.avgLatency"),
+                value:
+                  rangeSummary.isPending || !summary || summary.ok_count === 0
+                    ? "—"
+                    : formatLatency(summary.avg_latency_ms ?? 0),
+                hint: t("dashboard.avgLatencyHint"),
+                icon: <Timer size={13} />,
               },
               {
-                label: t("dashboard.cost24h"),
-                value: recentSummary.isPending ? "—" : formatCost(recentCost),
-                hint: t("dashboard.cost24hHint"),
-                icon: <Wallet size={13} />,
+                label: t("dashboard.totalTokens"),
+                value: allTime.data ? formatTokens(allTime.data.total_tokens) : "—",
+                hint: t("dashboard.totalTokensHint"),
+                icon: <Activity size={13} />,
               },
               {
                 label: t("dashboard.cacheRead"),
-                value: summary.isPending ? "—" : formatTokens(cacheRead24h),
+                value: rangeSummary.isPending ? "—" : formatTokens(summary?.cache_read_tokens ?? 0),
                 hint: t("dashboard.cacheReadHint"),
                 icon: <Database size={13} />,
               },
@@ -454,15 +547,16 @@ export function Dashboard() {
           />
         </div>
 
-        {/* 3. 全景流量波形与状态分布监视舱 (Traffic & Result Matrix) */}
+        {/* 3. 全景流量波形与状态分布监视舱 (Traffic & Result Matrix)
+               时间区间控件就落在本面板表头，紧贴它所解释的窗口读数。 */}
         <Panel className="cockpit-panel cockpit-chart-panel">
           <div className="panel-header cockpit-chart-header">
             <div className="cockpit-chart-title">
-              {detail ? (
+              {zoom ? (
                 <button
                   type="button"
                   className="chart-back-button"
-                  onClick={() => setSelectedHour(null)}
+                  onClick={() => setZoom(null)}
                   aria-label={t("dashboard.chartBack")}
                 >
                   <ArrowLeft size={14} />
@@ -471,135 +565,200 @@ export function Dashboard() {
                 <Activity size={15} />
               )}
               <strong>
-                {detail
-                  ? t("dashboard.hourlyDetail", {
-                      label: hourly.labels[selectedHour ?? 0] ?? "",
-                    })
+                {zoom
+                  ? t("dashboard.hourlyDetail", { label: zoom.label })
                   : t("dashboard.hourlyTraffic")}
               </strong>
-              {detail ? (
-                <span className="chart-detail-pill">
-                  {t("dashboard.chartDetailGranularity")}
-                </span>
-              ) : null}
+              <span className="chart-detail-pill">
+                {t("dashboard.granularity", { unit: t(grain.key, { n: grain.n }) })}
+              </span>
             </div>
-            <span className="panel-muted">
-              {detail
-                ? t("dashboard.chartDetailSummary", {
-                    n: detail.requests.reduce((sum, value) => sum + value, 0),
-                  })
-                : t("dashboard.tokens24h", { n: formatTokens(recentTokens) })}
-            </span>
-            <div
-              className="chart-window-tabs"
-              role="tablist"
-              aria-label={t("dashboard.chartWindow")}
-            >
-              {WINDOWS.map((w) => (
-                <button
-                  key={w.hours}
-                  type="button"
-                  role="tab"
-                  aria-selected={windowHours === w.hours}
-                  className={windowHours === w.hours ? "is-active" : ""}
-                  onClick={() => {
-                    setWindowHours(w.hours);
-                    setSelectedHour(null);
-                  }}
-                >
-                  {t(w.labelKey)}
-                </button>
-              ))}
+            {/* The window control belongs with the readout it explains, not on
+                a full-width bar above the fold. */}
+            <div className="chart-header-tools">
+              <TimeRangePicker
+                range={range}
+                compact
+                onRefresh={() => {
+                  setZoom(null);
+                  void series.refetch();
+                }}
+              />
+              <span className="panel-muted">
+                {zoom
+                  ? t("dashboard.chartDetailSummary", {
+                      n: (series.data?.requests ?? []).reduce((sum, n) => sum + n, 0),
+                    })
+                  : t("dashboard.rangeTokens", { n: formatTokens(windowTokens) })}
+              </span>
             </div>
           </div>
           <HourlyTrafficChart
-            key={detail ? `detail-${selectedHour}` : "overview"}
-            requests={detail?.requests ?? hourly.requests}
-            tokens={detail?.tokens ?? hourly.tokens}
-            labels={detail?.labels ?? hourly.labels}
-            height={detail ? 200 : 160}
-            labelStep={detail ? 1 : windowHours > 24 ? 8 : 4}
-            zoomed={detail != null}
-            onSelect={detail ? undefined : setSelectedHour}
+            key={zoom ? `zoom-${zoom.since}` : "overview"}
+            requests={series.data?.requests ?? []}
+            tokens={series.data?.tokens ?? []}
+            failed={series.data?.failed ?? []}
+            labels={labels}
+            height={zoom ? 200 : 168}
+            labelStep={Math.max(1, Math.round((labels.length || 1) / 8))}
+            zoomed={zoom != null}
+            onSelect={zoom ? undefined : openBucket}
           />
           <ResultDistribution
-            ok={breakdown.ok}
-            clientError={breakdown.clientError}
-            serverError={breakdown.serverError}
-            other={breakdown.other}
+            ok={okCount}
+            clientError={matrix?.client_error_count ?? 0}
+            serverError={matrix?.server_error_count ?? 0}
+            other={matrix?.other_count ?? 0}
           />
         </Panel>
 
         {/* 4. 双轨联动作战区：渠道健康状态阵列 + 实时遥测日志流 */}
+        {/* 这一排两个面板都是运维信息：成员的总览直接跳过整行，而不是渲染一个空网格。
+            只有两个面板都在时才是双轨，否则单列满宽。 */}
+        {caps.channels || caps.siteNews ? (
+          <div className={`cockpit-dual-grid${caps.channels && caps.siteNews ? "" : " is-single"}`}>
+            {/* 左轨：渠道健康雷达点阵（只有宿主能看到渠道时才渲染） */}
+            {caps.channels ? (
+              <Panel className="cockpit-panel cockpit-health-panel">
+                <div className="panel-header">
+                  <div className="cockpit-panel-title">
+                    <Boxes size={14} />
+                    <strong>{t("dashboard.channelHealth")}</strong>
+                  </div>
+                  <span className="panel-muted">
+                    {t("dashboard.enabledOf", {
+                      n: channelCounts.enabled,
+                      total: channelCounts.total,
+                    })}
+                  </span>
+                </div>
+                <ul className="cockpit-channel-list">
+                  {(channels.data ?? []).map((c) => {
+                    const health = channelHealthState(c);
+                    const tone =
+                      health === "healthy"
+                        ? "ok"
+                        : health === "unhealthy"
+                          ? "danger"
+                          : health === "disabled"
+                            ? "off"
+                            : "warn";
+                    return (
+                      <li key={c.channel.id} className={`cockpit-channel-item is-${tone}`}>
+                        {caps.consoleLinks ? (
+                          <Link
+                            className="cockpit-channel-name"
+                            to={`/channels?id=${c.channel.id}`}
+                            title={c.channel.name}
+                          >
+                            {c.channel.name}
+                          </Link>
+                        ) : (
+                          <span className="cockpit-channel-name" title={c.channel.name}>
+                            {c.channel.name}
+                          </span>
+                        )}
+                        <span className="cockpit-channel-meta">
+                          {health === "healthy" ? (
+                            <span className="badge badge-ok">
+                              <Zap size={10} /> {t("dashboard.ready")}
+                            </span>
+                          ) : health === "disabled" ? (
+                            <span className="badge badge-neutral">{t("dashboard.disabled")}</span>
+                          ) : (
+                            <span
+                              className={`badge badge-${health === "unhealthy" ? "danger" : "warn"}`}
+                            >
+                              <AlertTriangle size={10} />
+                              {t(`channels.healthState.${health}`)}
+                            </span>
+                          )}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </Panel>
+            ) : null}
+
+            {/* 右轨：上游站点消息（各站点自己发的公告）。它和渠道健康同一排：
+              两件事都是“网关外面发生了什么”。 */}
+            {caps.siteNews ? <SiteNewsPanel /> : null}
+          </div>
+        ) : null}
+
+        {/* 5. 模型负载消耗排行（SQL 聚合，不受列表行数上限影响）与最近代理请求流：
+            一个是模型名单，一个是刚刚发生的事，各占一半比各占满宽更好读。 */}
         <div className="cockpit-dual-grid">
-          {/* 左轨：渠道健康雷达点阵 */}
-          <Panel className="cockpit-panel cockpit-health-panel">
+          <Panel className="cockpit-panel cockpit-usage-panel">
             <div className="panel-header">
               <div className="cockpit-panel-title">
-                <Boxes size={14} />
-                <strong>{t("dashboard.channelHealth")}</strong>
+                <TrendingUp size={14} />
+                <strong>{t("dashboard.topModels")}</strong>
               </div>
               <span className="panel-muted">
-                {t("dashboard.enabledOf", {
-                  n: channelCounts.enabled,
-                  total: channelCounts.total,
-                })}
+                {t("dashboard.rangeTokens", { n: formatTokens(windowTokens) })}
               </span>
             </div>
-            <ul className="cockpit-channel-list">
-              {(channels.data ?? []).map((c) => {
-                const health = channelHealthState(c);
-                const tone =
-                  health === "healthy"
-                    ? "ok"
-                    : health === "unhealthy"
-                      ? "danger"
-                      : health === "disabled"
-                        ? "off"
-                        : "warn";
-                return (
-                  <li key={c.channel.id} className={`cockpit-channel-item is-${tone}`}>
-                    <Link
-                      className="cockpit-channel-name"
-                      to={`/channels?id=${c.channel.id}`}
-                      title={c.channel.name}
-                    >
-                      {c.channel.name}
-                    </Link>
-                    <span className="cockpit-channel-meta">
-                      {health === "healthy" ? (
-                        <span className="badge badge-ok">
-                          <Zap size={10} /> {t("dashboard.ready")}
+            <div className="cockpit-usage-body">
+              <div className="cockpit-subcol">
+                {ranked.length === 0 ? (
+                  <p className="dashboard-empty">{t("dashboard.topModelsEmpty")}</p>
+                ) : (
+                  <ul className="model-rank">
+                    {ranked.map((m) => (
+                      <li key={m.model}>
+                        {caps.consoleLinks ? (
+                          <Link
+                            className="model-rank-name"
+                            to={`/models?model=${encodeURIComponent(m.model)}`}
+                            title={m.model}
+                          >
+                            {m.model}
+                          </Link>
+                        ) : (
+                          <span className="model-rank-name" title={m.model}>
+                            {m.model}
+                          </span>
+                        )}
+                        <span className="model-rank-track">
+                          <span
+                            className="model-rank-fill"
+                            style={{
+                              transform: `scaleX(${m.requests / maxModelRequests})`,
+                            }}
+                          />
                         </span>
-                      ) : health === "disabled" ? (
-                        <span className="badge badge-neutral">
-                          {t("dashboard.disabled")}
+                        <span className="model-rank-meta">
+                          <strong>{m.requests}</strong>
+                          <small>{t("dashboard.colRequests")}</small>
+                          <i>·</i>
+                          <strong>{formatTokens(m.total_tokens)}</strong>
+                          <small>{t("dashboard.colTokens")}</small>
+                          {m.failed > 0 ? (
+                            <>
+                              <i>·</i>
+                              <strong className="is-warn">{m.failed}</strong>
+                              <small>{t("dashboard.colFailed")}</small>
+                            </>
+                          ) : null}
                         </span>
-                      ) : (
-                        <span
-                          className={`badge badge-${health === "unhealthy" ? "danger" : "warn"}`}
-                        >
-                          <AlertTriangle size={10} />
-                          {t(`channels.healthState.${health}`)}
-                        </span>
-                      )}
-                    </span>
-                  </li>
-                );
-              })}
-            </ul>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
           </Panel>
 
-          {/* 右轨：最近代理请求流 */}
+          {/* 右轨：最近代理请求流（跟随所选区间） */}
           <Panel className="cockpit-panel cockpit-logs-panel">
             <div className="panel-header">
               <div className="cockpit-panel-title">
                 <ScrollText size={14} />
                 <strong>{t("dashboard.recentLogs")}</strong>
               </div>
-              <span className="panel-muted">
-                {t("dashboard.cost", { n: recentCost.toFixed(6) })}
-              </span>
+              <span className="panel-muted">{rangeCaption}</span>
             </div>
             {recentLogs.length === 0 ? (
               <p className="dashboard-empty">{t("dashboard.noLogs")}</p>
@@ -610,21 +769,26 @@ export function Dashboard() {
                   return (
                     <li key={log.id} className="cockpit-log-item">
                       <span className={`cockpit-log-status is-${tone}`} aria-hidden="true" />
-                      <Link
-                        className="cockpit-log-model"
-                        to={`/models?model=${encodeURIComponent(log.model)}`}
-                      >
-                        {log.model}
-                        {log.route_id ? ` #${log.route_id}` : ""}
-                      </Link>
+                      {caps.consoleLinks ? (
+                        <Link
+                          className="cockpit-log-model"
+                          to={`/models?model=${encodeURIComponent(log.model)}`}
+                        >
+                          {log.model}
+                          {log.route_id ? ` #${log.route_id}` : ""}
+                        </Link>
+                      ) : (
+                        // The route id is the gateway's internal handle for a
+                        // model; a member gets the model name and nothing more.
+                        <span className="cockpit-log-model">{log.model}</span>
+                      )}
                       <div className="cockpit-log-right">
-                        <span className={`badge badge-${tone}`}>
-                          {log.status}
-                        </span>
+                        {(log.total_tokens ?? 0) > 0 ? (
+                          <span className="mono-value">{formatTokens(log.total_tokens ?? 0)}</span>
+                        ) : null}
+                        <span className={`badge badge-${tone}`}>{log.status}</span>
                         <span className="mono-value">{log.latency_ms}ms</span>
-                        <span className="cockpit-log-time">
-                          {relativeTime(log.created_at, t)}
-                        </span>
+                        <span className="cockpit-log-time">{relativeTime(log.created_at, t)}</span>
                       </div>
                     </li>
                   );
@@ -633,84 +797,6 @@ export function Dashboard() {
             )}
           </Panel>
         </div>
-
-        {/* 5. 模型负载消耗排行与 24h 实时请求分析 */}
-        <Panel className="cockpit-panel cockpit-usage-panel">
-          <div className="panel-header">
-            <div className="cockpit-panel-title">
-              <TrendingUp size={14} />
-              <strong>{t("dashboard.topModels")}</strong>
-            </div>
-            <span className="panel-muted">
-              {t("dashboard.tokens24h", { n: formatTokens(recentTokens) })}
-            </span>
-          </div>
-          <div className="cockpit-usage-body">
-            <div className="cockpit-subcol">
-              {topModels.length === 0 ? (
-                <p className="dashboard-empty">{t("dashboard.topModelsEmpty")}</p>
-              ) : (
-                <ul className="model-rank">
-                  {topModels.map((m) => (
-                    <li key={m.model}>
-                      <Link
-                        className="model-rank-name"
-                        to={`/models?model=${encodeURIComponent(m.model)}`}
-                        title={m.model}
-                      >
-                        {m.model}
-                      </Link>
-                      <span className="model-rank-track">
-                        <span
-                          className="model-rank-fill"
-                          style={{
-                            transform: `scaleX(${m.requests / maxModelRequests})`,
-                          }}
-                        />
-                      </span>
-                      <span className="model-rank-meta">
-                        <strong>{m.requests}</strong>
-                        <small>{t("dashboard.colRequests")}</small>
-                        <i>·</i>
-                        <strong>{formatTokens(m.tokens)}</strong>
-                        <small>{t("dashboard.colTokens")}</small>
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-            <div className="cockpit-subcol cockpit-subcol-bordered">
-              <div className="cockpit-subhead">
-                <Cpu size={13} />
-                <strong>{t("dashboard.activity24h")}</strong>
-                <span className="panel-muted">
-                  {t("dashboard.recentRequests")}
-                </span>
-              </div>
-              {recent.length === 0 ? (
-                <p className="dashboard-empty">{t("dashboard.noActivity")}</p>
-              ) : (
-                <ul className="cockpit-log-list is-compact">
-                  {recent.slice(0, 8).map((row: UsageRecord) => (
-                    <li key={row.id} className="cockpit-log-item">
-                      <span className="cockpit-log-model">{row.model}</span>
-                      <div className="cockpit-log-right">
-                        <span className="mono-value">
-                          {formatTokens(row.total_tokens ?? 0)}
-                        </span>
-                        <span className="badge badge-neutral">{row.status}</span>
-                        <span className="cockpit-log-time">
-                          {relativeTime(row.created_at, t)}
-                        </span>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          </div>
-        </Panel>
       </div>
     </Page>
   );

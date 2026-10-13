@@ -125,8 +125,6 @@ type Editable struct {
 	// ChannelRetryTimes is how many times the same upstream key is re-sent
 	// after a retryable failure before moving to the next key/channel (0-5).
 	ChannelRetryTimes int `json:"channel_retry_times"`
-	// KeyPoolRotation enables rotating through the site key pool on failure.
-	KeyPoolRotation bool `json:"key_pool_rotation"`
 	// UpdateCheckEnabled lets the gateway query GitHub for a newer release to
 	// power the console update badge. Off means no outbound calls at all.
 	UpdateCheckEnabled bool `json:"update_check_enabled"`
@@ -134,6 +132,54 @@ type Editable struct {
 	// get when the create request omits model_sync_mode. Existing channels
 	// keep their own mode.
 	DefaultModelSyncMode string `json:"default_model_sync_mode"`
+	// SiteProbeIntervalSeconds / SiteProbeJitterSeconds drive the external
+	// site-probe collection loop. The cadence has to be configurable because
+	// sites publish their own probe data at wildly different rates: a status
+	// page that polls every 60s is useless at the 15-minute default, while one
+	// that polls every 15 minutes gains nothing from a faster round.
+	SiteProbeIntervalSeconds int `json:"site_probe_interval_seconds"`
+	SiteProbeJitterSeconds   int `json:"site_probe_jitter_seconds"`
+	// SiteNewsIntervalSeconds drives the upstream notice-board reader
+	// (internal/sitenews). It differs from the site-probe pair on one point: 0
+	// means OFF — the scheduled read stops and only the dashboard's refresh
+	// button reads boards — while -1 (unset) resolves to the env bootstrap.
+	SiteNewsIntervalSeconds int `json:"site_news_interval_seconds"`
+	// KeepaliveEnabled is the keepalive master switch; the per-site window and
+	// the per-channel switch live in the database, because the window is the
+	// site's own rule (15 days here, 30 there). DefaultIdleDays is the fallback
+	// window for a site that was never given one, and CheckIntervalSeconds is how
+	// often a round asks whether anything is due.
+	KeepaliveEnabled              bool `json:"keepalive_enabled"`
+	KeepaliveCheckIntervalSeconds int  `json:"keepalive_check_interval_seconds"`
+	KeepaliveDefaultIdleDays      int  `json:"keepalive_default_idle_days"`
+	// Outbound client limits. They are runtime settings because the header
+	// ceiling is what decides whether a slow upstream dies at 60s: the image
+	// endpoints needed 5 minutes and the fix used to require a .env edit and a
+	// container recreate. 0 = the deployment default (OUTBOUND_* in the
+	// environment); a non-zero value is an override that survives restarts.
+	OutboundConnectTimeoutSeconds     int `json:"outbound_connect_timeout_seconds"`
+	OutboundHeaderTimeoutSeconds      int `json:"outbound_header_timeout_seconds"`
+	OutboundImageHeaderTimeoutSeconds int `json:"outbound_image_header_timeout_seconds"`
+	OutboundTLSTimeoutSeconds         int `json:"outbound_tls_timeout_seconds"`
+	OutboundMaxIdleConns              int `json:"outbound_max_idle_conns"`
+	OutboundMaxIdleConnsPerHost       int `json:"outbound_max_idle_conns_per_host"`
+	// RelayMaxBodyMB / RelayMaxImageMB are the /v1 request-body ceilings in
+	// megabytes, for the same reason as the outbound limits above: the ceiling is
+	// what refuses an ordinary request (a chat call with inlined base64
+	// screenshots), and 0 means the deployment default (RELAY_MAX_*_MB) applies.
+	RelayMaxBodyMB  int `json:"relay_max_body_mb"`
+	RelayMaxImageMB int `json:"relay_max_image_mb"`
+}
+
+// OutboundLimits is the resolved outbound client configuration: timeouts and
+// pool sizes with the deployment defaults already applied.
+type OutboundLimits struct {
+	ConnectTimeout      time.Duration
+	HeaderTimeout       time.Duration
+	ImageHeaderTimeout  time.Duration
+	TLSTimeout          time.Duration
+	MaxIdleConns        int
+	MaxIdleConnsPerHost int
 }
 
 // Snapshot is the effective runtime view returned to Admin UI.
@@ -151,6 +197,12 @@ type Snapshot struct {
 	PluginsDir     string `json:"plugins_dir"`
 	// MetricsTokenMasked shows whether a metrics token is configured ("" = none).
 	MetricsTokenMasked string `json:"metrics_token_masked"`
+	// DeploymentParameters is every environment variable the process read at
+	// startup with the value it is actually running with. Read-only: an
+	// environment variable cannot be changed without recreating the container,
+	// and this is where an operator sees what the running process really uses
+	// (a variable compose never passed is indistinguishable from a default).
+	DeploymentParameters []config.EnvParam `json:"deployment_parameters"`
 }
 
 // Appliers are optional hot-reload targets. Nil entries are skipped.
@@ -161,15 +213,14 @@ type Appliers struct {
 	RelayLimiter *ratelimit.Limiter
 	AdminLimiter *ratelimit.Limiter
 	CheckinSched *checkin.Scheduler
-	// CheckinAllowed reports whether the check-in module may run (plugin gate).
-	// When nil, check-in enablement follows the editable flag alone.
-	CheckinAllowed func() bool
-	SetAudit       func(days, rows int)
-	SetAuditLoop   func(days, rows int)
-	// SetSticky hot-applies sticky-session routing: a non-nil store enables it
-	// (with the given TTL), nil disables it. The applier must rewire selector,
-	// proxy, and admin handler so the switch is live without a restart.
-	SetSticky func(store *routing.StickyStore, ttl time.Duration)
+	SetAudit     func(days, rows int)
+	SetAuditLoop func(days, rows int)
+	// SetSticky hot-applies sticky-session routing. enabled is only the default
+	// that routes inherit — the store is installed either way so a route can
+	// force affinity on for one model (routes.sticky_session) without a second
+	// global switch. The applier must rewire selector, proxy, and admin handler
+	// so the switch is live without a restart.
+	SetSticky func(store *routing.StickyStore, enabled bool, ttl time.Duration)
 	// SetGlobalProxy hot-applies the global outbound proxy ("" = direct). The
 	// callback validates the URL against the outbound SSRF policy.
 	SetGlobalProxy func(raw string) error
@@ -184,6 +235,10 @@ type Appliers struct {
 	SetProbeSchedule func(schedule ProbeSchedule) error
 	// SetRecoveryProbe hot-applies the passive-recovery probe configuration.
 	SetRecoveryProbe func(enabled bool, interval time.Duration)
+	// SetOutboundLimits hot-applies the outbound client limits (timeouts, pool
+	// sizes). Every outbound holder keeps one client whose transport is rebuilt,
+	// so the change lands on the next request instead of the next restart.
+	SetOutboundLimits func(limits OutboundLimits)
 	// SetStableFirst hot-applies the grayscale pool (selector + promotion).
 	SetStableFirst func(enabled bool, denominator, promoteRequests int)
 	// SetConcurrencyAware hot-applies the in-flight burst guard.
@@ -196,10 +251,25 @@ type Appliers struct {
 	// SetHealthSweep hot-applies the periodic channel health sweep (enabled +
 	// interval/jitter/degraded threshold/concurrency/timeout).
 	SetHealthSweep func(cfg healthsweep.Config)
+	// SetSiteProbeSchedule hot-applies the external site-probe collection
+	// cadence. Unlike the model probe there is nothing to enable or scope: the
+	// loop only reads pages the sites publish themselves, so the only knobs are
+	// how often to read them.
+	SetSiteProbeSchedule func(interval, jitter time.Duration)
+	// SetSiteNewsSchedule hot-applies the upstream notice-board cadence. A zero
+	// interval turns the scheduled read off — a notice board is background
+	// reading, not a routing input — while the dashboard's refresh button keeps
+	// working either way.
+	SetSiteNewsSchedule func(interval time.Duration)
+	// SetKeepalive hot-applies the keepalive master switch, its round cadence
+	// and the fallback window for a site without one.
+	SetKeepalive func(enabled bool, checkInterval time.Duration, defaultIdleDays int)
 	// SetChannelRetryTimes hot-applies the same-key re-send count.
 	SetChannelRetryTimes func(times int)
-	// SetKeyPoolRotation hot-applies whether the site key pool is rotated.
-	SetKeyPoolRotation func(enabled bool)
+	// SetRelayBodyLimits hot-applies the /v1 request-body ceilings (bytes).
+	// Nothing has to be rebuilt: the limit is read from the handler on every
+	// request, so the next one uses the new ceiling.
+	SetRelayBodyLimits func(jsonBytes, imageBytes int64)
 }
 
 // Controller loads, validates, persists, and applies runtime settings.
@@ -253,12 +323,37 @@ func New(cfg *config.Config, settingsStore *store.RuntimeSettingsStore, appliers
 		HealthSweepConcurrency:           cfg.HealthSweepConcurrency,
 		HealthSweepTimeoutSeconds:        cfg.HealthSweepTimeoutSeconds,
 		ChannelRetryTimes:                cfg.ChannelRetryTimes,
-		KeyPoolRotation:                  cfg.KeyPoolRotation,
 		UpdateCheckEnabled:               cfg.UpdateCheckEnabled,
 		// No env knob: the bootstrap default for new channels is manual
 		// (discovery only fills the candidate snapshot until models are
 		// explicitly adopted); Admin can override it here.
 		DefaultModelSyncMode: "manual",
+		// External site-probe cadence: env bootstrap for a hot-reloadable
+		// setting, so an operator can speed the round up without a restart.
+		SiteProbeIntervalSeconds: cfg.SiteProbeIntervalSeconds,
+		SiteProbeJitterSeconds:   cfg.SiteProbeJitterSeconds,
+		// Upstream notice-board cadence: env bootstrap for a hot-reloadable
+		// setting, so an operator can turn the scheduled read off (0) or move it
+		// without a restart.
+		SiteNewsIntervalSeconds: cfg.SiteNewsIntervalSeconds,
+		// Keepalive: off until an operator turns it on, and the window fallback
+		// comes from the environment so a deployment can state its own default.
+		KeepaliveEnabled:              false,
+		KeepaliveCheckIntervalSeconds: cfg.KeepaliveCheckIntervalSeconds,
+		KeepaliveDefaultIdleDays:      cfg.KeepaliveDefaultIdleDays,
+		// Outbound limits: env bootstrap, same contract as the site-probe cadence.
+		OutboundConnectTimeoutSeconds:     int(cfg.OutboundConnectTimeout / time.Second),
+		OutboundHeaderTimeoutSeconds:      int(cfg.OutboundResponseHeaderTimeout / time.Second),
+		OutboundImageHeaderTimeoutSeconds: int(cfg.OutboundImageHeaderTimeout / time.Second),
+		OutboundTLSTimeoutSeconds:         int(cfg.OutboundTLSHandshakeTimeout / time.Second),
+		OutboundMaxIdleConns:              cfg.OutboundMaxIdleConns,
+		OutboundMaxIdleConnsPerHost:       cfg.OutboundMaxIdleConnsPerHost,
+		// Body ceilings: env bootstrap, same contract as the limits above. The
+		// console states them in whole megabytes; a deployment that set a
+		// sub-megabyte ceiling (only reachable from a test or an embedder) is
+		// rounded up rather than collapsed to "no ceiling at all".
+		RelayMaxBodyMB:  megabytesOrZero(cfg.RelayMaxBodyBytes),
+		RelayMaxImageMB: megabytesOrZero(cfg.RelayMaxImageBytes),
 	}
 	c := &Controller{
 		env:      env,
@@ -321,6 +416,8 @@ func (c *Controller) Snapshot() Snapshot {
 		BackupDir:          c.cfg.BackupDir,
 		PluginsDir:         c.cfg.PluginsDir,
 		MetricsTokenMasked: maskToken(c.cfg.MetricsToken),
+
+		DeploymentParameters: c.cfg.DeploymentParameters(),
 	}
 }
 
@@ -390,9 +487,24 @@ func (c *Controller) Update(next Editable) (Snapshot, error) {
 		HealthSweepConcurrency:           next.HealthSweepConcurrency,
 		HealthSweepTimeoutSeconds:        next.HealthSweepTimeoutSeconds,
 		ChannelRetryTimes:                next.ChannelRetryTimes,
-		KeyPoolRotation:                  boolInt(next.KeyPoolRotation),
 		UpdateCheckEnabled:               boolInt(next.UpdateCheckEnabled),
 		DefaultModelSyncMode:             next.DefaultModelSyncMode,
+		SiteProbeIntervalSeconds:         unsetIfZero(next.SiteProbeIntervalSeconds),
+		SiteProbeJitterSeconds:           next.SiteProbeJitterSeconds,
+		// No unsetIfZero here: 0 is the operator's "off", not "unset". The store
+		// keeps it as a value and only NULL resolves to the env bootstrap.
+		SiteNewsIntervalSeconds:           next.SiteNewsIntervalSeconds,
+		KeepaliveEnabled:                  next.KeepaliveEnabled,
+		KeepaliveCheckIntervalSeconds:     unsetIfZero(next.KeepaliveCheckIntervalSeconds),
+		KeepaliveDefaultIdleDays:          unsetIfZero(next.KeepaliveDefaultIdleDays),
+		OutboundConnectTimeoutSeconds:     next.OutboundConnectTimeoutSeconds,
+		OutboundHeaderTimeoutSeconds:      next.OutboundHeaderTimeoutSeconds,
+		OutboundImageHeaderTimeoutSeconds: next.OutboundImageHeaderTimeoutSeconds,
+		OutboundTLSTimeoutSeconds:         next.OutboundTLSTimeoutSeconds,
+		OutboundMaxIdleConns:              next.OutboundMaxIdleConns,
+		OutboundMaxIdleConnsPerHost:       next.OutboundMaxIdleConnsPerHost,
+		RelayMaxBodyMB:                    next.RelayMaxBodyMB,
+		RelayMaxImageMB:                   next.RelayMaxImageMB,
 	}
 	previousRow, err := c.store.Get()
 	if err != nil {
@@ -415,11 +527,60 @@ func (c *Controller) Update(next Editable) (Snapshot, error) {
 	}
 	now := time.Now().UTC()
 	c.mu.Lock()
-	c.current = next
+	// The console must show the values that are in effect: a stored 0 means "no
+	// override", so the deployment value is what the operator should read back
+	// (and what a later save re-sends).
+	c.current = c.withOutboundDefaults(next)
 	c.source = "admin_override"
 	c.updated = &now
 	c.mu.Unlock()
 	return c.Snapshot(), nil
+}
+
+// withOutboundDefaults fills the outbound limits that were left at 0 with the
+// deployment values, so the effective configuration and the stored override can
+// never disagree in the console.
+func (c *Controller) withOutboundDefaults(values Editable) Editable {
+	if values.OutboundConnectTimeoutSeconds <= 0 {
+		values.OutboundConnectTimeoutSeconds = int(c.cfg.OutboundConnectTimeout / time.Second)
+	}
+	if values.OutboundHeaderTimeoutSeconds <= 0 {
+		values.OutboundHeaderTimeoutSeconds = int(c.cfg.OutboundResponseHeaderTimeout / time.Second)
+	}
+	if values.OutboundImageHeaderTimeoutSeconds <= 0 {
+		values.OutboundImageHeaderTimeoutSeconds = int(c.cfg.OutboundImageHeaderTimeout / time.Second)
+	}
+	if values.OutboundTLSTimeoutSeconds <= 0 {
+		values.OutboundTLSTimeoutSeconds = int(c.cfg.OutboundTLSHandshakeTimeout / time.Second)
+	}
+	if values.OutboundMaxIdleConns <= 0 {
+		values.OutboundMaxIdleConns = c.cfg.OutboundMaxIdleConns
+	}
+	if values.OutboundMaxIdleConnsPerHost <= 0 {
+		values.OutboundMaxIdleConnsPerHost = c.cfg.OutboundMaxIdleConnsPerHost
+	}
+	if values.RelayMaxBodyMB <= 0 {
+		values.RelayMaxBodyMB = megabytesOrZero(c.cfg.RelayMaxBodyBytes)
+	}
+	if values.RelayMaxImageMB <= 0 {
+		values.RelayMaxImageMB = megabytesOrZero(c.cfg.RelayMaxImageBytes)
+	}
+	return values
+}
+
+// megabytesOrZero converts a byte ceiling to the whole megabytes the console
+// speaks, rounding up: 0 means "nothing configured" and must stay 0, while any
+// positive value below 1 MB must not become 0 (which would read as "no
+// override" and silently hand the request to the handler's built-in default).
+func megabytesOrZero(bytes int64) int {
+	if bytes <= 0 {
+		return 0
+	}
+	megabytes := int(bytes >> 20)
+	if megabytes < 1 {
+		return 1
+	}
+	return megabytes
 }
 
 // ClearOverride removes Admin override and re-applies env bootstrap.
@@ -453,22 +614,6 @@ func (c *Controller) ClearOverride() (Snapshot, error) {
 
 func (c *Controller) applyLocked(values Editable) {
 	_ = c.applyWithError(values)
-}
-
-// ResyncCheckin re-applies the current check-in schedule using the latest editable
-// settings and CheckinAllowed gate. Call when the checkin add-on is toggled.
-func (c *Controller) ResyncCheckin() error {
-	c.mu.RLock()
-	values := c.current
-	c.mu.RUnlock()
-	if c.appliers.CheckinSched == nil {
-		return nil
-	}
-	enabled := values.CheckinEnabled
-	if c.appliers.CheckinAllowed != nil && !c.appliers.CheckinAllowed() {
-		enabled = false
-	}
-	return c.appliers.CheckinSched.SetSchedule(values.CheckinCron, enabled)
 }
 
 func (c *Controller) applyWithError(values Editable) error {
@@ -517,11 +662,7 @@ func (c *Controller) applyWithError(values Editable) error {
 		c.appliers.SetAuditLoop(values.AuditRetentionDays, values.AuditRetentionRows)
 	}
 	if c.appliers.CheckinSched != nil {
-		enabled := values.CheckinEnabled
-		if c.appliers.CheckinAllowed != nil && !c.appliers.CheckinAllowed() {
-			enabled = false
-		}
-		if err := c.appliers.CheckinSched.SetSchedule(values.CheckinCron, enabled); err != nil {
+		if err := c.appliers.CheckinSched.SetSchedule(values.CheckinCron, values.CheckinEnabled); err != nil {
 			return err
 		}
 	}
@@ -535,14 +676,21 @@ func (c *Controller) applyWithError(values Editable) error {
 		c.appliers.Selector.SetLatencyAware(values.RoutingLatencyAware, c.appliers.Proxy.ChannelLatency)
 		c.appliers.Selector.SetErrorAware(values.RoutingErrorAware, c.appliers.Proxy.ChannelErrorRate)
 	}
-	// Sticky-session routing hot swap: enabled → build a store with the TTL and
-	// rewire selector/proxy/admin; disabled → nil store (off).
+	// Sticky-session routing hot swap. The store is rebuilt either way so a
+	// TTL change reaches it, but it is installed even while the switch is off:
+	// routes.sticky_session lets one model opt in, and a store that only
+	// existed when the default was on would make that override a silent no-op.
+	// A non-positive TTL (unset placeholder) would expire every binding on the
+	// next request, so fall back to the shipped default. Rebuilding drops the
+	// live bindings; each conversation then costs one unaffined request and
+	// rebinds on success, which is the behaviour sticky already had whenever
+	// this switch was toggled.
 	if c.appliers.SetSticky != nil {
-		var stickyStore *routing.StickyStore
-		if values.StickyEnabled {
-			stickyStore = routing.NewStickyStore(time.Duration(values.StickyTTLMinutes)*time.Minute, nil)
+		ttl := time.Duration(values.StickyTTLMinutes) * time.Minute
+		if ttl <= 0 {
+			ttl = routing.DefaultStickyTTL
 		}
-		c.appliers.SetSticky(stickyStore, time.Duration(values.StickyTTLMinutes)*time.Minute)
+		c.appliers.SetSticky(routing.NewStickyStore(ttl, nil), values.StickyEnabled, ttl)
 	}
 	// Passive-recovery probe configuration hot reload.
 	if c.appliers.SetRecoveryProbe != nil {
@@ -587,11 +735,70 @@ func (c *Controller) applyWithError(values Editable) error {
 	if c.appliers.SetChannelRetryTimes != nil {
 		c.appliers.SetChannelRetryTimes(values.ChannelRetryTimes)
 	}
-	// Key-pool rotation hot reload.
-	if c.appliers.SetKeyPoolRotation != nil {
-		c.appliers.SetKeyPoolRotation(values.KeyPoolRotation)
+	// External site-probe cadence hot reload. The loop re-reads this at every
+	// round, so a change lands on the next one rather than after a restart.
+	if c.appliers.SetSiteProbeSchedule != nil {
+		c.appliers.SetSiteProbeSchedule(
+			time.Duration(values.SiteProbeIntervalSeconds)*time.Second,
+			time.Duration(values.SiteProbeJitterSeconds)*time.Second,
+		)
+	}
+	// Upstream notice-board cadence hot reload. 0 = off: the loop stops reading
+	// boards until a positive value re-arms it, and either way the wait in
+	// flight is re-armed here, so the change lands now rather than after the old
+	// interval.
+	if c.appliers.SetSiteNewsSchedule != nil {
+		c.appliers.SetSiteNewsSchedule(time.Duration(values.SiteNewsIntervalSeconds) * time.Second)
+	}
+	// Keepalive: the switch, the round cadence and the fallback window all apply
+	// without a restart. The loop re-reads them every wake, so turning it off
+	// stops the next round rather than the one after a restart.
+	if c.appliers.SetKeepalive != nil {
+		c.appliers.SetKeepalive(values.KeepaliveEnabled,
+			time.Duration(values.KeepaliveCheckIntervalSeconds)*time.Second,
+			values.KeepaliveDefaultIdleDays)
+	}
+	// Outbound limits hot reload: the relays and every other outbound holder keep
+	// one client whose transport is rebuilt here, so the next request picks up the
+	// new timeouts. 0 means "no override" and resolves to the deployment value.
+	if c.appliers.SetOutboundLimits != nil {
+		c.appliers.SetOutboundLimits(OutboundLimits{
+			ConnectTimeout:      secondsOrEnv(values.OutboundConnectTimeoutSeconds, c.cfg.OutboundConnectTimeout),
+			HeaderTimeout:       secondsOrEnv(values.OutboundHeaderTimeoutSeconds, c.cfg.OutboundResponseHeaderTimeout),
+			ImageHeaderTimeout:  secondsOrEnv(values.OutboundImageHeaderTimeoutSeconds, c.cfg.OutboundImageHeaderTimeout),
+			TLSTimeout:          secondsOrEnv(values.OutboundTLSTimeoutSeconds, c.cfg.OutboundTLSHandshakeTimeout),
+			MaxIdleConns:        intOrEnv(values.OutboundMaxIdleConns, c.cfg.OutboundMaxIdleConns),
+			MaxIdleConnsPerHost: intOrEnv(values.OutboundMaxIdleConnsPerHost, c.cfg.OutboundMaxIdleConnsPerHost),
+		})
+	}
+	// Request-body ceilings hot reload for the same reason as the outbound
+	// limits: the handler reads the limit per request, so nothing is rebuilt and
+	// the next call accepts (or refuses) the bigger body. 0 means "no override"
+	// and resolves to the deployment value.
+	if c.appliers.SetRelayBodyLimits != nil {
+		c.appliers.SetRelayBodyLimits(
+			int64(intOrEnv(values.RelayMaxBodyMB, megabytesOrZero(c.cfg.RelayMaxBodyBytes)))<<20,
+			int64(intOrEnv(values.RelayMaxImageMB, megabytesOrZero(c.cfg.RelayMaxImageBytes)))<<20,
+		)
 	}
 	return nil
+}
+
+// secondsOrEnv resolves a stored seconds value to a duration, falling back to the
+// deployment default when the setting is 0 ("no override").
+func secondsOrEnv(value int, fallback time.Duration) time.Duration {
+	if value <= 0 {
+		return fallback
+	}
+	return time.Duration(value) * time.Second
+}
+
+// intOrEnv resolves a stored count to the deployment default when unset.
+func intOrEnv(value, fallback int) int {
+	if value <= 0 {
+		return fallback
+	}
+	return value
 }
 
 // boolInt converts a bool to the runtime-settings integer encoding.
@@ -602,55 +809,75 @@ func boolInt(value bool) int {
 	return 0
 }
 
+// unsetIfZero encodes "0 means the caller did not say" as the -1 sentinel the
+// nullable runtime-settings columns use, so the env bootstrap still wins. Only
+// for fields where 0 is not a meaningful value.
+func unsetIfZero(value int) int {
+	if value == 0 {
+		return -1
+	}
+	return value
+}
+
 func rowToEditable(row *store.RuntimeSettingsRow) Editable {
 	return Editable{
-		RetryTimes:                       row.RetryTimes,
-		CrossChannelFailoverEnabled:      row.CrossChannelFailoverEnabled == 1,
-		CooldownSeconds:                  row.CooldownSeconds,
-		CheckinEnabled:                   row.CheckinEnabled,
-		CheckinCron:                      row.CheckinCron,
-		RelayRatePerMinute:               row.RelayRatePerMinute,
-		RelayRateBurst:                   row.RelayRateBurst,
-		AdminRatePerMinute:               row.AdminRatePerMinute,
-		AdminRateBurst:                   row.AdminRateBurst,
-		AuditRetentionDays:               row.AuditRetentionDays,
-		AuditRetentionRows:               row.AuditRetentionRows,
-		ChannelAutoDisableThreshold:      row.ChannelAutoDisableThreshold,
-		RoutingLatencyAware:              row.RoutingLatencyAware == 1,
-		RoutingErrorAware:                row.RoutingErrorAware == 1,
-		RoutingConcurrencyEnabled:        row.RoutingConcurrencyEnabled == 1,
-		RoutingConcurrencyLimit:          row.RoutingConcurrencyLimit,
-		WebhookURL:                       row.WebhookURL,
-		ProxyURL:                         row.ProxyURL,
-		DiscoveryCron:                    row.DiscoveryCron,
-		DBGCCron:                         row.DBGCCron,
-		ProbeCron:                        row.ProbeCron,
-		ProbePrompt:                      row.ProbePrompt,
-		ProbeMaxTokens:                   row.ProbeMaxTokens,
-		ProbeConcurrency:                 row.ProbeConcurrency,
-		ProbeAutoDisable:                 row.ProbeAutoDisable,
-		ProbeChannels:                    row.ProbeChannels,
-		ProbeModels:                      row.ProbeModels,
-		WebhookThrottleSeconds:           row.WebhookThrottleSeconds,
-		StableFirstEnabled:               row.StableFirstEnabled == 1,
-		StableFirstDenominator:           row.StableFirstDenominator,
-		StableFirstPromoteRequests:       row.StableFirstPromoteRequests,
-		FaultProtectionEnabled:           row.FaultProtectionEnabled == 1,
-		StickyEnabled:                    row.StickyEnabled == 1,
-		StickyTTLMinutes:                 row.StickyTTLMinutes,
-		AlertConfigJSON:                  row.AlertConfigJSON,
-		AlertSweepIntervalSeconds:        row.AlertSweepIntervalSeconds,
-		AlertDailySummaryIntervalSeconds: row.AlertDailySummaryIntervalSeconds,
-		HealthSweepEnabled:               row.HealthSweepEnabled == 1,
-		HealthSweepIntervalSeconds:       row.HealthSweepIntervalSeconds,
-		HealthSweepJitterSeconds:         row.HealthSweepJitterSeconds,
-		HealthSweepDegradedMs:            row.HealthSweepDegradedMs,
-		HealthSweepConcurrency:           row.HealthSweepConcurrency,
-		HealthSweepTimeoutSeconds:        row.HealthSweepTimeoutSeconds,
-		ChannelRetryTimes:                row.ChannelRetryTimes,
-		KeyPoolRotation:                  row.KeyPoolRotation == 1,
-		UpdateCheckEnabled:               row.UpdateCheckEnabled == 1,
-		DefaultModelSyncMode:             row.DefaultModelSyncMode,
+		RetryTimes:                        row.RetryTimes,
+		CrossChannelFailoverEnabled:       row.CrossChannelFailoverEnabled == 1,
+		CooldownSeconds:                   row.CooldownSeconds,
+		CheckinEnabled:                    row.CheckinEnabled,
+		CheckinCron:                       row.CheckinCron,
+		RelayRatePerMinute:                row.RelayRatePerMinute,
+		RelayRateBurst:                    row.RelayRateBurst,
+		AdminRatePerMinute:                row.AdminRatePerMinute,
+		AdminRateBurst:                    row.AdminRateBurst,
+		AuditRetentionDays:                row.AuditRetentionDays,
+		AuditRetentionRows:                row.AuditRetentionRows,
+		ChannelAutoDisableThreshold:       row.ChannelAutoDisableThreshold,
+		RoutingLatencyAware:               row.RoutingLatencyAware == 1,
+		RoutingErrorAware:                 row.RoutingErrorAware == 1,
+		RoutingConcurrencyEnabled:         row.RoutingConcurrencyEnabled == 1,
+		RoutingConcurrencyLimit:           row.RoutingConcurrencyLimit,
+		WebhookURL:                        row.WebhookURL,
+		ProxyURL:                          row.ProxyURL,
+		DiscoveryCron:                     row.DiscoveryCron,
+		DBGCCron:                          row.DBGCCron,
+		ProbeCron:                         row.ProbeCron,
+		ProbePrompt:                       row.ProbePrompt,
+		ProbeMaxTokens:                    row.ProbeMaxTokens,
+		ProbeConcurrency:                  row.ProbeConcurrency,
+		ProbeAutoDisable:                  row.ProbeAutoDisable,
+		ProbeChannels:                     row.ProbeChannels,
+		ProbeModels:                       row.ProbeModels,
+		WebhookThrottleSeconds:            row.WebhookThrottleSeconds,
+		StableFirstEnabled:                row.StableFirstEnabled == 1,
+		StableFirstDenominator:            row.StableFirstDenominator,
+		StableFirstPromoteRequests:        row.StableFirstPromoteRequests,
+		FaultProtectionEnabled:            row.FaultProtectionEnabled == 1,
+		StickyEnabled:                     row.StickyEnabled == 1,
+		StickyTTLMinutes:                  row.StickyTTLMinutes,
+		AlertConfigJSON:                   row.AlertConfigJSON,
+		AlertSweepIntervalSeconds:         row.AlertSweepIntervalSeconds,
+		AlertDailySummaryIntervalSeconds:  row.AlertDailySummaryIntervalSeconds,
+		HealthSweepEnabled:                row.HealthSweepEnabled == 1,
+		HealthSweepIntervalSeconds:        row.HealthSweepIntervalSeconds,
+		HealthSweepJitterSeconds:          row.HealthSweepJitterSeconds,
+		HealthSweepDegradedMs:             row.HealthSweepDegradedMs,
+		HealthSweepConcurrency:            row.HealthSweepConcurrency,
+		HealthSweepTimeoutSeconds:         row.HealthSweepTimeoutSeconds,
+		ChannelRetryTimes:                 row.ChannelRetryTimes,
+		UpdateCheckEnabled:                row.UpdateCheckEnabled == 1,
+		DefaultModelSyncMode:              row.DefaultModelSyncMode,
+		SiteProbeIntervalSeconds:          row.SiteProbeIntervalSeconds,
+		SiteProbeJitterSeconds:            row.SiteProbeJitterSeconds,
+		SiteNewsIntervalSeconds:           row.SiteNewsIntervalSeconds,
+		OutboundConnectTimeoutSeconds:     row.OutboundConnectTimeoutSeconds,
+		OutboundHeaderTimeoutSeconds:      row.OutboundHeaderTimeoutSeconds,
+		OutboundImageHeaderTimeoutSeconds: row.OutboundImageHeaderTimeoutSeconds,
+		OutboundTLSTimeoutSeconds:         row.OutboundTLSTimeoutSeconds,
+		OutboundMaxIdleConns:              row.OutboundMaxIdleConns,
+		OutboundMaxIdleConnsPerHost:       row.OutboundMaxIdleConnsPerHost,
+		RelayMaxBodyMB:                    row.RelayMaxBodyMB,
+		RelayMaxImageMB:                   row.RelayMaxImageMB,
 	}
 }
 
@@ -658,19 +885,19 @@ func rowToEditable(row *store.RuntimeSettingsRow) Editable {
 // bootstrap so an older override row cannot accidentally zero new settings.
 func (c *Controller) rowToEditableWithEnv(row *store.RuntimeSettingsRow) Editable {
 	editable := rowToEditable(row)
-	if editable.CrossChannelFailoverEnabled == false && row.CrossChannelFailoverEnabled == -1 {
+	if !editable.CrossChannelFailoverEnabled && row.CrossChannelFailoverEnabled == -1 {
 		editable.CrossChannelFailoverEnabled = c.env.CrossChannelFailoverEnabled
 	}
 	if editable.ChannelAutoDisableThreshold < 0 {
 		editable.ChannelAutoDisableThreshold = c.env.ChannelAutoDisableThreshold
 	}
-	if editable.RoutingLatencyAware == false && row.RoutingLatencyAware == -1 {
+	if !editable.RoutingLatencyAware && row.RoutingLatencyAware == -1 {
 		editable.RoutingLatencyAware = c.env.RoutingLatencyAware
 	}
-	if editable.RoutingErrorAware == false && row.RoutingErrorAware == -1 {
+	if !editable.RoutingErrorAware && row.RoutingErrorAware == -1 {
 		editable.RoutingErrorAware = c.env.RoutingErrorAware
 	}
-	if editable.RoutingConcurrencyEnabled == false && row.RoutingConcurrencyEnabled == -1 {
+	if !editable.RoutingConcurrencyEnabled && row.RoutingConcurrencyEnabled == -1 {
 		editable.RoutingConcurrencyEnabled = c.env.RoutingConcurrencyEnabled
 	}
 	if editable.RoutingConcurrencyLimit < 0 {
@@ -682,7 +909,7 @@ func (c *Controller) rowToEditableWithEnv(row *store.RuntimeSettingsRow) Editabl
 	if editable.WebhookThrottleSeconds < 0 {
 		editable.WebhookThrottleSeconds = c.env.WebhookThrottleSeconds
 	}
-	if editable.StableFirstEnabled == false && row.StableFirstEnabled == -1 {
+	if !editable.StableFirstEnabled && row.StableFirstEnabled == -1 {
 		editable.StableFirstEnabled = c.env.StableFirstEnabled
 	}
 	if editable.StableFirstDenominator < 0 {
@@ -691,16 +918,16 @@ func (c *Controller) rowToEditableWithEnv(row *store.RuntimeSettingsRow) Editabl
 	if editable.StableFirstPromoteRequests < 0 {
 		editable.StableFirstPromoteRequests = c.env.StableFirstPromoteRequests
 	}
-	if editable.FaultProtectionEnabled == false && row.FaultProtectionEnabled == -1 {
+	if !editable.FaultProtectionEnabled && row.FaultProtectionEnabled == -1 {
 		editable.FaultProtectionEnabled = c.env.FaultProtectionEnabled
 	}
-	if editable.RecoveryProbeEnabled == false && row.RecoveryProbeEnabled == -1 {
+	if !editable.RecoveryProbeEnabled && row.RecoveryProbeEnabled == -1 {
 		editable.RecoveryProbeEnabled = c.env.RecoveryProbeEnabled
 	}
 	if editable.RecoveryProbeIntervalSeconds < 0 {
 		editable.RecoveryProbeIntervalSeconds = c.env.RecoveryProbeIntervalSeconds
 	}
-	if editable.StickyEnabled == false && row.StickyEnabled == -1 {
+	if !editable.StickyEnabled && row.StickyEnabled == -1 {
 		editable.StickyEnabled = c.env.StickyEnabled
 	}
 	if editable.StickyTTLMinutes < 0 {
@@ -715,7 +942,7 @@ func (c *Controller) rowToEditableWithEnv(row *store.RuntimeSettingsRow) Editabl
 	if editable.AlertDailySummaryIntervalSeconds < 0 {
 		editable.AlertDailySummaryIntervalSeconds = c.env.AlertDailySummaryIntervalSeconds
 	}
-	if editable.HealthSweepEnabled == false && row.HealthSweepEnabled == -1 {
+	if !editable.HealthSweepEnabled && row.HealthSweepEnabled == -1 {
 		editable.HealthSweepEnabled = c.env.HealthSweepEnabled
 	}
 	if editable.HealthSweepIntervalSeconds < 0 {
@@ -736,16 +963,37 @@ func (c *Controller) rowToEditableWithEnv(row *store.RuntimeSettingsRow) Editabl
 	if editable.ChannelRetryTimes < 0 {
 		editable.ChannelRetryTimes = c.env.ChannelRetryTimes
 	}
-	if editable.KeyPoolRotation == false && row.KeyPoolRotation == -1 {
-		editable.KeyPoolRotation = c.env.KeyPoolRotation
-	}
-	if editable.UpdateCheckEnabled == false && row.UpdateCheckEnabled == -1 {
+
+	if !editable.UpdateCheckEnabled && row.UpdateCheckEnabled == -1 {
 		editable.UpdateCheckEnabled = c.env.UpdateCheckEnabled
 	}
 	if editable.DefaultModelSyncMode == "" {
 		editable.DefaultModelSyncMode = c.env.DefaultModelSyncMode
 	}
-	return editable
+	if editable.SiteProbeIntervalSeconds < 0 {
+		editable.SiteProbeIntervalSeconds = c.env.SiteProbeIntervalSeconds
+	}
+	if editable.SiteProbeJitterSeconds < 0 {
+		editable.SiteProbeJitterSeconds = c.env.SiteProbeJitterSeconds
+	}
+	// A stored 0 is the operator's "off" and must survive: only the unset
+	// sentinel (-1) resolves to the deployment value.
+	if editable.SiteNewsIntervalSeconds < 0 {
+		editable.SiteNewsIntervalSeconds = c.env.SiteNewsIntervalSeconds
+	}
+	// Keepalive: a stored 0 is "no override", so the console shows the deployment
+	// value the process is actually running with instead of a value that is not
+	// the one in effect (and a 0 interval would fail its own validation).
+	if editable.KeepaliveCheckIntervalSeconds <= 0 {
+		editable.KeepaliveCheckIntervalSeconds = c.env.KeepaliveCheckIntervalSeconds
+	}
+	if editable.KeepaliveDefaultIdleDays <= 0 {
+		editable.KeepaliveDefaultIdleDays = c.env.KeepaliveDefaultIdleDays
+	}
+	// Outbound limits: a stored 0 is "no override", so the console shows the
+	// deployment value the process is actually running with instead of a limit
+	// that is not the one in effect.
+	return c.withOutboundDefaults(editable)
 }
 
 // Validate enforces the same bounds as env loading for Admin-writable fields.
@@ -865,6 +1113,64 @@ func Validate(values Editable) error {
 	}
 	if values.DefaultModelSyncMode != "auto" && values.DefaultModelSyncMode != "manual" {
 		return fmt.Errorf("default_model_sync_mode must be auto or manual")
+	}
+	// Site-probe cadence: the floor is a minute (faster would hammer a public
+	// page for no new data) and the jitter may not exceed the interval. Zero is
+	// accepted as "unset" — an older console build that does not know these
+	// fields would otherwise fail the whole settings save — and the store turns
+	// it back into the unset sentinel so the env bootstrap still applies.
+	if values.SiteProbeIntervalSeconds != 0 && (values.SiteProbeIntervalSeconds < 60 || values.SiteProbeIntervalSeconds > 86400) {
+		return fmt.Errorf("site_probe_interval_seconds must be between 60 and 86400")
+	}
+	if values.SiteProbeJitterSeconds < 0 || values.SiteProbeJitterSeconds > 3600 {
+		return fmt.Errorf("site_probe_jitter_seconds must be between 0 and 3600")
+	}
+	if values.SiteProbeIntervalSeconds > 0 && values.SiteProbeJitterSeconds > values.SiteProbeIntervalSeconds {
+		return fmt.Errorf("site_probe_jitter_seconds must not exceed site_probe_interval_seconds")
+	}
+	// Notice-board cadence: 0 is a real value here ("off"), so unlike the
+	// site-probe columns only a positive value has a floor. The ceiling keeps a
+	// value that would read as "never again" out of the console.
+	if values.SiteNewsIntervalSeconds < 0 || (values.SiteNewsIntervalSeconds > 0 &&
+		(values.SiteNewsIntervalSeconds < 60 || values.SiteNewsIntervalSeconds > 86400)) {
+		return fmt.Errorf("site_news_interval_seconds must be 0 (off) or between 60 and 86400")
+	}
+	// Keepalive: a round cadence below a minute would wake up for nothing, and a
+	// window is a number of days a site states (0 = the deployment default).
+	if values.KeepaliveCheckIntervalSeconds != 0 && (values.KeepaliveCheckIntervalSeconds < 60 || values.KeepaliveCheckIntervalSeconds > 86400) {
+		return fmt.Errorf("keepalive_check_interval_seconds must be between 60 and 86400")
+	}
+	if values.KeepaliveDefaultIdleDays < 0 || values.KeepaliveDefaultIdleDays > 3650 {
+		return fmt.Errorf("keepalive_default_idle_days must be between 0 and 3650")
+	}
+	// Outbound limits: 0 means "deployment default", so the floor is 0 and the
+	// ceilings keep a typo from turning every request into an instant failure.
+	if values.OutboundConnectTimeoutSeconds < 0 || values.OutboundConnectTimeoutSeconds > 600 {
+		return fmt.Errorf("outbound_connect_timeout_seconds must be between 0 and 600")
+	}
+	if values.OutboundHeaderTimeoutSeconds < 0 || values.OutboundHeaderTimeoutSeconds > 3600 {
+		return fmt.Errorf("outbound_header_timeout_seconds must be between 0 and 3600")
+	}
+	if values.OutboundImageHeaderTimeoutSeconds < 0 || values.OutboundImageHeaderTimeoutSeconds > 3600 {
+		return fmt.Errorf("outbound_image_header_timeout_seconds must be between 0 and 3600")
+	}
+	if values.OutboundTLSTimeoutSeconds < 0 || values.OutboundTLSTimeoutSeconds > 600 {
+		return fmt.Errorf("outbound_tls_timeout_seconds must be between 0 and 600")
+	}
+	if values.OutboundMaxIdleConns < 0 || values.OutboundMaxIdleConns > 100000 {
+		return fmt.Errorf("outbound_max_idle_conns must be between 0 and 100000")
+	}
+	if values.OutboundMaxIdleConnsPerHost < 0 || values.OutboundMaxIdleConnsPerHost > 100000 {
+		return fmt.Errorf("outbound_max_idle_conns_per_host must be between 0 and 100000")
+	}
+	// Body ceilings: 0 means the deployment default, and the ceiling matches the
+	// environment knob's own range so a console save cannot set a limit the
+	// process could never be started with.
+	if values.RelayMaxBodyMB < 0 || values.RelayMaxBodyMB > 512 {
+		return fmt.Errorf("relay_max_body_mb must be between 0 and 512")
+	}
+	if values.RelayMaxImageMB < 0 || values.RelayMaxImageMB > 1024 {
+		return fmt.Errorf("relay_max_image_mb must be between 0 and 1024")
 	}
 	return nil
 }

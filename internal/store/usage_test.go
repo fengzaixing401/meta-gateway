@@ -54,7 +54,7 @@ func TestUsageAndQuota(t *testing.T) {
 	if !store.QuotaExceeded(got) {
 		t.Fatal("expected quota exceeded")
 	}
-	summary, err := db.Usage.Summary(&id)
+	summary, err := db.Usage.Summary(store.UsageScope{DownstreamKeyID: &id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestRecordRelayUsageAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	// All three writes landed.
-	summary, err := db.Usage.Summary(&keyID)
+	summary, err := db.Usage.Summary(store.UsageScope{DownstreamKeyID: &keyID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestRecordRelayUsageNoOpWithoutTokens(t *testing.T) {
 	if err := db.RecordRelayUsage(nil, 1); err != nil {
 		t.Fatalf("nil record must be a no-op, got %v", err)
 	}
-	summary, err := db.Usage.Summary(nil)
+	summary, err := db.Usage.Summary(store.UsageScope{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +360,6 @@ func TestUsageCostPersistedAndSummarized(t *testing.T) {
 	db := openTestDB(t)
 	key := &domain.DownstreamKey{
 		TokenHash: "hash-cost-1", Name: "billed", Enabled: true, Scopes: "relay",
-		PricePromptPer1k: 0.01, PriceCompletionPer1k: 0.02,
 	}
 	keyID, err := db.DownstreamKey.Create(key)
 	if err != nil {
@@ -378,7 +377,7 @@ func TestUsageCostPersistedAndSummarized(t *testing.T) {
 	}, keyID); err != nil {
 		t.Fatal(err)
 	}
-	summary, err := db.Usage.Summary(&keyID)
+	summary, err := db.Usage.Summary(store.UsageScope{DownstreamKeyID: &keyID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,12 +395,12 @@ func TestUsageCostPersistedAndSummarized(t *testing.T) {
 		t.Fatalf("listed usage cost=%v, want 0.04", rows)
 	}
 	past := time.Now().Add(-time.Hour)
-	recent, err := db.Usage.SummarySince(&keyID, &past)
+	recent, err := db.Usage.SummarySince(store.UsageScope{DownstreamKeyID: &keyID}, &past)
 	if err != nil || recent.RequestCount != 1 {
 		t.Fatalf("recent summary=%+v err=%v", recent, err)
 	}
 	future := time.Now().Add(time.Hour)
-	recent, err = db.Usage.SummarySince(&keyID, &future)
+	recent, err = db.Usage.SummarySince(store.UsageScope{DownstreamKeyID: &keyID}, &future)
 	if err != nil || recent.RequestCount != 0 || recent.Cost != 0 {
 		t.Fatalf("future summary=%+v err=%v", recent, err)
 	}
@@ -421,10 +420,105 @@ func TestUsageCostPersistedAndSummarized(t *testing.T) {
 	}
 }
 
+func TestUsageCostAggregations(t *testing.T) {
+	db := openTestDB(t)
+	keyA, err := db.DownstreamKey.Create(&domain.DownstreamKey{TokenHash: "hash-agg-a", Name: "a", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyB, err := db.DownstreamKey.Create(&domain.DownstreamKey{TokenHash: "hash-agg-b", Name: "b", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := []domain.UsageRecord{
+		{RequestID: "r1", DownstreamKeyID: keyA, ChannelID: 1, Model: "m", TotalTokens: 10, PromptTokens: 10, Status: 200, Cost: 0.5},
+		{RequestID: "r2", DownstreamKeyID: keyA, ChannelID: 1, Model: "m", TotalTokens: 10, PromptTokens: 10, Status: 200, Cost: 0.25},
+		{RequestID: "r3", DownstreamKeyID: keyB, ChannelID: 1, Model: "m", TotalTokens: 10, PromptTokens: 10, Status: 200, Cost: 2},
+	}
+	for i := range records {
+		if err := db.RecordRelayUsage(&records[i], records[i].DownstreamKeyID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	byKey, err := db.Usage.CostByKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byKey[keyA] != 0.75 || byKey[keyB] != 2 {
+		t.Fatalf("cost by key = %+v, want %d→0.75 %d→2", byKey, keyA, keyB)
+	}
+
+	byRequest, err := db.Usage.CostByRequestIDs([]string{"r1", "r3", "missing", ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byRequest["r1"] != 0.5 || byRequest["r3"] != 2 {
+		t.Fatalf("cost by request = %+v, want r1→0.5 r3→2", byRequest)
+	}
+	if _, ok := byRequest["missing"]; ok {
+		t.Fatalf("missing request must be absent, got %+v", byRequest)
+	}
+
+	if empty, err := db.Usage.CostByRequestIDs(nil); err != nil || len(empty) != 0 {
+		t.Fatalf("empty request ids = %+v err=%v", empty, err)
+	}
+}
+
+func TestBillingByRequestIDs(t *testing.T) {
+	db := openTestDB(t)
+	// One request billed twice (two attempts), one legacy row with no snapshot,
+	// and one whose stored snapshot is not readable JSON.
+	records := []domain.UsageRecord{
+		{RequestID: "r-bill", ChannelID: 1, Model: "m", Status: 200, TotalTokens: 10, Cost: 0.5, BillingStatus: "settled", BillingEvidence: `{"owner":"model:m","revision":2}`},
+		{RequestID: "r-bill", ChannelID: 1, Model: "m", Status: 200, TotalTokens: 10, Cost: 0.25, BillingStatus: "estimated", BillingEvidence: `{"owner":"model:m","revision":3}`},
+		{RequestID: "r-legacy", ChannelID: 1, Model: "m", Status: 200, TotalTokens: 10},
+		{RequestID: "r-bad", ChannelID: 1, Model: "m", Status: 200, TotalTokens: 10, BillingStatus: "settled", BillingEvidence: "not json at all"},
+	}
+	for i := range records {
+		if _, err := db.Usage.Insert(&records[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	byRequest, err := db.Usage.BillingByRequestIDs([]string{"r-bill", "r-legacy", "r-bad", "missing", ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bill := byRequest["r-bill"]
+	if len(bill) != 2 || bill[0].Status != "settled" || bill[1].Status != "estimated" {
+		t.Fatalf("r-bill explanations = %+v, want both attempts in order", bill)
+	}
+	if string(bill[0].Evidence) != `{"owner":"model:m","revision":2}` {
+		t.Fatalf("stored evidence changed: %s", bill[0].Evidence)
+	}
+	legacy := byRequest["r-legacy"]
+	if len(legacy) != 1 {
+		t.Fatalf("legacy explanations = %+v, want one", legacy)
+	}
+	if legacy[0].Status != "legacy" || legacy[0].Evidence != nil {
+		t.Fatalf("legacy must carry no snapshot: %+v (evidence %q)", legacy[0], legacy[0].Evidence)
+	}
+	bad := byRequest["r-bad"]
+	if len(bad) != 1 {
+		t.Fatalf("unreadable explanations = %+v, want one", bad)
+	}
+	if bad[0].Evidence != nil {
+		t.Fatalf("unreadable evidence must be dropped, got %q", bad[0].Evidence)
+	}
+	if _, ok := byRequest["missing"]; ok {
+		t.Fatalf("missing request must be absent: %+v", byRequest)
+	}
+
+	if empty, err := db.Usage.BillingByRequestIDs(nil); err != nil || len(empty) != 0 {
+		t.Fatalf("empty request ids = %+v err=%v", empty, err)
+	}
+}
+
 func TestGroupQuotaEnforcedAndAccrued(t *testing.T) {
 	db := openTestDB(t)
 	// Group with a 100-token quota.
-	if err := db.Group.Upsert("team-a", 100, 0, 0); err != nil {
+	if err := db.Group.Upsert("team-a", 100, 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	// Key in the group.

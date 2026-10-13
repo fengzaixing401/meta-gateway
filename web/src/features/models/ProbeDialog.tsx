@@ -1,18 +1,15 @@
 import { Play, Search, Square } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../../api/client";
 import type { ProbeStartRequest, RouteOverview } from "../../api/types";
-import { Button, Dialog, Empty } from "../../components/ui";
+import { Button, Dialog, Empty, ErrorState } from "../../components/ui";
 import { useAdminMutation } from "../../hooks/useAdminMutation";
 import { useI18n } from "../../i18n";
-import { useSession } from "../../session";
+import { useSession, isStaff } from "../../session";
+import { CronSchedulePicker } from "../ops/CronSchedulePicker";
 
-const PROBE_INVALIDATE_KEYS = [
-  ["probe-tasks"],
-  ["probe-results"],
-  ["model-health"],
-] as const;
+const PROBE_INVALIDATE_KEYS = [["probe-tasks"], ["probe-results"], ["model-health"]] as const;
 
 /**
  * Model probing: send a real completion to every selected (channel, model)
@@ -24,16 +21,27 @@ const PROBE_INVALIDATE_KEYS = [
  */
 export function ProbeDialog({ onClose }: { onClose: () => void }) {
   const { t } = useI18n();
-  const { client } = useSession();
+  const { client, role } = useSession();
   const service = api(client!);
+  // Members reach this dialog through the shared models page but cannot read the
+  // deployment's runtime settings, so the schedule block is staff-only rather
+  // than a permanently empty form.
+  const staff = isStaff(role);
   const [pickedChannels, setPickedChannels] = useState<string[]>([]);
   const [pickedModels, setPickedModels] = useState<string[]>([]);
-  const [prompt, setPrompt] = useState("");
-  const [maxTokens, setMaxTokens] = useState(1);
-  const [concurrency, setConcurrency] = useState(4);
+  const [allChannels, setAllChannels] = useState(true);
+  const [allModels, setAllModels] = useState(true);
+  // The run knobs are drafts of the RUNTIME settings, not a second copy of them:
+  // the scheduled round reads probe_prompt / probe_max_tokens / probe_concurrency /
+  // probe_auto_disable, so an operator who tunes them here must get the same values
+  // in the next scheduled round (and vice versa). Drafts keep typing smooth; blur
+  // commits, and starting a run sends what is on screen either way.
+  const [promptDraft, setPromptDraft] = useState("");
+  const [maxTokensDraft, setMaxTokensDraft] = useState(1);
+  const [concurrencyDraft, setConcurrencyDraft] = useState(4);
   // 0 leaves routing untouched; above it, this is how many consecutive
   // failures a member survives before the run takes it out of rotation.
-  const [autoDisable, setAutoDisable] = useState(0);
+  const [autoDisableDraft, setAutoDisableDraft] = useState(0);
 
   const channels = useQuery({
     queryKey: ["channels"],
@@ -43,6 +51,56 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
     queryKey: ["route-overviews"],
     queryFn: ({ signal }) => service.routeOverviews(signal),
   });
+  // The scheduled run is the same probe with the same pick lists, so its scope
+  // and its schedule are set from here: the selection above is exactly what the
+  // schedule needs, and asking the operator to re-pick it in Settings would be a
+  // second, separately-remembered copy of the same decision.
+  const runtime = useQuery({
+    queryKey: ["runtime-settings"],
+    queryFn: ({ signal }) => service.runtimeSettings(signal),
+    enabled: staff,
+  });
+  const schedule = useAdminMutation({
+    mutationFn: (
+      patch: Partial<{
+        probe_cron: string;
+        probe_channels: number[];
+        probe_models: string[];
+        probe_prompt: string;
+        probe_max_tokens: number;
+        probe_concurrency: number;
+        probe_auto_disable: number;
+      }>,
+    ) => {
+      const editable = runtime.data?.editable;
+      if (!editable) throw new Error("runtime settings are not loaded");
+      return service.updateRuntimeSettings({ ...editable, ...patch });
+    },
+    invalidateKeys: [["runtime-settings"]],
+  });
+  // Seed the drafts from the stored values, one effect per field: depending on
+  // the whole object would reset the field being typed in whenever a background
+  // refetch handed back a new object.
+  const storedPrompt = runtime.data?.editable?.probe_prompt;
+  const storedMaxTokens = runtime.data?.editable?.probe_max_tokens;
+  const storedConcurrency = runtime.data?.editable?.probe_concurrency;
+  const storedAutoDisable = runtime.data?.editable?.probe_auto_disable;
+  useEffect(() => {
+    if (storedPrompt === undefined) return;
+    setPromptDraft(storedPrompt);
+  }, [storedPrompt]);
+  useEffect(() => {
+    if (storedMaxTokens === undefined) return;
+    setMaxTokensDraft(storedMaxTokens || 1);
+  }, [storedMaxTokens]);
+  useEffect(() => {
+    if (storedConcurrency === undefined) return;
+    setConcurrencyDraft(storedConcurrency || 4);
+  }, [storedConcurrency]);
+  useEffect(() => {
+    if (storedAutoDisable === undefined) return;
+    setAutoDisableDraft(storedAutoDisable);
+  }, [storedAutoDisable]);
 
   // Poll while a run is in flight; the interval turns itself off once idle.
   const tasks = useQuery({
@@ -58,7 +116,13 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
     queryKey: ["probe-results", latest?.id],
     queryFn: ({ signal }) => service.probeResults(latest!.id, signal),
     enabled: latest !== undefined,
+    refetchInterval: running ? 1000 : false,
   });
+  const refetchResults = results.refetch;
+  const latestID = latest?.id;
+  useEffect(() => {
+    if (latestID !== undefined && !running) void refetchResults();
+  }, [latestID, running, refetchResults]);
 
   const start = useAdminMutation({
     mutationFn: (request: ProbeStartRequest) => service.probeStart(request),
@@ -80,30 +144,24 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
   }, [channels.data]);
 
   const selectableChannels = useMemo(
-    () =>
-      (channels.data ?? []).filter((channel) =>
-        index.byChannel.has(channel.id),
-      ),
+    () => (channels.data ?? []).filter((channel) => index.byChannel.has(channel.id)),
     [channels.data, index],
   );
 
   // Models follow the channel selection: with channels picked, only models
   // those channels actually serve stay in reach.
   const visibleModels = useMemo(() => {
-    if (pickedChannels.length === 0) return index.models;
+    if (allChannels) return index.models;
     const union = new Set<string>();
     for (const id of pickedChannels) {
       for (const model of index.byChannel.get(Number(id)) ?? []) union.add(model);
     }
     return index.models.filter((model) => union.has(model));
-  }, [pickedChannels, index]);
+  }, [pickedChannels, index, allChannels]);
 
   const scope = useMemo(() => {
-    const ids =
-      pickedChannels.length > 0
-        ? pickedChannels.map(Number)
-        : [...index.byChannel.keys()];
-    const models = pickedModels.length > 0 ? pickedModels : visibleModels;
+    const ids = allChannels ? [...index.byChannel.keys()] : pickedChannels.map(Number);
+    const models = allModels ? visibleModels : pickedModels;
     let pairs = 0;
     for (const id of ids) {
       const owned = index.byChannel.get(id);
@@ -115,12 +173,14 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
       models: models.length,
       pairs,
     };
-  }, [pickedChannels, pickedModels, visibleModels, index]);
+  }, [pickedChannels, pickedModels, visibleModels, index, allChannels, allModels]);
 
   const toggleChannel = (id: string, value: boolean) => {
-    const next = value
-      ? [...pickedChannels, id]
-      : pickedChannels.filter((item) => item !== id);
+    const current = allChannels
+      ? selectableChannels.map((channel) => String(channel.id))
+      : pickedChannels;
+    const next = value ? [...current, id] : current.filter((item) => item !== id);
+    setAllChannels(false);
     setPickedChannels(next);
     // A model that no selected channel serves would silently vanish from the
     // run, so drop it here and keep the estimate honest.
@@ -136,16 +196,54 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
   };
 
   const submit = () => {
+    if (!scope.pairs) return;
+    // A run started from here uses what is on screen, and writes it back so the
+    // next scheduled round runs the same thing (blur may not have happened yet).
+    saveKnobs();
     start.mutate({
-      channel_ids:
-        pickedChannels.length > 0 ? pickedChannels.map(Number) : undefined,
-      models: pickedModels.length > 0 ? pickedModels : undefined,
-      prompt: prompt.trim() !== "" ? prompt : undefined,
-      max_tokens: maxTokens,
-      concurrency,
-      auto_disable_after: autoDisable > 0 ? autoDisable : undefined,
+      channel_ids: allChannels ? undefined : pickedChannels.map(Number),
+      models: allModels ? undefined : pickedModels,
+      prompt: promptDraft.trim() !== "" ? promptDraft : undefined,
+      max_tokens: maxTokensDraft,
+      concurrency: concurrencyDraft,
+      auto_disable_after: autoDisableDraft > 0 ? autoDisableDraft : undefined,
     });
   };
+
+  // The four run knobs are stored runtime settings, shared with the scheduled
+  // round. Committing on blur keeps a typed value from being lost, and writing
+  // only changed fields keeps a blur from being a write for nothing.
+  const saveKnobs = () => {
+    if (!scheduleReady) return;
+    const patch: Partial<{
+      probe_prompt: string;
+      probe_max_tokens: number;
+      probe_concurrency: number;
+      probe_auto_disable: number;
+    }> = {};
+    if (promptDraft !== (storedPrompt ?? "")) patch.probe_prompt = promptDraft;
+    if (maxTokensDraft !== (storedMaxTokens || 1)) patch.probe_max_tokens = maxTokensDraft;
+    if (concurrencyDraft !== (storedConcurrency || 4)) patch.probe_concurrency = concurrencyDraft;
+    if (autoDisableDraft !== (storedAutoDisable ?? 0)) patch.probe_auto_disable = autoDisableDraft;
+    if (Object.keys(patch).length === 0) return;
+    schedule.mutate(patch);
+  };
+
+  // What the scheduled run covers. An empty list means "everything" on the
+  // backend, so selecting everything writes [] rather than a snapshot of today's
+  // channels: a channel added tomorrow must join the next round by itself.
+  const scheduledCron = runtime.data?.editable?.probe_cron ?? "";
+  const scheduledChannels = runtime.data?.editable?.probe_channels ?? [];
+  const scheduledModels = runtime.data?.editable?.probe_models ?? [];
+  const selectionMatchesSchedule =
+    (allChannels ? scheduledChannels.length === 0 : sameSet(scheduledChannels, pickedChannels)) &&
+    (allModels ? scheduledModels.length === 0 : sameSet(scheduledModels, pickedModels));
+  const scheduleReady = staff && runtime.data?.editable !== undefined;
+  const saveScope = () =>
+    schedule.mutate({
+      probe_channels: allChannels ? [] : pickedChannels.map(Number),
+      probe_models: allModels ? [] : pickedModels,
+    });
 
   return (
     <Dialog
@@ -190,8 +288,13 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
               count: index.byChannel.get(channel.id)?.size ?? 0,
             }),
           }))}
-          selected={pickedChannels}
-          onChange={setPickedChannels}
+          selected={
+            allChannels ? selectableChannels.map((channel) => String(channel.id)) : pickedChannels
+          }
+          onChange={(values) => {
+            setAllChannels(false);
+            setPickedChannels(values);
+          }}
           onToggleOne={toggleChannel}
           emptyLabel={t("common.loading")}
         />
@@ -206,8 +309,11 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
               count: index.byModel.get(model)?.size ?? 0,
             }),
           }))}
-          selected={pickedModels}
-          onChange={setPickedModels}
+          selected={allModels ? visibleModels : pickedModels}
+          onChange={(values) => {
+            setAllModels(false);
+            setPickedModels(values);
+          }}
           emptyLabel={t("common.loading")}
         />
       </div>
@@ -224,9 +330,10 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
           className="probe-prompt"
           rows={2}
           disabled={running}
-          value={prompt}
+          value={promptDraft}
           placeholder={t("modelsPage.probe.promptPlaceholder")}
-          onChange={(event) => setPrompt(event.target.value)}
+          onChange={(event) => setPromptDraft(event.target.value)}
+          onBlur={saveKnobs}
         />
       </label>
 
@@ -238,8 +345,9 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
             min={1}
             max={256}
             disabled={running}
-            value={maxTokens}
-            onChange={(event) => setMaxTokens(Number(event.target.value))}
+            value={maxTokensDraft}
+            onChange={(event) => setMaxTokensDraft(Number(event.target.value))}
+            onBlur={saveKnobs}
           />
         </label>
         <label className="field">
@@ -249,8 +357,9 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
             min={1}
             max={16}
             disabled={running}
-            value={concurrency}
-            onChange={(event) => setConcurrency(Number(event.target.value))}
+            value={concurrencyDraft}
+            onChange={(event) => setConcurrencyDraft(Number(event.target.value))}
+            onBlur={saveKnobs}
           />
         </label>
         <label className="field">
@@ -260,11 +369,14 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
             min={0}
             max={10}
             disabled={running}
-            value={autoDisable}
-            onChange={(event) => setAutoDisable(Number(event.target.value))}
+            value={autoDisableDraft}
+            onChange={(event) => setAutoDisableDraft(Number(event.target.value))}
+            onBlur={saveKnobs}
           />
         </label>
       </div>
+      {/* These four are the scheduled round's parameters, not a per-run copy. */}
+      <p className="unify-section-hint">{t("modelsPage.probe.knobsShared")}</p>
 
       {/* The estimate sits after the knobs that determine it, so changing the
           scope or the prompt re-reads as a new price before submitting. */}
@@ -275,14 +387,56 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
           pairs: scope.pairs,
         })}
       </div>
-      {autoDisable > 0 ? (
+      {autoDisableDraft > 0 ? (
         <p className="unify-section-hint">
-          {t("modelsPage.probe.autoDisableHint", { count: autoDisable })}
+          {t("modelsPage.probe.autoDisableHint", { count: autoDisableDraft })}
         </p>
       ) : null}
 
-      {start.error ? (
-        <div className="inline-error">{String(start.error)}</div>
+      {start.error ? <div className="inline-error">{String(start.error)}</div> : null}
+
+      {/* The same pick lists above are what the schedule needs, so the schedule is
+          configured where the selection is made — plan, scope and the four run
+          knobs, which are stored settings the scheduled round reads directly. */}
+      {staff ? (
+        <div className="probe-schedule">
+          <div className="probe-schedule-head">
+            <span className="probe-schedule-title">{t("modelsPage.probe.schedule")}</span>
+            <CronSchedulePicker
+              value={scheduledCron}
+              disabled={!scheduleReady || running || schedule.isPending}
+              onChange={(cron) => schedule.mutate({ probe_cron: cron })}
+            />
+          </div>
+          <div className="probe-schedule-head">
+            <span className="probe-schedule-scope" role="status">
+              {t("modelsPage.probe.scheduleScope", {
+                channels:
+                  scheduledChannels.length === 0
+                    ? t("modelsPage.probe.scheduleAllChannels")
+                    : t("modelsPage.probe.scheduleChannels", { count: scheduledChannels.length }),
+                models:
+                  scheduledModels.length === 0
+                    ? t("modelsPage.probe.scheduleAllModels")
+                    : t("modelsPage.probe.scheduleModels", { count: scheduledModels.length }),
+              })}
+            </span>
+            {selectionMatchesSchedule ? (
+              <span className="muted">{t("modelsPage.probe.scheduleScopeMatches")}</span>
+            ) : (
+              <button
+                type="button"
+                className="unify-covered-toggle"
+                disabled={!scheduleReady || running || schedule.isPending}
+                onClick={saveScope}
+              >
+                {t("modelsPage.probe.scheduleUseSelection")}
+              </button>
+            )}
+          </div>
+          <p className="field-hint">{t("modelsPage.probe.scheduleHint")}</p>
+          {schedule.error ? <div className="inline-error">{String(schedule.error)}</div> : null}
+        </div>
       ) : null}
 
       {latest ? (
@@ -297,8 +451,10 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
         </div>
       ) : null}
 
-      {results.isPending ? (
+      {latest && results.isPending ? (
         <Empty>{t("common.loading")}</Empty>
+      ) : results.isError ? (
+        <ErrorState error={results.error} retry={() => results.refetch()} />
       ) : (results.data ?? []).length === 0 ? (
         <Empty>{t("modelsPage.probe.noResults")}</Empty>
       ) : (
@@ -320,12 +476,8 @@ export function ProbeDialog({ onClose }: { onClose: () => void }) {
                   <td>{channelNames.get(result.channel_id) ?? result.channel_id}</td>
                   <td className="mono">{result.model}</td>
                   <td>
-                    <span
-                      className={`model-meta-badge${result.ok ? " is-mapped" : ""}`}
-                    >
-                      {result.ok
-                        ? t("modelsPage.probe.ok")
-                        : t("modelsPage.probe.failed")}
+                    <span className={`model-meta-badge${result.ok ? " is-mapped" : ""}`}>
+                      {result.ok ? t("modelsPage.probe.ok") : t("modelsPage.probe.failed")}
                     </span>
                   </td>
                   <td>{result.latency_ms} ms</td>
@@ -379,16 +531,13 @@ function PickList({
       onToggleOne(value, checked);
       return;
     }
-    onChange(
-      checked ? [...selected, value] : selected.filter((item) => item !== value),
-    );
+    onChange(checked ? [...selected, value] : selected.filter((item) => item !== value));
   };
 
   // Select-all applies to what the operator can currently see, so a filter
   // narrows the bulk action instead of silently grabbing everything.
   const allVisibleSelected =
-    visible.length > 0 &&
-    visible.every((option) => selected.includes(option.value));
+    visible.length > 0 && visible.every((option) => selected.includes(option.value));
 
   return (
     <section className="probe-picker-col">
@@ -416,16 +565,16 @@ function PickList({
           className="unify-covered-toggle"
           disabled={disabled || visible.length === 0}
           onClick={() =>
-            onChange(allVisibleSelected
-              ? selected.filter(
-                  (item) => !visible.some((option) => option.value === item),
-                )
-              : [
-                  ...selected,
-                  ...visible
-                    .map((option) => option.value)
-                    .filter((value) => !selected.includes(value)),
-                ])
+            onChange(
+              allVisibleSelected
+                ? selected.filter((item) => !visible.some((option) => option.value === item))
+                : [
+                    ...selected,
+                    ...visible
+                      .map((option) => option.value)
+                      .filter((value) => !selected.includes(value)),
+                  ],
+            )
           }
         >
           {allVisibleSelected
@@ -489,4 +638,12 @@ function buildIndex(overviews: RouteOverview[]) {
     }
   }
   return { byChannel, byModel, models: [...byModel.keys()].sort() };
+}
+
+/** Set equality over ids or names, for "is the schedule already this scope?". */
+function sameSet(a: readonly (string | number)[], b: readonly (string | number)[]) {
+  if (a.length !== b.length) return false;
+  const norm = (values: readonly (string | number)[]) =>
+    [...values].map(String).sort().join("\u0000");
+  return norm(a) === norm(b);
 }

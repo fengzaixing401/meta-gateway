@@ -1,8 +1,14 @@
-import type { ChannelPingResult, ChannelOverview } from "../../api/types"
-import { StatusBadge } from "../../components/ui"
-import { useI18n } from "../../i18n"
-import { channelAccountState, channelConnectivityState, channelHealthState, channelReadiness } from "../channelHealth"
-import {  } from "./helpers"
+import type { ChannelPingResult, ChannelOverview } from "../../api/types";
+import { StatusBadge } from "../../components/ui";
+import { useI18n } from "../../i18n";
+import { formatCost, formatTokens } from "../../lib/format";
+import {
+  channelAccountState,
+  channelConnectivityState,
+  channelHealthState,
+  channelReadiness,
+} from "../channelHealth";
+import {} from "./helpers";
 
 function channelHealthReasonLabel(
   overview: ChannelOverview,
@@ -47,11 +53,7 @@ export function ChannelHealthBadge({ overview }: { overview: ChannelOverview }) 
   const state = channelHealthState(overview);
   const reason = channelHealthReasonLabel(overview, t);
   return (
-    <span
-      className={`badge badge-${state}`}
-      title={reason}
-      data-testid="channel-health-badge"
-    >
+    <span className={`badge badge-${state}`} title={reason} data-testid="channel-health-badge">
       {t(`channels.healthState.${state}`)}
     </span>
   );
@@ -96,10 +98,7 @@ function ChannelStatusBadges({ overview }: { overview: ChannelOverview }) {
   if (readiness === "missing_key") {
     const health = channelHealthState(overview);
     return (
-      <span
-        className="badge badge-missing-key"
-        title={channelHealthReasonLabel(overview, t)}
-      >
+      <span className="badge badge-missing-key" title={channelHealthReasonLabel(overview, t)}>
         {t(`channels.healthState.${health}`)} · {t("channels.badge.missingKey")}
       </span>
     );
@@ -108,7 +107,36 @@ function ChannelStatusBadges({ overview }: { overview: ChannelOverview }) {
     <>
       <ChannelHealthBadge overview={overview} />
       <ChannelReadinessBadge overview={overview} />
+      <ChannelUsageLimitBadge overview={overview} />
     </>
+  );
+}
+
+/**
+ * The budget badge: this channel is parked because the operator's own limit came
+ * due, which is a different answer from "the upstream broke" — the tooltip names
+ * the limit and the amount, so the row says why it stopped and what to raise.
+ */
+export function ChannelUsageLimitBadge({ overview }: { overview: ChannelOverview }) {
+  const { t } = useI18n();
+  const channel = overview.channel;
+  const hit = (channel.usage_limit_hit ?? "").split(",").filter(Boolean);
+  if (hit.length === 0) return null;
+  const reasons = hit.map((kind) =>
+    kind === "cost"
+      ? t("channels.usageLimitHitCost", { limit: formatCost(channel.usage_limit_cost ?? 0) })
+      : t("channels.usageLimitHitTokens", {
+          limit: formatTokens(channel.usage_limit_tokens ?? 0),
+        }),
+  );
+  return (
+    <span
+      className="badge badge-unhealthy"
+      data-testid="channel-usage-limit-badge"
+      title={reasons.join(" · ")}
+    >
+      {t("channels.usageLimitBadge")}
+    </span>
   );
 }
 
@@ -154,10 +182,7 @@ export function ChannelConnectivityBadge({
   // only append detail when it adds information.
   const suffix = detail && detail !== stateLabel ? ` · ${detail}` : "";
   return (
-    <span
-      className={`badge badge-${state}`}
-      data-testid="channel-connectivity-badge"
-    >
+    <span className={`badge badge-${state}`} data-testid="channel-connectivity-badge">
       {stateLabel}
       {suffix}
     </span>

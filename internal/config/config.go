@@ -12,147 +12,210 @@ import (
 )
 
 type Config struct {
-	HTTPAddr    string
-	DataDir     string
-	AdminToken  string
-	AdminTokens []string
-	MasterKey   string
-	RetryTimes  int
+	HTTPAddr      string   `env:"HTTP_ADDR"`
+	DataDir       string   `env:"DATA_DIR"`
+	AdminToken    string   `env:"ADMIN_TOKEN" secret:"true"`
+	AdminUsername string   `env:"ADMIN_USERNAME"`
+	AdminTokens   []string `env:"ADMIN_TOKENS" secret:"true"`
+	// AdminTokenLogin re-opens the ADMIN_TOKEN-as-password login after the
+	// deployment has claimed an owner account. Empty (the default) means the
+	// token only works while no owner credential exists, which is what makes the
+	// first-run claim close the upgrade path by itself; "break-glass" is the
+	// documented recovery hatch for a deployment whose owner forgot the password.
+	AdminTokenLogin string `env:"ADMIN_TOKEN_LOGIN"`
+	MasterKey       string `env:"MASTER_KEY" secret:"true"`
+	RetryTimes      int    `env:"RETRY_TIMES"`
 	// ChannelRetryTimes is how many times the same upstream key is re-sent
 	// after a retryable failure before moving to the next key/channel.
 	// Network errors (transport) fail fast after these retries instead of
 	// fanning out across every channel.
-	ChannelRetryTimes int
-	// KeyPoolRotation enables rotating through the site key pool on failure.
-	// Disabled = only the channel's bound key is used.
-	KeyPoolRotation bool
+	ChannelRetryTimes int `env:"CHANNEL_RETRY_TIMES"`
 	// UpdateCheckEnabled lets the gateway query GitHub for newer releases to
 	// power the console update badge.
-	UpdateCheckEnabled          bool
-	CrossChannelFailoverEnabled bool
-	Cooldown                    time.Duration
+	UpdateCheckEnabled          bool          `env:"UPDATE_CHECK_ENABLED"`
+	CrossChannelFailoverEnabled bool          `env:"CROSS_CHANNEL_FAILOVER_ENABLED"`
+	Cooldown                    time.Duration `env:"COOLDOWN_SECONDS"`
 	// SQLiteMaxOpenConns is the SQLite connection-pool ceiling (WAL allows
 	// concurrent readers). Default 4; 1 restores the fully serialized behavior.
-	SQLiteMaxOpenConns int
-	CheckinEnabled     bool
-	CheckinCron        string
+	SQLiteMaxOpenConns int    `env:"SQLITE_MAX_OPEN_CONNS"`
+	CheckinEnabled     bool   `env:"CHECKIN_ENABLED"`
+	CheckinCron        string `env:"CHECKIN_CRON"`
 	// CheckinTZ is the IANA timezone (e.g. "Asia/Shanghai") the check-in cron is
 	// interpreted in. Empty means the process local timezone (UTC in containers).
-	CheckinTZ string
+	CheckinTZ string `env:"CHECKIN_TZ"`
 
-	WebDAVSyncEnabled    bool
-	WebDAVUploadEnabled  bool
-	WebDAVURL            string
-	WebDAVUsername       string
-	WebDAVPassword       string
-	WebDAVBackupPassword string
+	WebDAVSyncEnabled    bool   `env:"WEBDAV_SYNC_ENABLED"`
+	WebDAVUploadEnabled  bool   `env:"WEBDAV_UPLOAD_ENABLED"`
+	WebDAVURL            string `env:"WEBDAV_URL"`
+	WebDAVUsername       string `env:"WEBDAV_USERNAME"`
+	WebDAVPassword       string `env:"WEBDAV_PASSWORD" secret:"true"`
+	WebDAVBackupPassword string `env:"WEBDAV_BACKUP_PASSWORD" secret:"true"`
 	// Upload direction owns its own connection; each WEBDAV_UPLOAD_* falls back
 	// to the matching shared variable when unset.
-	WebDAVUploadURL            string
-	WebDAVUploadUsername       string
-	WebDAVUploadPassword       string
-	WebDAVUploadBackupPassword string
-	WebDAVCron                 string
-	WebDAVMaxBytes             int64
+	WebDAVUploadURL            string `env:"WEBDAV_UPLOAD_URL"`
+	WebDAVUploadUsername       string `env:"WEBDAV_UPLOAD_USERNAME"`
+	WebDAVUploadPassword       string `env:"WEBDAV_UPLOAD_PASSWORD" secret:"true"`
+	WebDAVUploadBackupPassword string `env:"WEBDAV_UPLOAD_BACKUP_PASSWORD" secret:"true"`
+	WebDAVCron                 string `env:"WEBDAV_CRON"`
+	WebDAVMaxBytes             int64  `env:"WEBDAV_MAX_BYTES"`
 
-	OutboundAllowHosts            []string
-	OutboundAllowCIDRs            []string
-	OutboundConnectTimeout        time.Duration
-	OutboundTLSHandshakeTimeout   time.Duration
-	OutboundResponseHeaderTimeout time.Duration
+	OutboundAllowHosts            []string      `env:"OUTBOUND_ALLOW_HOSTS"`
+	OutboundAllowCIDRs            []string      `env:"OUTBOUND_ALLOW_CIDRS"`
+	OutboundConnectTimeout        time.Duration `env:"OUTBOUND_CONNECT_TIMEOUT_SECONDS"`
+	OutboundTLSHandshakeTimeout   time.Duration `env:"OUTBOUND_TLS_TIMEOUT_SECONDS"`
+	OutboundResponseHeaderTimeout time.Duration `env:"OUTBOUND_HEADER_TIMEOUT_SECONDS"`
+	// OutboundImageHeaderTimeout is the response-header ceiling for the image
+	// endpoints, which are slower by nature and never retried.
+	OutboundImageHeaderTimeout time.Duration `env:"OUTBOUND_IMAGE_HEADER_TIMEOUT_SECONDS"`
 	// OutboundMaxIdleConns is the total outbound idle connection ceiling.
-	OutboundMaxIdleConns int
+	OutboundMaxIdleConns int `env:"OUTBOUND_MAX_IDLE_CONNS"`
 	// OutboundMaxIdleConnsPerHost is the per-upstream-host idle connection ceiling.
-	OutboundMaxIdleConnsPerHost int
-	TrustedProxyCIDRs           []string
-	RelayRatePerMinute          int
-	RelayRateBurst              int
-	RelayModelRatePerMinute     int
-	RelayModelRateBurst         int
+	OutboundMaxIdleConnsPerHost int      `env:"OUTBOUND_MAX_IDLE_CONNS_PER_HOST"`
+	TrustedProxyCIDRs           []string `env:"TRUSTED_PROXY_CIDRS"`
+	RelayRatePerMinute          int      `env:"RELAY_RATE_PER_MINUTE"`
+	RelayRateBurst              int      `env:"RELAY_RATE_BURST"`
+	RelayModelRatePerMinute     int      `env:"RELAY_MODEL_RATE_PER_MINUTE"`
+	RelayModelRateBurst         int      `env:"RELAY_MODEL_RATE_BURST"`
 	// ChannelAutoDisableThreshold: consecutive member failures before a channel
 	// is auto-disabled. 0 disables the feature.
-	ChannelAutoDisableThreshold int
+	ChannelAutoDisableThreshold int `env:"CHANNEL_AUTO_DISABLE_THRESHOLD"`
 	// RoutingLatencyAware enables latency-weighted channel selection.
-	RoutingLatencyAware bool
+	RoutingLatencyAware bool `env:"ROUTING_LATENCY_AWARE"`
 	// RoutingErrorAware penalizes channels with a high EWMA failure propensity.
-	RoutingErrorAware bool
+	RoutingErrorAware bool `env:"ROUTING_ERROR_AWARE"`
 	// RoutingConcurrencyEnabled enables the in-flight burst guard.
-	RoutingConcurrencyEnabled bool
+	RoutingConcurrencyEnabled bool `env:"ROUTING_CONCURRENCY_AWARE"`
 	// RoutingConcurrencyLimit is the per-channel in-flight ceiling.
-	RoutingConcurrencyLimit int
+	RoutingConcurrencyLimit int `env:"ROUTING_CONCURRENCY_LIMIT"`
 	// WebhookURL is the operational notification endpoint ("" disables).
-	WebhookURL string
+	WebhookURL string `env:"WEBHOOK_URL" secret:"true"`
 	// WebhookThrottleSeconds coalesces repeated events within the window.
-	WebhookThrottleSeconds int
+	WebhookThrottleSeconds int `env:"WEBHOOK_THROTTLE_SECONDS"`
 	// AlertConfigJSON is the multi-channel alert matrix config (bark/serverchan/
 	// telegram/smtp + cooldown + daily summary flag), JSON-encoded.
-	AlertConfigJSON string
+	AlertConfigJSON string `env:"ALERT_CONFIG_JSON" secret:"true"`
 	// AlertDailySummaryInterval is how often the daily digest runs (0 = off).
-	AlertDailySummaryInterval time.Duration
+	AlertDailySummaryInterval time.Duration `env:"ALERT_DAILY_SUMMARY_INTERVAL_SECONDS"`
 	// AlertSweepInterval is how often the proactive health sweep runs (0 = off).
-	AlertSweepInterval time.Duration
+	AlertSweepInterval time.Duration `env:"ALERT_SWEEP_INTERVAL_SECONDS"`
 	// RecoveryProbeEnabled enables the passive-recovery loop for auto-disabled channels.
-	RecoveryProbeEnabled bool
+	RecoveryProbeEnabled bool `env:"RECOVERY_PROBE_ENABLED"`
 	// RecoveryProbeIntervalSeconds is the recovery-loop cadence.
-	RecoveryProbeIntervalSeconds int
+	RecoveryProbeIntervalSeconds int `env:"RECOVERY_PROBE_INTERVAL_SECONDS"`
 	// FaultProtectionEnabled gates fixed cooldown and channel auto-disable.
-	FaultProtectionEnabled bool
+	FaultProtectionEnabled bool `env:"FAULT_PROTECTION_ENABLED"`
 	// FaultProtectionConfigured distinguishes a loaded config from a minimal
 	// test/embedder literal, whose zero value should preserve legacy protection.
 	FaultProtectionConfigured bool
 	// StickyEnabled enables sticky-session routing (same conversation prefers
 	// the previously successful channel).
-	StickyEnabled bool
+	StickyEnabled bool `env:"STICKY_ENABLED"`
 	// StickyTTL is how long a session binding stays valid without renewal.
-	StickyTTL time.Duration
+	StickyTTL time.Duration `env:"STICKY_TTL_MINUTES"`
 	// StableFirstEnabled gates the 1/N grayscale pool.
-	StableFirstEnabled bool
+	StableFirstEnabled bool `env:"STABLE_FIRST_ENABLED"`
 	// StableFirstDenominator is the draw base (25 = grayscale gets 1/25).
-	StableFirstDenominator int
+	StableFirstDenominator int `env:"STABLE_FIRST_DENOMINATOR"`
 	// StableFirstPromoteRequests is the successful-attempt threshold for
 	// automatic promotion out of the grayscale pool.
-	StableFirstPromoteRequests int
-	AdminRatePerMinute         int
-	AdminRateBurst             int
-	MetricsToken               string
-	TrustedScraperCIDRs        []string
-	MaxHeaderBytes             int
-	MaxAdminBodyBytes          int64
-	ServerReadHeaderTimeout    time.Duration
-	ServerReadTimeout          time.Duration
-	ServerIdleTimeout          time.Duration
-	ServerShutdownTimeout      time.Duration
-	ReadinessTimeout           time.Duration
-	AuditRetentionDays         int
-	AuditRetentionRows         int
+	StableFirstPromoteRequests int      `env:"STABLE_FIRST_PROMOTE_REQUESTS"`
+	AdminRatePerMinute         int      `env:"ADMIN_RATE_PER_MINUTE"`
+	AdminRateBurst             int      `env:"ADMIN_RATE_BURST"`
+	MetricsToken               string   `env:"METRICS_TOKEN" secret:"true"`
+	TrustedScraperCIDRs        []string `env:"TRUSTED_SCRAPER_CIDRS"`
+	// CORSAllowedOrigins opens the downstream /v1 surface to browser callers.
+	// Empty means any origin ("*"), which is the zero-config default; entries
+	// are exact origins or "*.example.com" subdomain patterns.
+	CORSAllowedOrigins []string `env:"CORS_ALLOWED_ORIGINS"`
+	MaxHeaderBytes     int      `env:"MAX_HEADER_BYTES"`
+	MaxAdminBodyBytes  int64    `env:"MAX_ADMIN_BODY_BYTES"`
+	// RelayMaxBodyBytes caps a /v1 request body for the JSON surfaces (chat,
+	// responses, embeddings, audio, custom paths). It has to cover what a real
+	// client sends: a chat request with an inlined base64 screenshot is routinely
+	// several megabytes, and a 10 MB ceiling turned that into a bare
+	// "body too large" on every retry. Raise it with RELAY_MAX_BODY_MB.
+	RelayMaxBodyBytes int64 `env:"RELAY_MAX_BODY_MB"`
+	// RelayMaxImageBytes caps the image surfaces, which carry base64 or multipart
+	// payloads by definition (RELAY_MAX_IMAGE_MB).
+	RelayMaxImageBytes      int64         `env:"RELAY_MAX_IMAGE_MB"`
+	ServerReadHeaderTimeout time.Duration `env:"SERVER_READ_HEADER_TIMEOUT_SECONDS"`
+	ServerReadTimeout       time.Duration `env:"SERVER_READ_TIMEOUT_SECONDS"`
+	ServerIdleTimeout       time.Duration `env:"SERVER_IDLE_TIMEOUT_SECONDS"`
+	ServerShutdownTimeout   time.Duration `env:"SERVER_SHUTDOWN_TIMEOUT_SECONDS"`
+	ReadinessTimeout        time.Duration `env:"READINESS_TIMEOUT_SECONDS"`
+	AuditRetentionDays      int           `env:"AUDIT_RETENTION_DAYS"`
+	AuditRetentionRows      int           `env:"AUDIT_RETENTION_ROWS"`
 	// HealthHistoryRetentionDays bounds channel_health_history rows (default 90).
-	HealthHistoryRetentionDays int
+	HealthHistoryRetentionDays int `env:"HEALTH_HISTORY_RETENTION_DAYS"`
 	// BalanceHistoryRetentionDays and DecisionSnapshotRetentionDays control
 	// the other daily maintenance pruners. Zero disables each pruner.
-	BalanceHistoryRetentionDays   int
-	DecisionSnapshotRetentionDays int
-	BackupRetentionCount          int
-	BackupDir                     string
-	PluginsDir                    string
-	PluginCatalogURL              string
+	BalanceHistoryRetentionDays   int `env:"BALANCE_HISTORY_RETENTION_DAYS"`
+	DecisionSnapshotRetentionDays int `env:"DECISION_SNAPSHOT_RETENTION_DAYS"`
+	// ModelChangeRetentionDays bounds finished model_changes rows (default
+	// 90); ModelChangeAutoIgnoreDays auto-ignores pending removals with no
+	// route impact after that many days (0 = off by default).
+	ModelChangeRetentionDays  int `env:"MODEL_CHANGE_RETENTION_DAYS"`
+	ModelChangeAutoIgnoreDays int `env:"MODEL_CHANGE_AUTO_IGNORE_DAYS"`
+	// SiteProbeRetentionDays bounds external site-probe rounds and their
+	// samples (default 7): one row per monitored model per site per round.
+	SiteProbeRetentionDays int `env:"SITE_PROBE_RETENTION_DAYS"`
+	// SiteProbeIntervalSeconds / SiteProbeJitterSeconds are the external
+	// site-probe collection cadence (defaults 900 + 120). They are the env
+	// bootstrap for a hot-reloadable runtime setting, so an operator can speed
+	// the round up for sites that publish heartbeats every minute without a
+	// restart.
+	SiteProbeIntervalSeconds int `env:"SITE_PROBE_INTERVAL_SECONDS"`
+	SiteProbeJitterSeconds   int `env:"SITE_PROBE_JITTER_SECONDS"`
+	// SiteNewsIntervalSeconds is the env bootstrap for the upstream notice-board
+	// reader (internal/sitenews; default 300 = 5 minutes). Same contract as the
+	// site-probe cadence next door — a hot-reloadable runtime setting — except
+	// that the console may also set it to 0, which turns the background reader
+	// off rather than falling back here.
+	SiteNewsIntervalSeconds int `env:"SITE_NEWS_INTERVAL_SECONDS"`
+	// KeepaliveCheckIntervalSeconds / KeepaliveDefaultIdleDays are the env
+	// bootstrap for the hot-reloadable keepalive settings: how often a round asks
+	// whether anything is due, and the window used by a site that was never given
+	// one. The per-site window itself is data, not configuration — 15 days here
+	// and 30 days there is the site's rule, not the deployment's.
+	KeepaliveCheckIntervalSeconds int `env:"KEEPALIVE_CHECK_INTERVAL_SECONDS"`
+	KeepaliveDefaultIdleDays      int `env:"KEEPALIVE_DEFAULT_IDLE_DAYS"`
+	// SiteProbeCatalogURL is the third-party monitoring directory the scheduled
+	// third-party health snapshot is read from. Empty keeps the shipped default
+	// (siteprobe.DefaultCatalogURL).
+	SiteProbeCatalogURL  string `env:"SITE_PROBE_CATALOG_URL"`
+	BackupRetentionCount int    `env:"BACKUP_RETENTION_COUNT"`
+	BackupDir            string `env:"BACKUP_DIR"`
+	PluginsDir           string `env:"PLUGINS_DIR"`
+	PluginCatalogURL     string `env:"PLUGIN_CATALOG_URL"`
 	// PluginMarketURLs appends extra plugin market registry URLs
 	// (comma-separated; the built-in official registry is always included).
-	PluginMarketURLs []string
+	PluginMarketURLs []string `env:"PLUGIN_MARKET_URLS"`
+	// ModelCatalogSources selects which external model indexes a sync reads
+	// (comma-separated: "litellm", "models.dev"). Empty disables the sync
+	// entirely, which is also what a zero interval does.
+	ModelCatalogSources []string `env:"MODEL_CATALOG_SOURCES"`
+	// ModelCatalogInterval is the gap between scheduled catalog syncs. Zero
+	// turns the schedule off while leaving the manual sync available.
+	ModelCatalogInterval time.Duration `env:"MODEL_CATALOG_SYNC_INTERVAL_HOURS"`
+	// ModelCatalogSyncPrices lets a sync fill in per-1k prices it finds. It
+	// only ever fills columns the gateway has left at zero, so an operator's own
+	// price always wins; set false to keep every price hand-managed.
+	ModelCatalogSyncPrices bool `env:"MODEL_CATALOG_SYNC_PRICES"`
 	// ExchangeAllowSecretExport gates include_secrets on export (default true for compat).
-	ExchangeAllowSecretExport bool
+	ExchangeAllowSecretExport bool `env:"EXCHANGE_ALLOW_SECRET_EXPORT"`
 	// HealthSweepEnabled enables the periodic channel health sweep (jittered
 	// probes grading operational/degraded/error with transition alerts).
-	HealthSweepEnabled bool
+	HealthSweepEnabled bool `env:"HEALTH_SWEEP_ENABLED"`
 	// HealthSweepIntervalSeconds is the base probe interval.
-	HealthSweepIntervalSeconds int
+	HealthSweepIntervalSeconds int `env:"HEALTH_SWEEP_INTERVAL_SECONDS"`
 	// HealthSweepJitterSeconds is the per-round random jitter ceiling.
-	HealthSweepJitterSeconds int
+	HealthSweepJitterSeconds int `env:"HEALTH_SWEEP_JITTER_SECONDS"`
 	// HealthSweepDegradedMs: latency above this grades the channel degraded.
-	HealthSweepDegradedMs int
+	HealthSweepDegradedMs int `env:"HEALTH_SWEEP_DEGRADED_MS"`
 	// HealthSweepConcurrency caps simultaneous probes.
-	HealthSweepConcurrency int
+	HealthSweepConcurrency int `env:"HEALTH_SWEEP_CONCURRENCY"`
 	// HealthSweepTimeoutSeconds bounds one probe.
-	HealthSweepTimeoutSeconds int
+	HealthSweepTimeoutSeconds int `env:"HEALTH_SWEEP_TIMEOUT_SECONDS"`
 }
 
 func Load() (*Config, error) {
@@ -164,10 +227,7 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	keyPoolRotation, err := envBool("KEY_POOL_ROTATION", true)
-	if err != nil {
-		return nil, err
-	}
+
 	updateCheckEnabled, err := envBool("UPDATE_CHECK_ENABLED", true)
 	if err != nil {
 		return nil, err
@@ -221,6 +281,15 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	headerTimeout, err := envDurationSeconds("OUTBOUND_HEADER_TIMEOUT_SECONDS", 60, 1, 3600)
+	if err != nil {
+		return nil, err
+	}
+	// Image generation and editing is the one family that legitimately takes
+	// minutes: the caller is waiting for an artifact, the operation is never
+	// retried (a replay would bill twice), and the upstream may need well over
+	// the chat timeout. Without a separate ceiling those requests fail with
+	// "timeout awaiting response headers" while the upstream is still working.
+	imageHeaderTimeout, err := envDurationSeconds("OUTBOUND_IMAGE_HEADER_TIMEOUT_SECONDS", 300, 1, 3600)
 	if err != nil {
 		return nil, err
 	}
@@ -342,11 +411,25 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Absent or empty keeps the downstream surface open to any origin.
+	corsOrigins := splitList(os.Getenv("CORS_ALLOWED_ORIGINS"))
 	maxHeaderBytes, err := envInt("MAX_HEADER_BYTES", 1<<20, 4096, 16<<20)
 	if err != nil {
 		return nil, err
 	}
 	maxAdminBodyBytes, err := envInt("MAX_ADMIN_BODY_BYTES", 2<<20, 1024, 16<<20)
+	if err != nil {
+		return nil, err
+	}
+	// The relay surfaces are sized for what clients actually send, not for what
+	// the gateway would prefer to parse: it forwards bytes without reading the
+	// images inside a chat request, so the ceiling only has to protect memory.
+	// These are megabytes (RELAY_MAX_BODY_MB), stored as bytes for the readers.
+	maxRelayBodyMB, err := envInt("RELAY_MAX_BODY_MB", 32, 1, 512)
+	if err != nil {
+		return nil, err
+	}
+	maxRelayImageMB, err := envInt("RELAY_MAX_IMAGE_MB", 64, 1, 1024)
 	if err != nil {
 		return nil, err
 	}
@@ -390,7 +473,54 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	modelChangeRetentionDays, err := envInt("MODEL_CHANGE_RETENTION_DAYS", 90, 0, 36500)
+	if err != nil {
+		return nil, err
+	}
+	siteProbeRetentionDays, err := envInt("SITE_PROBE_RETENTION_DAYS", 7, 0, 36500)
+	if err != nil {
+		return nil, err
+	}
+	siteProbeIntervalSeconds, err := envInt("SITE_PROBE_INTERVAL_SECONDS", 900, 60, 86400)
+	if err != nil {
+		return nil, err
+	}
+	siteProbeJitterSeconds, err := envInt("SITE_PROBE_JITTER_SECONDS", 120, 0, 3600)
+	if err != nil {
+		return nil, err
+	}
+	siteNewsIntervalSeconds, err := envInt("SITE_NEWS_INTERVAL_SECONDS", 300, 60, 86400)
+	if err != nil {
+		return nil, err
+	}
+	keepaliveCheckIntervalSeconds, err := envInt("KEEPALIVE_CHECK_INTERVAL_SECONDS", 3600, 60, 86400)
+	if err != nil {
+		return nil, err
+	}
+	keepaliveDefaultIdleDays, err := envInt("KEEPALIVE_DEFAULT_IDLE_DAYS", 15, 0, 3650)
+	if err != nil {
+		return nil, err
+	}
+	siteProbeCatalogURL := envStr("SITE_PROBE_CATALOG_URL", "")
+	modelChangeAutoIgnoreDays, err := envInt("MODEL_CHANGE_AUTO_IGNORE_DAYS", 0, 0, 36500)
+	if err != nil {
+		return nil, err
+	}
 	backupRetentionCount, err := envInt("BACKUP_RETENTION_COUNT", 30, 0, 100000)
+	if err != nil {
+		return nil, err
+	}
+	// The catalog sweep defaults to daily. Zero disables the schedule but keeps
+	// the console's manual sync working.
+	modelCatalogHours, err := envInt("MODEL_CATALOG_SYNC_INTERVAL_HOURS", 24, 0, 8760)
+	if err != nil {
+		return nil, err
+	}
+	modelCatalogPrices, err := envBool("MODEL_CATALOG_SYNC_PRICES", true)
+	if err != nil {
+		return nil, err
+	}
+	modelCatalogSources, err := envModelCatalogSources()
 	if err != nil {
 		return nil, err
 	}
@@ -437,11 +567,12 @@ func Load() (*Config, error) {
 		HTTPAddr:                    envStr("HTTP_ADDR", ":4100"),
 		DataDir:                     dataDir,
 		AdminToken:                  firstNonEmpty(adminTokens),
+		AdminUsername:               envStr("ADMIN_USERNAME", "admin"),
+		AdminTokenLogin:             envStr("ADMIN_TOKEN_LOGIN", ""),
 		AdminTokens:                 adminTokens,
 		MasterKey:                   envStr("MASTER_KEY", ""),
 		RetryTimes:                  retryTimes,
 		ChannelRetryTimes:           channelRetryTimes,
-		KeyPoolRotation:             keyPoolRotation,
 		UpdateCheckEnabled:          updateCheckEnabled,
 		CrossChannelFailoverEnabled: crossChannelFailover,
 		Cooldown:                    time.Duration(cooldownSeconds) * time.Second,
@@ -467,6 +598,7 @@ func Load() (*Config, error) {
 		OutboundConnectTimeout:        connectTimeout,
 		OutboundTLSHandshakeTimeout:   tlsTimeout,
 		OutboundResponseHeaderTimeout: headerTimeout,
+		OutboundImageHeaderTimeout:    imageHeaderTimeout,
 		OutboundMaxIdleConns:          outboundMaxIdle,
 		OutboundMaxIdleConnsPerHost:   outboundMaxIdlePerHost,
 		SQLiteMaxOpenConns:            sqliteMaxConns,
@@ -494,24 +626,38 @@ func Load() (*Config, error) {
 		StableFirstPromoteRequests:   stableFirstPromote,
 		AdminRatePerMinute:           adminRate, AdminRateBurst: adminBurst,
 		MetricsToken: metricsToken, TrustedScraperCIDRs: trustedScrapers,
-		MaxHeaderBytes: maxHeaderBytes, MaxAdminBodyBytes: int64(maxAdminBodyBytes),
+		CORSAllowedOrigins: corsOrigins,
+		MaxHeaderBytes:     maxHeaderBytes, MaxAdminBodyBytes: int64(maxAdminBodyBytes),
+		RelayMaxBodyBytes: int64(maxRelayBodyMB) << 20, RelayMaxImageBytes: int64(maxRelayImageMB) << 20,
 		ServerReadHeaderTimeout: readHeaderTimeout, ServerReadTimeout: readTimeout,
 		ServerIdleTimeout: idleTimeout, ServerShutdownTimeout: shutdownTimeout,
 		ReadinessTimeout: readinessTimeout, AuditRetentionDays: auditDays,
 		AuditRetentionRows: auditRows, HealthHistoryRetentionDays: healthHistoryDays,
 		BalanceHistoryRetentionDays: balanceHistoryDays, DecisionSnapshotRetentionDays: decisionSnapshotDays,
-		BackupRetentionCount:       backupRetentionCount,
-		BackupDir:                  envStr("BACKUP_DIR", filepath.Join(dataDir, "backups")),
-		PluginsDir:                 envStr("PLUGINS_DIR", filepath.Join(dataDir, "plugins")),
-		PluginCatalogURL:           envStr("PLUGIN_CATALOG_URL", ""),
-		PluginMarketURLs:           envList("PLUGIN_MARKET_URLS"),
-		ExchangeAllowSecretExport:  exchangeAllowSecretExport,
-		HealthSweepEnabled:         healthSweepEnabled,
-		HealthSweepIntervalSeconds: healthSweepInterval,
-		HealthSweepJitterSeconds:   healthSweepJitter,
-		HealthSweepDegradedMs:      healthSweepDegraded,
-		HealthSweepConcurrency:     healthSweepConcurrency,
-		HealthSweepTimeoutSeconds:  healthSweepTimeout,
+		ModelChangeRetentionDays:      modelChangeRetentionDays,
+		ModelChangeAutoIgnoreDays:     modelChangeAutoIgnoreDays,
+		SiteProbeRetentionDays:        siteProbeRetentionDays,
+		SiteProbeIntervalSeconds:      siteProbeIntervalSeconds,
+		SiteProbeJitterSeconds:        siteProbeJitterSeconds,
+		SiteNewsIntervalSeconds:       siteNewsIntervalSeconds,
+		KeepaliveCheckIntervalSeconds: keepaliveCheckIntervalSeconds,
+		KeepaliveDefaultIdleDays:      keepaliveDefaultIdleDays,
+		SiteProbeCatalogURL:           siteProbeCatalogURL,
+		BackupRetentionCount:          backupRetentionCount,
+		BackupDir:                     envStr("BACKUP_DIR", filepath.Join(dataDir, "backups")),
+		PluginsDir:                    envStr("PLUGINS_DIR", filepath.Join(dataDir, "plugins")),
+		PluginCatalogURL:              envStr("PLUGIN_CATALOG_URL", ""),
+		ModelCatalogSources:           modelCatalogSources,
+		ModelCatalogInterval:          time.Duration(modelCatalogHours) * time.Hour,
+		ModelCatalogSyncPrices:        modelCatalogPrices,
+		PluginMarketURLs:              envList("PLUGIN_MARKET_URLS"),
+		ExchangeAllowSecretExport:     exchangeAllowSecretExport,
+		HealthSweepEnabled:            healthSweepEnabled,
+		HealthSweepIntervalSeconds:    healthSweepInterval,
+		HealthSweepJitterSeconds:      healthSweepJitter,
+		HealthSweepDegradedMs:         healthSweepDegraded,
+		HealthSweepConcurrency:        healthSweepConcurrency,
+		HealthSweepTimeoutSeconds:     healthSweepTimeout,
 	}, nil
 }
 
@@ -612,6 +758,44 @@ func envIntSeconds(key string, def, min, max int) (time.Duration, error) {
 		return 0, err
 	}
 	return time.Duration(n) * time.Second, nil
+}
+
+// modelCatalogSourceIDs is the accepted set for MODEL_CATALOG_SOURCES. It is
+// duplicated from modelcatalog.DefaultURLs on purpose: config validates input
+// and the catalog package owns the endpoints, and a typo here should be a
+// startup error rather than a silently ignored source.
+var modelCatalogSourceIDs = []string{"litellm", "models.dev"}
+
+// envModelCatalogSources parses MODEL_CATALOG_SOURCES. Unset means every known
+// source; naming a subset narrows the sweep and the manual sync alike.
+func envModelCatalogSources() ([]string, error) {
+	configured := envList("MODEL_CATALOG_SOURCES")
+	if len(configured) == 0 {
+		out := make([]string, len(modelCatalogSourceIDs))
+		copy(out, modelCatalogSourceIDs)
+		return out, nil
+	}
+	seen := make(map[string]bool, len(configured))
+	out := make([]string, 0, len(configured))
+	for _, value := range configured {
+		match := ""
+		for _, known := range modelCatalogSourceIDs {
+			if strings.EqualFold(value, known) {
+				match = known
+				break
+			}
+		}
+		if match == "" {
+			return nil, fmt.Errorf("config: MODEL_CATALOG_SOURCES has unknown source %q (known: %s)",
+				value, strings.Join(modelCatalogSourceIDs, ", "))
+		}
+		if seen[match] {
+			continue
+		}
+		seen[match] = true
+		out = append(out, match)
+	}
+	return out, nil
 }
 
 func envInt(key string, def, min, max int) (int, error) {

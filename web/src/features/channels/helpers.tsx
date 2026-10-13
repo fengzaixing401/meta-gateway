@@ -25,6 +25,23 @@ export type UserAuthFields = "both" | "cookie" | "none";
 
 const COOKIE_ONLY_USER_AUTH_TYPES = new Set(["external-checkin"]);
 
+/** Type ids the picker offers by name. Anything else is hand-typed. */
+const KNOWN_CHANNEL_TYPES = new Set(CONNECTION_TYPE_OPTIONS.map((option) => option.value));
+
+/**
+ * True when the operator is wiring an endpoint on their own terms — the
+ * literal "custom" type, or an id the picker does not know (typed in the
+ * free-text row). Only these types open the endpoint/field mapping panel from
+ * scratch: for everything else the mapping is a protocol contract that ships
+ * with the provider (backend `proxy.ProviderProfile`), not a form to fill in.
+ */
+export function isCustomChannelType(typeHint: string): boolean {
+  const key = (typeHint || "").trim().toLowerCase();
+  if (!key) return false;
+  if (key === "custom") return true;
+  return !KNOWN_CHANNEL_TYPES.has(key);
+}
+
 const NO_USER_AUTH_TYPES = new Set([
   // Plain OpenAI-compatible relays and official provider APIs.
   "openai-compatible",
@@ -48,6 +65,7 @@ const NO_USER_AUTH_TYPES = new Set([
   "xai",
   "mistral",
   "perplexity",
+  "typesafe",
   // Site families with no server-side account adapter.
   "octopus",
   "axonhub",
@@ -67,8 +85,7 @@ export function userAuthFieldsFor(typeHint: string): UserAuthFields {
 export /** Value shown in secret inputs when a credential is stored; keeping it means "don't change". */
 const SECRET_MASK = "••••••••••";
 
-export type ConnectionHealthFilter =
-  "all" | "ready" | "attention" | "missing_key";
+export type ConnectionHealthFilter = "all" | "ready" | "attention" | "missing_key";
 
 export function isMissingAPIKey(overview: ChannelOverview) {
   return !overview.has_api_key;
@@ -82,6 +99,24 @@ export type CreateConnectionInput = {
   group_name?: string;
   /** Empty/undefined = inherit the Admin-configured default. */
   model_sync_mode?: "auto" | "manual";
+  /** The models this channel serves. Omitted when the dialog never fetched a
+   *  list, which is different from "fetched and picked none". */
+  models_csv?: string;
+  /** Per-channel behaviour the dialog can set up front. Only the keys the
+   *  operator actually touched are present, so an untouched field keeps the
+   *  backend default instead of pinning whatever the form rendered. */
+  advanced?: ConnectionAdvancedPatch;
+};
+
+export type ConnectionAdvancedPatch = {
+  priority?: number;
+  weight?: number;
+  max_reasoning_effort?: string;
+  max_concurrent?: number;
+  non_stream_timeout_seconds?: number;
+  stream_policy?: "" | "force_stream" | "force_non_stream";
+  proxy_url?: string;
+  call_policy?: "" | "allow_probe" | "real_calls_only";
 };
 
 export function normalizeBase(url: string) {
@@ -89,9 +124,7 @@ export function normalizeBase(url: string) {
 }
 
 export function needsVerify(overview: ChannelOverview) {
-  return (
-    channelReadiness(overview) === "unverified" || overview.model_count === 0
-  );
+  return channelReadiness(overview) === "unverified" || overview.model_count === 0;
 }
 
 export function capabilityFlags(overview: ChannelOverview) {
@@ -133,4 +166,19 @@ export function capabilityFlags(overview: ChannelOverview) {
     modelsReady,
     needsKeyForRelay: !hasAPIKey,
   };
+}
+
+/**
+ * The type picker's "Custom…" marker mapped onto the id the gateway understands.
+ *
+ * The picker's sentinel (`__custom__`) is a UI concept — it means "none of the
+ * listed families, I am wiring this endpoint on my own terms". The backend's id
+ * for exactly that is `custom`: it is in `OpenAICompatibleBrands()` and
+ * `CanonicalType()` maps it to the OpenAI-compatible passthrough, which is the
+ * honest default for an unknown protocol family (the endpoint/field mapping is
+ * what bends it into shape). Saving the sentinel instead would leave the channel
+ * resolving to no adapter at all.
+ */
+export function normalizeTypeChoice(value: string): string {
+  return value === "__custom__" ? "custom" : value;
 }

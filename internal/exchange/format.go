@@ -25,6 +25,24 @@ type SkippedChannel struct {
 	Reason    string `json:"reason"`
 }
 
+// SkippedItem records one document row that was recognized but could not be
+// imported. A document is still accepted as long as at least one row imports.
+type SkippedItem struct {
+	// Index is the 0-based row ordinal inside the section the row came from.
+	Index  int    `json:"index"`
+	Name   string `json:"name,omitempty"`
+	Reason string `json:"reason"`
+}
+
+// Skip reasons. Stable codes so the console can render localized copy.
+const (
+	SkipMissingCredential = "missing_credential"
+	SkipMissingField      = "missing_field"
+	SkipInvalidBaseURL    = "invalid_base_url"
+	SkipDuplicateIdentity = "duplicate_identity"
+	SkipInvalidItem       = "invalid_item"
+)
+
 type Item struct {
 	Name         string   `json:"name"`
 	BaseURL      string   `json:"base_url"`
@@ -39,8 +57,10 @@ type Item struct {
 	CredentialKind string `json:"-"`
 	// MetaJSON is stored on credentials.meta_json (e.g. platform_user_id for New API check-in).
 	MetaJSON string `json:"-"`
-	// CheckinEnabled is stored on credentials.checkin_enabled.
-	CheckinEnabled bool `json:"-"`
+	// CheckinEnabled is stored on credentials.checkin_enabled. It is part of the
+	// document so a restore brings the operator's scheduled check-in back; the
+	// field is additive and older files simply have no opinion about it.
+	CheckinEnabled bool `json:"checkin_enabled,omitempty"`
 }
 
 type ErrorKind string
@@ -48,9 +68,14 @@ type ErrorKind string
 const (
 	ErrorValidation  ErrorKind = "validation_error"
 	ErrorUnsupported ErrorKind = "unsupported_format"
-	ErrorConflict    ErrorKind = "identity_conflict"
-	ErrorNotFound    ErrorKind = "channel_not_found"
-	ErrorInternal    ErrorKind = "internal_error"
+	// ErrorNoEntries means the document was recognized as a backup, but no row
+	// in it could be imported. Distinct from ErrorUnsupported so the console can
+	// say "this backup holds no importable credentials" instead of "unknown
+	// format".
+	ErrorNoEntries ErrorKind = "no_importable_entries"
+	ErrorConflict  ErrorKind = "identity_conflict"
+	ErrorNotFound  ErrorKind = "channel_not_found"
+	ErrorInternal  ErrorKind = "internal_error"
 )
 
 type Error struct {

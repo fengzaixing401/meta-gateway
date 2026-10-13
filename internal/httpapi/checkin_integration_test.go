@@ -26,7 +26,7 @@ func TestCheckinAdminWorkflow(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	db, err := store.Open(filepath.Join(t.TempDir()))
+	db, err := store.OpenTest(filepath.Join(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestCheckinAdminWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := httpapi.New(&config.Config{
+	handler := httpapi.NewTestRouter(t, &config.Config{
 		AdminToken:                "admin-secret",
 		AdminTokens:               []string{"admin-secret"},
 		ExchangeAllowSecretExport: true,
@@ -175,7 +175,7 @@ func TestExternalCheckinAdminWorkflow(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	db, err := store.Open(filepath.Join(t.TempDir()))
+	db, err := store.OpenTest(filepath.Join(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestExternalCheckinAdminWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := httpapi.New(&config.Config{
+	handler := httpapi.NewTestRouter(t, &config.Config{
 		AdminToken:                "admin-secret",
 		AdminTokens:               []string{"admin-secret"},
 		ExchangeAllowSecretExport: true,

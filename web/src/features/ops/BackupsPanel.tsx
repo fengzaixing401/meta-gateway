@@ -1,11 +1,21 @@
-import { DatabaseBackup } from "lucide-react"
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { api } from "../../api/client"
-import { useClientPagination } from "../../hooks/useClientPagination"
-import { useI18n } from "../../i18n"
-import { useSession } from "../../session"
-import { PaginationBar } from "../../components/PaginationBar"
-import { Button, DataTable, Empty, ErrorState, Loading, Panel, StatusBadge, formatBytes, formatDate } from "../../components/ui"
+import { DatabaseBackup } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { api } from "../../api/client";
+import { useClientPagination } from "../../hooks/useClientPagination";
+import { useI18n } from "../../i18n";
+import { useSession } from "../../session";
+import { PaginationBar } from "../../components/PaginationBar";
+import {
+  Button,
+  DataTable,
+  Empty,
+  ErrorState,
+  Loading,
+  Panel,
+  StatusBadge,
+  formatBytes,
+  formatDate,
+} from "../../components/ui";
 
 export function BackupsPanel() {
   const { client } = useSession();
@@ -96,7 +106,7 @@ export function BackupsPanel() {
           />
         </>
       )}
-      <p className="muted" style={{ marginTop: 12, fontSize: 12 }}>
+      <p className="muted panel-note is-spaced">
         {t("ops.restoreNote", {
           cmd: "meta-gateway restore --from <backup-name>",
         })}

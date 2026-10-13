@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -120,16 +121,26 @@ func (s *Service) ChatCompletionsWithMeta(ctx context.Context, req Request) (*re
 }
 
 // ForwardWithMeta selects a channel, resolves credentials, and forwards to the OpenAI-compatible path.
-func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Result, *AttemptMeta) {
-	req.Model = strings.TrimSpace(req.Model)
-	if len([]byte(req.Model)) > 256 {
-		return &relay.Result{StatusCode: http.StatusBadRequest, Err: ErrModelTooLong}, nil
-	}
-	if strings.TrimSpace(req.OpenAIPath) == "" {
-		req.OpenAIPath = "chat/completions"
-	}
-	if strings.TrimSpace(req.Method) == "" {
-		req.Method = http.MethodPost
+func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (finalResult *relay.Result, finalMeta *AttemptMeta) {
+	// Named results plus one defer carry the plugin decision trail out of every
+	// return path — including the early error returns that have no attempt meta
+	// of their own. Without it the trail would die here: req is a value copy, so
+	// the caller's Request never sees the decisions taken on its behalf.
+	defer func() {
+		if finalResult != nil && finalMeta != nil {
+			finalMeta.AttemptLogID = finalResult.AttemptLogID
+			finalMeta.ResolvedModel = req.Model
+		}
+		if len(req.HookDecisions) == 0 {
+			return
+		}
+		if finalMeta == nil {
+			finalMeta = &AttemptMeta{}
+		}
+		finalMeta.HookDecisions = req.HookDecisions
+	}()
+	if rejected := normalizeAndAuthorize(&req); rejected != nil {
+		return rejected, nil
 	}
 	// Failover state for one relay request: channels retired entirely
 	// (channel-wide failure), individual alias variants retired (the upstream
@@ -139,21 +150,42 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 	// round's selector call and mutated as attempts fail.
 	excludedChannels := make(map[int64]struct{})
 	excludedMembers := make(map[int64]struct{})
-	constraint := &routing.SelectionConstraint{ExcludedMembers: excludedMembers, RouteGroup: req.RouteGroup}
+	constraint := &routing.SelectionConstraint{
+		ExcludedMembers: excludedMembers,
+		RouteGroup:      req.RouteGroup,
+		TeamAccess:      req.TeamAccess,
+		// The admin 试调 and a health probe name one upstream. Telling the
+		// selector about that pin keeps a single-mode route from reporting its
+		// non-pinned rows as ineligible — the pin is the more specific choice,
+		// and pickPreferred below needs the row to still be selectable.
+		PinnedMemberID: req.PreferMemberID, RecoveryProbe: req.Probe,
+		PinnedChannelID: req.PreferChannelID,
+	}
 	// Resolve the sticky session key: an explicit client header wins;
 	// otherwise derive a content digest from the request body (stateless
 	// clients get affinity through their conversation content).
 	sessionKey := routing.SessionKeyFromRequest(req.Body, req.SessionKey)
+	if req.TeamAccess != nil && sessionKey != "" {
+		sessionKey = fmt.Sprintf("team:%d:key:%d:%s", req.TeamAccess.UserID, req.DownstreamKeyID, sessionKey)
+	}
 	req.SessionKey = sessionKey
 	stickyStore := s.sticky.Load()
 	var last *relay.Result
 	var lastMeta *AttemptMeta
+	// responsesRefusal records why the Responses→chat fallback could not be
+	// built. It is only used at the very end: when every channel answered 404 to
+	// a native /v1/responses, the client needs this reason instead of the
+	// upstream's "404 page not found".
+	var responsesRefusal error
 	retrySafe := retrySafeRequest(req)
 	// Route-level retry overrides tune the round counts (retry_times /
 	// channel_retry_times) but cannot re-enable cross-channel failover when
 	// the process default is off, bypass an admin channel pin, or skip the
 	// non-idempotent-write safety gate.
-	allowCrossChannelRetries := s.crossChannelFailoverEnabled.Load() && req.PreferChannelID <= 0 && retrySafe
+	allowCrossChannelRetries := s.crossChannelFailoverEnabled.Load() && !pinnedUpstream(req) && retrySafe
+	if req.TeamAccess != nil && req.TeamAccess.DisableFailover {
+		allowCrossChannelRetries = false
+	}
 	maxAttempts := int(s.retryTimes.Load())
 	if !allowCrossChannelRetries {
 		maxAttempts = 0
@@ -165,32 +197,16 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 		// idempotency key that the upstream can honor.
 		maxAttempts = 0
 	}
+	maxAttempts = req.TeamAccess.LimitRetries(maxAttempts)
 	// Evaluate prompt guards once per request. Re-running them for every
 	// channel retry caused repeated DB reads and could apply masking/exclusion
 	// differently after the first attempt.
-	var promptGuardRules []store.PromptGuardRule
-	if req.OpenAIPath == "chat/completions" && s.db != nil && s.db.PromptGuard != nil {
-		if guardRules, gErr := s.db.PromptGuard.ListEnabled(); gErr == nil {
-			promptGuardRules = guardRules
-			globalRules := promptGuardRulesForChannel(promptGuardRules, 0)
-			guarded, hit, guardErr := ApplyPromptGuards(req.Body, globalRules)
-			if guardErr != nil {
-				log.Printf("proxy: prompt guard eval model=%s: %v", req.Model, guardErr)
-			} else if hit != nil {
-				switch hit.Action {
-				case "reject":
-					return &relay.Result{StatusCode: http.StatusBadRequest, Err: fmt.Errorf("%w: %s", ErrGuardRejected, hit.Message)}, nil
-				case "exclude":
-					for _, id := range hit.Exclude {
-						excludedChannels[id] = struct{}{}
-					}
-					log.Printf("proxy: prompt guard %q excludes channels %v for request (request_id=%s)", hit.Rule, hit.Exclude, req.RequestID)
-				default:
-					req.Body = guarded
-					log.Printf("proxy: prompt guard %q masked request body (request_id=%s)", hit.Rule, req.RequestID)
-				}
-			}
-		}
+	promptGuardRules, guardExclude, guardReject := s.globalPromptGuards(&req)
+	if guardReject != nil {
+		return guardReject, nil
+	}
+	for _, id := range guardExclude {
+		excludedChannels[id] = struct{}{}
 	}
 	// Route-level retry overrides: the first selection decision carries the
 	// model's policy (nil = follow the global setting). The override can tune
@@ -218,22 +234,28 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 		// when the translated retry succeeds.
 		responsesFallbackTried := false
 		responsesFallbackCategory := ""
-		decision, err := s.selector.SelectSticky(ctx, req.Model, excludedChannels, sessionKey, constraint)
-		// Persist a decision snapshot for audit: the full explanation
-		// (candidates, scores, reasons, sticky/stable-first state) survives
-		// even when the request later fails or the UI is long gone. Errors
-		// carry whatever partial explanation the selector produced.
-		if payload, marshalErr := json.Marshal(decision.Explanation); marshalErr == nil && len(payload) > 0 {
-			selectedID := int64(0)
-			if decision.Selected.Channel.ID > 0 {
-				selectedID = decision.Selected.Channel.ID
-			}
-			// attempt+1 matches the proxy_logs row this selection produces, so
-			// the log UI can show the decision behind EACH attempt.
-			if snapErr := s.db.InsertDecisionSnapshot(req.RequestID, req.Model, decision.RouteID, selectedID, attempt+1, payload, s.now()); snapErr != nil {
-				log.Printf("proxy: decision snapshot request_id=%s: %v", req.RequestID, snapErr)
+		// Plugin route hook: the one place a request may change WHICH model is
+		// routed. Evaluated on the first round only — re-running it on a failover
+		// round could silently move the client onto a different model than the
+		// one already chosen for its request.
+		if attempt == 0 {
+			if interceptor := s.hookEnabled(); interceptor != nil {
+				if rejected := s.applyRouteHook(ctx, &req, interceptor); rejected != nil {
+					return rejected, nil
+				}
 			}
 		}
+		if !req.TeamAccess.AllowsModel(req.Model) {
+			return &relay.Result{StatusCode: http.StatusForbidden, Err: errors.New("model not authorized")}, nil
+		}
+		decision, err := s.selector.SelectSticky(ctx, req.Model, excludedChannels, sessionKey, constraint)
+		if err == nil && !req.TeamAccess.AllowsMember(req.Model, decision.Selected.Member.ID) {
+			return &relay.Result{StatusCode: http.StatusForbidden, Err: errors.New("route member not authorized")}, nil
+		}
+		// Persist a decision snapshot for audit: the full explanation
+		// (candidates, scores, reasons, sticky/stable-first state) survives
+		// even when the request later fails or the UI is long gone.
+		s.insertDecisionSnapshot(req, decision, attempt+1)
 		if err != nil {
 			if last != nil {
 				return last, lastMeta
@@ -245,7 +267,7 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 			if allowCrossChannelRetries {
 				// Route rows are validated by the Admin API, but clamp here as a
 				// last line of defence for old/corrupt rows and non-HTTP callers.
-				maxAttempts = clampInt(*retryOverride, 0, 100)
+				maxAttempts = req.TeamAccess.LimitRetries(clampInt(*retryOverride, 0, 100))
 			}
 		}
 		if channelRetryOverride == nil && decision.ChannelRetryTimesOverride != nil {
@@ -253,10 +275,10 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 		}
 		candidate := decision.Selected
 		req.RouteID = decision.RouteID
-		if req.PreferChannelID > 0 {
-			pinned, ok := pickPreferred(decision, req.PreferChannelID)
+		if pinnedUpstream(req) {
+			pinned, ok := pickPreferred(decision, req.PreferChannelID, req.PreferMemberID)
 			if !ok {
-				return &relay.Result{Err: ErrPreferredChannel}, nil
+				return &relay.Result{Err: pinFailure(decision, req)}, nil
 			}
 			candidate = pinned
 		}
@@ -270,36 +292,25 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 		if memberMapping := strings.TrimSpace(candidate.Member.MappingJSON); memberMapping != "" {
 			mappingJSON = memberMapping
 		}
-		effectiveModel := req.Model
-		if mappingJSON != "" {
-			if real := realModelFromMapping(mappingJSON); real != "" {
-				effectiveModel = real
-			}
-		}
+		effectiveModel := domain.ResolveUpstreamModel(req.Model, candidate.Member.MappingJSON, decision.RouteMappingJSON)
+		// Same value the upstream sees; the log keeps it so an alias shared by
+		// several real models stays attributable after the fact.
+		req.UpstreamModel = effectiveModel
 		// Channel-scoped rules are evaluated only once the candidate is known;
 		// applying them before selection would incorrectly affect every channel.
-		requestBody := req.Body
-		if scopedRules := promptGuardRulesForChannel(promptGuardRules, candidate.Channel.ID); len(scopedRules) > 0 {
-			guarded, hit, guardErr := ApplyPromptGuards(requestBody, scopedRules)
-			if guardErr != nil {
-				log.Printf("proxy: scoped prompt guard eval model=%s channel=%d: %v", req.Model, candidate.Channel.ID, guardErr)
-			} else if hit != nil {
-				switch hit.Action {
-				case "reject":
-					return &relay.Result{StatusCode: http.StatusBadRequest, Err: fmt.Errorf("%w: %s", ErrGuardRejected, hit.Message)}, nil
-				case "exclude":
-					excludedChannels[candidate.Channel.ID] = struct{}{}
-					continue
-				default:
-					requestBody = guarded
-				}
-			}
+		requestBody, guardReject, guardExcludeChannel := channelPromptGuards(promptGuardRules, candidate.Channel.ID, req.Model, req.Body)
+		if guardReject != nil {
+			return guardReject, nil
+		}
+		if guardExcludeChannel {
+			excludedChannels[candidate.Channel.ID] = struct{}{}
+			continue
 		}
 		// Model-not-found blacklist: skip a channel×real-name combination the
 		// upstream permanently reported as unknown before spending an attempt.
 		// Only the affected VARIANT retires — sibling names on the channel stay
 		// eligible, and the fallback walk prefers their remaining ones.
-		if blocked, err := s.db.IsModelBlocked(candidate.Channel.ID, effectiveModel); err == nil && blocked {
+		if blocked, err := s.db.IsModelBlocked(candidate.Channel.ID, effectiveModel); err == nil && blocked && !req.Probe {
 			excludedMembers[candidate.Member.ID] = struct{}{}
 			constraint.PreferChannel = candidate.Channel.ID
 			if last != nil && last.Body != nil {
@@ -307,11 +318,12 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 			}
 			last = preserve(&relay.Result{StatusCode: http.StatusServiceUnavailable, Err: fmt.Errorf("%w: model %s on channel %d", ErrModelBlacklisted, effectiveModel, candidate.Channel.ID)})
 			lastMeta = &AttemptMeta{
-				ChannelID:   candidate.Channel.ID,
-				ChannelName: candidate.Channel.Name,
-				MemberID:    candidate.Member.ID,
-				Priority:    candidate.Member.Priority,
-				Weight:      candidate.Member.Weight,
+				ChannelID:     candidate.Channel.ID,
+				ChannelName:   candidate.Channel.Name,
+				MemberID:      candidate.Member.ID,
+				Priority:      candidate.Member.Priority,
+				Weight:        candidate.Member.Weight,
+				UpstreamModel: effectiveModel,
 			}
 			continue
 		}
@@ -329,14 +341,19 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 		}
 		defer releaseAttempt()
 		meta := &AttemptMeta{
-			RouteID:     decision.RouteID,
-			GrayAttempt: req.GrayAttempt,
-			ChannelID:   candidate.Channel.ID,
-			ChannelName: candidate.Channel.Name,
-			MemberID:    candidate.Member.ID,
-			Priority:    candidate.Member.Priority,
-			Weight:      candidate.Member.Weight,
+			RouteID: decision.RouteID, RouteGroup: candidate.Member.GroupName,
+			GrayAttempt:   req.GrayAttempt,
+			ChannelID:     candidate.Channel.ID,
+			ChannelName:   candidate.Channel.Name,
+			MemberID:      candidate.Member.ID,
+			Priority:      candidate.Member.Priority,
+			Weight:        candidate.Member.Weight,
+			UpstreamModel: effectiveModel,
 		}
+		billingRequest := req
+		billingRequest.MemberID = candidate.Member.ID
+		billingRequest.UpstreamModel = effectiveModel
+		meta.BillingSnapshot = s.freezeBilling(billingRequest)
 		if observer := s.liveTraceObserver.Load(); observer != nil && req.RequestID != "" {
 			(*observer).Attempt(req.RequestID, attempt+1, candidate.Channel.Name, req.DownstreamProtocol, "")
 		}
@@ -365,182 +382,35 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 		var result *relay.Result
 		var category string
 		var retryable bool
-		adapter := s.resolveForward(candidate.Channel)
-
-		// Downstream protocol handling. OpenAI is the pivot contract; native
-		// Anthropic and Responses clients are translated per upstream family.
-		// Prefer the registered N×M translation pair; when absent, compose the
-		// upstream adapter with the protocol's pivot segment.
-		downstreamProto := strings.ToLower(strings.TrimSpace(req.DownstreamProtocol))
-		if downstreamProto == "" {
-			downstreamProto = "openai"
+		// Per-attempt preparation (adapter, protocol, stream policy, aliases,
+		// rewrites, payload rules, endpoint, plugin request hook). A local
+		// rejection comes back already recorded, so it is simply returned.
+		plan, rejected := s.prepareAttempt(ctx, &req, candidate, effectiveModel, mappingJSON, requestBody, attempt+1)
+		if rejected != nil {
+			return rejected, meta
 		}
-		downstreamAnthropic := downstreamProto == "anthropic"
-		downstreamResponses := downstreamProto == "responses" && req.OpenAIPath == "responses"
-		var registryTranslation *adapters.Translation
-		// Responses passthrough on OpenAI-compatible upstreams stays native
-		// FIRST (an upstream with real /v1/responses keeps full semantics); a
-		// 404/405 later falls back to a translated chat/completions retry.
-		responsesPassthroughFallback := false
-		if downstreamAnthropic && req.OpenAIPath == "messages" && adapter.Name() != "anthropic" {
-			if tr, ok := s.registry.Translations.Lookup("anthropic", adapters.CanonicalFamily(adapter.Name())); ok && tr.Body != nil {
-				registryTranslation = &tr
-			} else {
-				composed := adapters.ComposeDownstream(adapter, "anthropic")
-				if c, ok := composed.(*adapters.ComposeForwardAdapter); ok {
-					prompt := strings.TrimSpace(candidate.Channel.SystemPrompt)
-					c.OnOpenAI = func(openaiBody []byte) ([]byte, error) {
-						if prompt != "" {
-							return injectSystemPrompt(openaiBody, prompt), nil
-						}
-						return openaiBody, nil
-					}
-				}
-				adapter = composed
-			}
-		} else if downstreamResponses {
-			family := adapters.CanonicalFamily(adapter.Name())
-			if family == "openai" {
-				// Native passthrough first; arm the in-place translated fallback.
-				if tr, ok := s.registry.Translations.Lookup("responses", "openai"); ok && tr.Body != nil && tr.Response != nil {
-					responsesPassthroughFallback = true
-				}
-			} else if tr, ok := s.registry.Translations.Lookup("responses", family); ok && tr.Body != nil {
-				registryTranslation = &tr
-			} else {
-				composed := adapters.ComposeDownstream(adapter, "responses")
-				if c, ok := composed.(*adapters.ComposeForwardAdapter); ok {
-					prompt := strings.TrimSpace(candidate.Channel.SystemPrompt)
-					c.OnOpenAI = func(openaiBody []byte) ([]byte, error) {
-						if prompt != "" {
-							return injectSystemPrompt(openaiBody, prompt), nil
-						}
-						return openaiBody, nil
-					}
-				}
-				adapter = composed
-			}
-		}
-
-		// Channel-scoped model aliases: when the matched route or the selected
-		// channel's member carries a mapping_json of {"real":"…"}, clients
-		// requested the alias and we must rewrite the body back to the
-		// upstream's real model name. Member-level mapping wins (shared aliases
-		// rewrite per channel); route-level mapping is the legacy/fallback
-		// form for aliases created before per-member mappings existed.
-		mappedBody := requestBody
-		if mappingJSON != "" {
-			mappedBody = rewriteModelName(requestBody, req.Model, mappingJSON)
-		}
-
-		effectivePath := req.OpenAIPath
-		requestSource := mappedBody
-		if !downstreamAnthropic || adapter.Name() == "anthropic" {
-			// Channel-level system prompt injection (OpenAI-format chat bodies
-			// only; translated requests are injected inside the composed
-			// adapter at the pivot step).
-			if prompt := strings.TrimSpace(candidate.Channel.SystemPrompt); prompt != "" && effectivePath == "chat/completions" {
-				requestSource = injectSystemPrompt(requestSource, prompt)
-			}
-		}
-		// Channel capability-aware reasoning effort downgrade: when the channel
-		// declares a max_reasoning_effort and the client asked for more, rewrite
-		// the body so the request succeeds instead of burning a failover round
-		// (e.g. gateways that reject reasoning_effort=max). The original value is
-		// kept in the log; the mapping is recorded as "max→high".
-		mappedReasoning := ""
-		if maxEffort := strings.TrimSpace(candidate.Channel.MaxReasoningEffort); maxEffort != "" {
-			if downgraded, note := downgradeReasoningEffort(requestSource, maxEffort); downgraded != nil {
-				requestSource = downgraded
-				mappedReasoning = note
-			}
-		}
-		if mappedReasoning != "" {
-			req.MappedReasoningEffort = mappedReasoning
-		}
-
-		// Channel-level payload rules (body rewrite chain): model/protocol/
-		// header/payload conditions → set/delete/filter actions. A filter
-		// short-circuits with a synthesized 403 so the channel is skipped like
-		// any other local rejection (it is not an upstream health signal).
-		if rulesJSON := strings.TrimSpace(candidate.Channel.PayloadRules); rulesJSON != "" {
-			out, filter, err := ApplyPayloadRules(requestSource, rulesJSON, req.Model, req.DownstreamProtocol, req.Headers)
-			if err != nil {
-				log.Printf("proxy: payload rules channel=%d model=%s: %v", candidate.Channel.ID, req.Model, err)
-			} else if filter != nil {
-				result = &relay.Result{
-					StatusCode: http.StatusForbidden,
-					Err:        fmt.Errorf("%w: %s (rule %q)", ErrPayloadFiltered, filter.Reason, filter.Rule),
-				}
-				category = "payload_filter"
-				s.recordAttempt(req, candidate, attempt+1, result, category, "")
-				return result, meta
-			} else {
-				requestSource = out
-			}
-		}
-
-		upstreamPath, requestBody, translateErr := adapter.TransformRequest(effectivePath, requestSource)
-		if translateErr != nil {
-			// Request conversion is local validation, not an upstream health signal.
-			// Return it directly instead of retrying the same malformed request on
-			// every channel.
-			result = &relay.Result{
-				StatusCode: adapterErrorStatus(translateErr, http.StatusBadRequest),
-				Err:        fmt.Errorf("proxy: %s translate: %w", adapter.Name(), translateErr),
-			}
-			category = adapterErrorCategory(translateErr)
-			s.recordAttempt(req, candidate, attempt+1, result, category, "")
-			return result, meta
-		}
-		// Registered N×M translation path: the (protocol → upstream family)
-		// pair exists in the matrix, so translate directly instead of going
-		// through the composed adapter. The translation returns the upstream
-		// body; the response/stream conversion happens via the pair's
-		// Response/Stream modes inside the relay conversion block below.
-		if registryTranslation != nil {
-			translateProto := "anthropic"
-			if downstreamResponses {
-				translateProto = "responses"
-			}
-			toPath, out, tr, ok, trErr := s.registry.Translations.Translate(translateProto, adapters.CanonicalFamily(adapter.Name()), effectivePath, requestSource)
-			if trErr != nil || !ok || tr.Body == nil {
-				result = &relay.Result{
-					StatusCode: http.StatusBadRequest,
-					Err:        fmt.Errorf("proxy: %s translation: %w", translateProto, trErr),
-				}
-				s.recordAttempt(req, candidate, attempt+1, result, "translate", "")
-				return result, meta
-			}
-			// Channel-level system prompt injection happens on the translated
-			// OpenAI-format body (same point as the composed adapter's pivot).
-			if prompt := strings.TrimSpace(candidate.Channel.SystemPrompt); prompt != "" && toPath == "chat/completions" {
-				out = injectSystemPrompt(out, prompt)
-			}
-			upstreamPath = toPath
-			requestBody = out
-			_ = tr
-		}
-		upstreamURL, err := s.resolveUpstreamURL(candidate.Channel, upstreamPath, adapter)
-		if err != nil {
-			// URL construction is local configuration validation. Do not treat it
-			// as an upstream health signal or retry it on another channel: a local
-			// adapter/configuration failure must not mutate breaker, cooldown, or
-			// API-key state.
-			result = &relay.Result{Err: err}
-			category = "invalid_url"
-			result.Err = fmt.Errorf("proxy: %w: %v", adapters.ErrInvalidURL, result.Err)
-			s.recordAttempt(req, candidate, attempt+1, result, category, "")
-			return result, meta
-		}
+		adapter, channelMap, effectivePath := plan.adapter, plan.channelMap, plan.effectivePath
+		upstreamURL, requestBody, requestSource := plan.upstreamURL, plan.requestBody, plan.requestSource
+		hookHeaders := plan.hookHeaders
+		upstreamStream, aggregateUpstreamStream, synthesizeClientStream := plan.upstreamStream, plan.aggregateUpstreamStream, plan.synthesizeClientStream
+		registryTranslation, responsesPassthroughFallback := plan.protocol.translation, plan.protocol.nativeFallback
 		// Aggregate all enabled site API keys; failover keys before leaving the channel.
-		apiKeys, err := s.resolveAPIKeyPool(candidate.Channel, req.Model)
+		// Key-pool selection keys on the EFFECTIVE upstream name: a key's
+		// recorded model set contains real names, so an alias/unified/renamed
+		// request must resolve credentials against what the member maps to —
+		// filtering on the public name starves the pool into a bogus
+		// "credential unavailable".
+		apiKeys, err := s.resolveAPIKeyPool(candidate.Channel, effectiveModel)
 		if err != nil || len(apiKeys) == 0 {
 			result = &relay.Result{Err: ErrCredential}
 			category = "no_credential"
 			retryable = true
-			s.recordAttempt(req, candidate, attempt+1, result, category, "")
-			s.recordMemberFailure(req, candidate.Member.ID, candidate.Channel.ID, req.Model, cooldown, category)
+			s.recordAttempt(req, candidate, attempt+1, result, category, "", 0)
+			// Health bookkeeping keys on the name the upstream actually saw
+			// (req.UpstreamModel), not the client-facing alias: an alias route
+			// reaching "cn:x" and "global:x" must keep two records, or a fast
+			// variant's failures would cool the slow one and vice versa.
+			s.recordMemberFailure(req, candidate.Member.ID, candidate.Channel.ID, req.UpstreamModel, cooldown, category)
 
 			excludedChannels[candidate.Channel.ID] = struct{}{}
 			constraint.PreferChannel = 0
@@ -568,7 +438,7 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 				keyRetries = 0
 			}
 			for keyAttempt := 0; ; keyAttempt++ {
-				headers := adapter.AuthHeaders(apiKey)
+				headers := adapter.AuthHeaders(apiKey.Secret)
 				if headers.Get("Content-Type") == "" && strings.TrimSpace(req.ContentType) != "" {
 					headers.Set("Content-Type", req.ContentType)
 				}
@@ -576,6 +446,11 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 					result = &relay.Result{Err: fmt.Errorf("proxy: header override: %w", overrideErr)}
 					category, retryable = classifyForChannel(result, domain.ParseRetryConfig(candidate.Channel.RetryConfig))
 					break
+				}
+				if len(hookHeaders) > 0 {
+					// Plugin headers ride next to the channel's own overrides; the
+					// credential and transport framing stay the gateway's.
+					mergePluginHeaders(headers, hookHeaders)
 				}
 				if idempotencyKey := requestHeader(req.Headers, "Idempotency-Key"); idempotencyKey != "" {
 					headers.Set("Idempotency-Key", idempotencyKey)
@@ -586,13 +461,24 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 				// headers and then stalls mid-body would otherwise pin this goroutine
 				// until the client disconnects. Streaming requests are exempt — long
 				// SSE sessions legitimately exceed any fixed budget, and their idle
-				// detection is the stream path's responsibility.
+				// detection is the stream path's responsibility. A channel-level
+				// override serves slow upstreams (deep-reasoning models routinely
+				// exceed the global five-minute budget).
 				fwdCtx := ctx
 				var attemptCancel context.CancelFunc
-				if !req.Stream {
+				// Only a true stream-to-stream passthrough is exempt. Whenever
+				// EITHER side is non-streaming the exchange must complete before
+				// the client can be answered, so it needs the overall budget:
+				// force_stream aggregates a streaming upstream for a
+				// non-streaming client, and that read is buffered whole with no
+				// peek/idle guard of its own (those only wrap client streams).
+				if !upstreamStream || !req.Stream {
 					timeout := s.nonStreamTimeout
 					if timeout <= 0 {
 						timeout = nonStreamRequestTimeout
+					}
+					if seconds := candidate.Channel.NonStreamTimeoutSeconds; seconds > 0 {
+						timeout = time.Duration(seconds) * time.Second
 					}
 					fwdCtx, attemptCancel = context.WithTimeout(ctx, timeout)
 				}
@@ -601,124 +487,93 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 				if proxyURL := strings.TrimSpace(candidate.Channel.ProxyURL); proxyURL != "" {
 					fwdCtx = outbound.WithChannelProxy(fwdCtx, proxyURL)
 				}
-				// (gate slot is held at the channel-attempt level, above the retry
-				// loops — see the Acquire/releaseGate pair near the meta setup)
-				result = s.relay.ForwardWithHeaders(fwdCtx, req.Method, upstreamURL, headers, requestBody)
 				// Responses passthrough fallback: an OpenAI-compatible channel that
 				// lacks a native /v1/responses surface answers 404/405 (endpoint
 				// missing). Replay ONCE with the request pivoted to chat/completions;
 				// the pair's Response/Stream modes below convert the upstream
 				// answer back to the Responses contract.
+				//
+				// A channel that already told us it has no native surface skips the
+				// probe entirely: sending the body to an endpoint we know is missing
+				// costs a full upload and a round-trip on every request, and the
+				// answer is the same 404 the fallback exists to absorb.
+				// (gate slot is held at the channel-attempt level, above the retry
+				// loops — see the Acquire/releaseGate pair near the meta setup)
+				nativeAttempted := true
+				if responsesPassthroughFallback && s.nativeResponsesUnsupported(candidate.Channel.ID) {
+					nativeAttempted = false
+					result = &relay.Result{StatusCode: http.StatusNotFound}
+				} else {
+					result = s.upstreamFor(req.OpenAIPath).ForwardWithHeaders(fwdCtx, req.Method, upstreamURL, headers, requestBody)
+				}
 				if responsesPassthroughFallback && !responsesFallbackTried &&
 					result != nil && result.Err == nil &&
 					(result.StatusCode == http.StatusNotFound || result.StatusCode == http.StatusMethodNotAllowed) {
-					_ = result.Body.Close()
-					translated, translateErr := adapters.ResponsesToChat(requestSource)
+					if nativeAttempted {
+						s.markNativeResponsesUnsupported(candidate.Channel.ID)
+					}
+					translated, droppedTools, translateErr := adapters.ResponsesToChatReport(requestSource)
+					if translateErr != nil {
+						// Stored conversation, background execution or a forced tool that
+						// only a native upstream can run: this request needs a native
+						// Responses upstream and the one we just tried does not have it.
+						// Keep the upstream's 404 driving the failover walk, but remember
+						// why so the client is not told "404 page not found" when nothing
+						// else can serve it either.
+						responsesRefusal = translateErr
+						log.Printf("proxy: responses fallback refused (request_id=%s): %v", req.RequestID, translateErr)
+					}
+					if len(droppedTools) > 0 {
+						// Server-side tools (web_search, mcp, ...) have no chat/completions
+						// equivalent. The turn still runs; what was lost is named in the
+						// response header and in the log, because "the model did not search
+						// the web" has to be explainable afterwards.
+						log.Printf("proxy: responses fallback dropped server-side tools (request_id=%s): %s", req.RequestID, strings.Join(droppedTools, ", "))
+					}
 					if prompt := strings.TrimSpace(candidate.Channel.SystemPrompt); prompt != "" && translateErr == nil {
 						translated = injectSystemPrompt(translated, prompt)
 					}
-					chatURL, urlErr := s.resolveUpstreamURL(candidate.Channel, "chat/completions", adapter)
+					chatURL, urlErr := s.resolveUpstreamURL(candidate.Channel, "chat/completions", adapter, effectiveModel)
 					if translateErr == nil && urlErr == nil {
 						fallbackTranslation, fallbackOK := s.registry.Translations.Lookup("responses", "openai")
 						if fallbackOK && fallbackTranslation.Response != nil {
+							if result.Body != nil {
+								_ = result.Body.Close()
+							}
 							responsesFallbackTried = true
 							registryTranslation = &fallbackTranslation
 							responsesFallbackCategory = "responses_translated"
-							result = s.relay.ForwardWithHeaders(fwdCtx, req.Method, chatURL, headers, translated)
+							// The pivoted replay is the endpoint that answers the client from
+							// here on: log and echo THAT url, not the /responses one that 404'd.
+							req.UpstreamURLActual = adapters.SafeURL(chatURL)
+							result = s.upstreamFor(req.OpenAIPath).ForwardWithHeaders(fwdCtx, req.Method, chatURL, headers, translated)
+							if result != nil && len(droppedTools) > 0 {
+								if result.Header == nil {
+									result.Header = http.Header{}
+								}
+								result.Header.Set(DroppedToolsEchoHeader, strings.Join(droppedTools, ","))
+							}
 						} else {
 							log.Printf("proxy: responses fallback translation missing (request_id=%s)", req.RequestID)
 						}
 					}
 				}
-				// Convert upstream 2xx bodies back to the OpenAI contract.
-				if result != nil && result.Err == nil && result.StatusCode >= 200 && result.StatusCode < 300 && result.Body != nil {
-					// N×M matrix path: the (anthropic → family) pair's Response/Stream
-					// modes convert upstream output back to the Anthropic contract.
-					if registryTranslation != nil {
-						if req.Stream && registryTranslation.Stream != nil {
-							wrapped, wrapErr := registryTranslation.Stream(effectivePath, result.Body)
-							if wrapErr != nil {
-								_ = result.Body.Close()
-								result = &relay.Result{Header: result.Header, LatencyMs: result.LatencyMs, Err: wrapErr}
-							} else {
-								result.Body = wrapped
-								if result.Header == nil {
-									result.Header = make(http.Header)
-								}
-								if !isBinaryResponsePath(effectivePath) {
-									result.Header.Set("Content-Type", "text/event-stream")
-								}
-							}
-						} else if !req.Stream && registryTranslation.Response != nil {
-							raw, readErr := readResponseBody(result.Body, preserveBodyReadLimit)
-							_ = result.Body.Close()
-							if readErr != nil {
-								result = &relay.Result{StatusCode: result.StatusCode, Header: result.Header, LatencyMs: result.LatencyMs, Err: readErr}
-							} else if converted, convErr := registryTranslation.Response(effectivePath, raw); convErr != nil {
-								result = &relay.Result{
-									StatusCode: adapterErrorStatus(convErr, http.StatusBadGateway),
-									Header:     result.Header,
-									LatencyMs:  result.LatencyMs,
-									Err:        fmt.Errorf("proxy: anthropic response: %w", convErr),
-								}
-							} else {
-								result.Body = io.NopCloser(bytes.NewReader(converted))
-								if result.Header == nil {
-									result.Header = make(http.Header)
-								}
-								result.Header.Set("Content-Type", transformedContentType(effectivePath, adapter.Name(), result.Header.Get("Content-Type")))
-							}
-						}
-					} else if req.Stream {
-						// Reshape native/upstream SSE into the downstream contract (the
-						// composed adapter pivots through OpenAI SSE internally).
-						wrapped, wrapErr := adapter.WrapStream(effectivePath, result.Body)
-						if wrapErr != nil {
-							// The upstream stream is not handed to the client; close it so
-							// the connection returns to the pool instead of leaking.
-							_ = result.Body.Close()
-							result = &relay.Result{Header: result.Header, LatencyMs: result.LatencyMs, Err: wrapErr}
-						} else {
-							result.Body = wrapped
-							if result.Header == nil {
-								result.Header = make(http.Header)
-							}
-							if !isBinaryResponsePath(effectivePath) {
-								result.Header.Set("Content-Type", "text/event-stream")
-							}
-						}
-					} else {
-						raw, readErr := readResponseBody(result.Body, preserveBodyReadLimit)
-						_ = result.Body.Close()
-						if readErr != nil {
-							result = &relay.Result{StatusCode: result.StatusCode, Header: result.Header, LatencyMs: result.LatencyMs, Err: readErr}
-						} else if converted, convErr := adapter.TransformResponse(effectivePath, raw); convErr != nil {
-							result = &relay.Result{
-								StatusCode: adapterErrorStatus(convErr, http.StatusBadGateway),
-								Header:     result.Header,
-								LatencyMs:  result.LatencyMs,
-								Err:        fmt.Errorf("proxy: %s response: %w", adapter.Name(), convErr),
-							}
-						} else {
-							// Empty-success check: a 2xx chat completion with no
-							// choices or an empty message is a silent upstream
-							// failure — fail over instead of returning emptiness.
-							if effectivePath == "chat/completions" && isEmptyChatSuccess(converted) {
-								result = &relay.Result{
-									StatusCode: result.StatusCode,
-									Header:     result.Header,
-									LatencyMs:  result.LatencyMs,
-									Err:        ErrEmptyCompletion,
-								}
-							} else {
-								result.Body = io.NopCloser(bytes.NewReader(converted))
-								if result.Header == nil {
-									result.Header = make(http.Header)
-								}
-								result.Header.Set("Content-Type", transformedContentType(effectivePath, adapter.Name(), result.Header.Get("Content-Type")))
-							}
-						}
-					}
+				// Convert upstream 2xx bodies back to the client's contract: stream
+				// policy, the translation pair's modes, adapter wrap, response map.
+				result = convertSuccessBody(result, convertInput{
+					adapter:                 adapter,
+					channelMap:              channelMap,
+					translation:             registryTranslation,
+					effectivePath:           effectivePath,
+					aggregateUpstreamStream: aggregateUpstreamStream,
+					synthesizeClientStream:  synthesizeClientStream,
+					clientStream:            req.Stream,
+				})
+				// Plugin response hook: a complete, non-streaming answer may be
+				// rewritten before the client sees it. Streaming answers keep their
+				// body as an open reader and are not offered (see HookResponse).
+				if interceptor := s.hookEnabled(); interceptor != nil {
+					result = s.applyResponseHook(ctx, &req, &candidate, effectiveModel, attempt+1, result, interceptor)
 				}
 				streamInterrupted := false
 				if req.Stream && result.Err == nil && result.StatusCode >= 200 && result.StatusCode < 300 {
@@ -795,8 +650,8 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 				// re-established through the check-in machinery exactly once per
 				// request, then the request is replayed from the first key in the
 				// refreshed pool. A successful replay is logged as refresh_retry.
-				if !refreshed && !localAdapterFailure && result.Err == nil && result.StatusCode == http.StatusUnauthorized && s.credentialRefresher != nil {
-					if s.refreshCredentialAndReplay(ctx, &candidate, &apiKeys, req.Model) {
+				if retrySafe && !refreshed && !localAdapterFailure && result.Err == nil && result.StatusCode == http.StatusUnauthorized && s.credentialRefresher != nil {
+					if s.refreshCredentialAndReplay(ctx, &candidate, &apiKeys, effectiveModel) {
 						if result.Body != nil {
 							_ = result.Body.Close()
 							result.Body = nil
@@ -848,7 +703,7 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 				category = "refresh_retry"
 			}
 			if keyIndex == len(apiKeys)-1 || (result.Err == nil && !retryable) {
-				s.recordAttempt(req, candidate, attempt+1, result, category, keyFingerprint(apiKey))
+				s.recordAttempt(req, candidate, attempt+1, result, category, keyFingerprint(apiKey.Secret), apiKey.CredentialID)
 			}
 			if result.Err == nil && !retryable {
 				break
@@ -877,22 +732,26 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 			// A probe success is the answer the operator asked for, not a health
 			// signal: member cooldown reset, channel counter, error decay, and
 			// latency sampling stay untouched so probe traffic never looks like
-			// real traffic to the bookkeeping.
-			if !req.Probe {
+			// real traffic to the bookkeeping. The console's 试调 is the same
+			// kind of call and is exempted the same way.
+			if !req.Probe && !req.Diagnostic {
 				if err := s.db.RouteMember.RecordSuccess(candidate.Member.ID, s.now()); err != nil {
 					log.Printf("proxy: record success member_id=%d: %v", candidate.Member.ID, err)
 				}
-				s.decayError(candidate.Channel.ID, req.Model)
+				s.decayError(candidate.Channel.ID, req.UpstreamModel)
 				s.recordMemberSuccess(candidate.Channel.ID)
 				s.resetTransportFails(candidate.Member.ID)
 				if s.latencyAware.Load() && result.LatencyMs > 0 {
-					s.observeLatency(candidate.Channel.ID, req.Model, result.LatencyMs)
+					s.observeLatency(candidate.Channel.ID, req.UpstreamModel, result.LatencyMs)
 				}
 			}
 			// Bind the successful relay to its session key so the next request
 			// of the same conversation prefers this channel (prompt-cache and
-			// multi-turn continuity). Admin-pinned probes never bind.
-			if stickyStore != nil && sessionKey != "" && req.PreferChannelID == 0 {
+			// multi-turn continuity). Admin-pinned probes never bind, and a
+			// route that opted out of affinity (routes.sticky_session=false,
+			// or the global default off with no override) must not leave a
+			// binding behind for when it opts back in.
+			if stickyStore != nil && decision.StickyActive && sessionKey != "" && !pinnedUpstream(req) {
 				stickyStore.Bind(sessionKey, candidate.Channel.ID, s.now())
 			}
 			// Hand the gate slot to the response body: the hard ceiling now
@@ -906,6 +765,15 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 				// body wrapper, which fires exactly once via sync.Once.
 				result.Body = &gateBoundBody{ReadCloser: body, release: func() { s.gate.Release(candidate.Channel.ID, gateGen) }}
 				gateHeld = false
+			}
+			if req.UpstreamURLActual != "" {
+				// Echo the endpoint that served the request. Without it a client
+				// calling a custom path cannot tell which upstream answered once a
+				// channel mapping or a per-request override relocated the call.
+				if result.Header == nil {
+					result.Header = make(http.Header)
+				}
+				result.Header.Set(UpstreamURLEchoHeader, req.UpstreamURLActual)
 			}
 			return result, meta
 		}
@@ -932,7 +800,7 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 						result.StatusCode = rule.RewriteTo
 					}
 					category = "error_rule_" + rule.Action
-					s.recordAttempt(req, candidate, attempt+1, result, category, "")
+					s.recordAttempt(req, candidate, attempt+1, result, category, "", 0)
 					log.Printf("proxy: error rule %q passthrough status=%d model=%s channel=%d (request_id=%s)", rule.Name, result.StatusCode, req.Model, candidate.Channel.ID, req.RequestID)
 					return result, meta
 				case store.ErrorRuleIgnoreMonitor:
@@ -948,13 +816,13 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 			// cooldown, a repeat does — the channel never silently keeps
 			// eating full timeouts on every request. ignore_monitor rules
 			// skip bookkeeping entirely.
-			if !monitorSkipped && !req.Probe {
+			if !monitorSkipped && !req.Probe && !req.Diagnostic {
 				penalty := retryAfterCooldown(result.Header, s.now(), cooldown)
 				if category == "transport" {
 					penalty = s.transportPenalty(candidate.Member.ID, cooldown)
 					s.observeTransportFailure(candidate.Member.ID)
 				}
-				s.recordMemberFailure(req, candidate.Member.ID, candidate.Channel.ID, req.Model, penalty, category)
+				s.recordMemberFailure(req, candidate.Member.ID, candidate.Channel.ID, req.UpstreamModel, penalty, category)
 			}
 			// Two-layer fallback scope: an upstream that ANSWERED (any status,
 			// or a stream that died mid-flight — surfaced as the
@@ -973,7 +841,7 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 				result.StatusCode != http.StatusUnauthorized && result.StatusCode != http.StatusForbidden:
 				memberScopedFailure = true
 			}
-			if req.PreferChannelID > 0 {
+			if pinnedUpstream(req) {
 				return result, meta
 			}
 		} else if result.Err == nil && result.StatusCode >= 400 && result.StatusCode < 500 {
@@ -1004,20 +872,20 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 					}
 					log.Printf("proxy: model %s not found on channel %d — blacklisted (request_id=%s)", effectiveModel, candidate.Channel.ID, req.RequestID)
 				}
-				// Probes are pinned synthetic traffic: a 4xx here is information,
-				// not a fault, so member cooldown and error bookkeeping stay
-				// untouched (recordMemberFailure guards the same way on the
-				// retryable path).
-				if !req.Probe {
+				// Probes (and the console's 试调) are pinned synthetic traffic: a
+				// 4xx here is information, not a fault, so member cooldown and
+				// error bookkeeping stay untouched (recordMemberFailure guards the
+				// same way on the retryable path).
+				if !req.Probe && !req.Diagnostic {
 					if s.faultProtectionEnabled.Load() {
 						if err := s.db.RouteMember.RecordFailure(candidate.Member.ID, s.now(), cooldown, category); err != nil {
 							log.Printf("proxy: record 4xx member failure member_id=%d: %v", candidate.Member.ID, err)
 						}
 					}
-					s.observeError(candidate.Channel.ID, req.Model)
+					s.observeError(candidate.Channel.ID, req.UpstreamModel)
 				}
 			}
-			if req.PreferChannelID > 0 {
+			if pinnedUpstream(req) {
 				return result, meta
 			}
 			goto nextCandidate
@@ -1047,6 +915,23 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 		}
 	}
 	if last != nil {
+		// A Responses client whose request cannot be expressed as a chat
+		// completion (stored conversation, non-function tools) has no fallback
+		// path: the upstream has no native /v1/responses surface, so all we hold
+		// is its 404. Passing that through tells the client nothing — "404 page
+		// not found" reads as "this gateway has no Responses endpoint" — while
+		// the real reason is a capability the request needs. The routing decision
+		// above is untouched (the 404 still drove the walk); only the final
+		// message changes, and only when every channel said the same thing.
+		if responsesRefusal != nil && last.StatusCode == http.StatusNotFound {
+			if last.Body != nil {
+				_ = last.Body.Close()
+			}
+			return preserve(&relay.Result{
+				StatusCode: adapterErrorStatus(responsesRefusal, http.StatusNotImplemented),
+				Err:        responsesRefusal,
+			}), lastMeta
+		}
 		return last, lastMeta
 	}
 	return &relay.Result{Err: routing.ErrNoEligible}, lastMeta
@@ -1056,7 +941,7 @@ func (s *Service) ForwardWithMeta(ctx context.Context, req Request) (*relay.Resu
 // credential (kind session/access_token) after an upstream 401, then
 // re-resolves the key pool so the replay uses the refreshed secret. Reports
 // whether the refresh succeeded AND the pool was replaced.
-func (s *Service) refreshCredentialAndReplay(ctx context.Context, candidate *domain.RoutingCandidate, apiKeys *[]string, model string) bool {
+func (s *Service) refreshCredentialAndReplay(ctx context.Context, candidate *domain.RoutingCandidate, apiKeys *[]upstreamKey, model string) bool {
 	if candidate == nil || candidate.Channel.CredentialID == nil || *candidate.Channel.CredentialID <= 0 {
 		return false
 	}
@@ -1085,13 +970,78 @@ func (s *Service) refreshCredentialAndReplay(ctx context.Context, candidate *dom
 	return true
 }
 
-func pickPreferred(decision routing.Decision, channelID int64) (domain.RoutingCandidate, bool) {
+// pinnedUpstream reports whether the caller pinned an exact upstream — the
+// admin console's 试调, or a probe. Pinned traffic is a diagnostic: it never
+// fails over to another channel, and it never binds a sticky session (a route
+// that did not choose the channel must not inherit the affinity).
+func pinnedUpstream(req Request) bool {
+	return req.PreferChannelID > 0 || req.PreferMemberID > 0
+}
+
+func pickPreferred(decision routing.Decision, channelID, memberID int64) (domain.RoutingCandidate, bool) {
+	if memberID > 0 {
+		for _, evaluation := range decision.Candidates {
+			if evaluation.Eligible && evaluation.Candidate.Member.ID == memberID {
+				return evaluation.Candidate, true
+			}
+		}
+		return domain.RoutingCandidate{}, false
+	}
 	for _, evaluation := range decision.Candidates {
 		if evaluation.Eligible && evaluation.Candidate.Channel.ID == channelID {
 			return evaluation.Candidate, true
 		}
 	}
 	return domain.RoutingCandidate{}, false
+}
+
+// PinFailure carries the reason an explicitly chosen upstream could not be
+// used. It wraps ErrPreferredChannel so every existing errors.Is check keeps
+// working while the console gets a code it can translate.
+type PinFailure struct{ Code string }
+
+func (e *PinFailure) Error() string { return "proxy: preferred upstream unusable (" + e.Code + ")" }
+
+func (e *PinFailure) Unwrap() error { return ErrPreferredChannel }
+
+// pinFailure explains WHY the upstream the caller named cannot be used. The
+// console's 试调 and the health probes both pin a row, and a single generic
+// "preferred channel unavailable" made a disabled member, an empty key pool and
+// a cooling channel look like one and the same fault.
+func pinFailure(decision routing.Decision, req Request) error {
+	reasons := map[routing.Reason]bool{}
+	found := false
+	for _, evaluation := range decision.Candidates {
+		if req.PreferMemberID > 0 {
+			if evaluation.Candidate.Member.ID != req.PreferMemberID {
+				continue
+			}
+		} else if evaluation.Candidate.Channel.ID != req.PreferChannelID {
+			continue
+		}
+		found = true
+		for _, reason := range evaluation.Reasons {
+			reasons[reason] = true
+		}
+	}
+	code := "preferred_channel_unavailable"
+	switch {
+	case !found:
+		// The route does not hold that upstream at all: the row was deleted, or
+		// the pin belongs to a different model.
+		code = "pinned_upstream_not_member"
+	case reasons[routing.ReasonMemberDisabled]:
+		code = "pinned_upstream_member_disabled"
+	case reasons[routing.ReasonChannelDisabled]:
+		code = "pinned_upstream_channel_disabled"
+	case reasons[routing.ReasonCredentialAbsent]:
+		code = "pinned_upstream_no_credential"
+	case reasons[routing.ReasonCoolingDown]:
+		code = "pinned_upstream_cooling_down"
+	case reasons[routing.ReasonInvalidWeight]:
+		code = "pinned_upstream_invalid_weight"
+	}
+	return &PinFailure{Code: code}
 }
 
 func isBinaryResponsePath(path string) bool {
@@ -1135,19 +1085,51 @@ func requestHeader(headers map[string]string, name string) string {
 	return ""
 }
 
+// retrySafeRequest reports whether a failed attempt may be replayed on another
+// channel or upstream key.
+//
+// The matrix it encodes is a safety contract, not a tuning knob:
+//
+//	path                default   with Idempotency-Key
+//	images/*            no        no   (a header cannot dedupe across channels)
+//	audio/*             no        yes
+//	videos/*, video/*   no        yes
+//	music/*             no        yes
+//	responses           no        yes
+//	everything else     yes       yes
+//
+// Anything that generates and bills an artifact defaults to no: the upstream
+// may have accepted and charged it before the failure reached us. Read-like
+// calls (chat, completions, embeddings, moderations, and custom paths such as
+// TypeSafe's /v1/systemone) keep their retries.
 func retrySafeRequest(req Request) bool {
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
 	if method != http.MethodPost && method != http.MethodPut && method != http.MethodPatch {
 		return true
 	}
+	path := strings.TrimPrefix(strings.Trim(strings.ToLower(req.OpenAIPath), "/"), "v1/")
+	// Image operations may already have been accepted and charged. An
+	// idempotency header cannot guarantee deduplication across channels/keys.
+	if strings.HasPrefix(path, "images/") {
+		return false
+	}
 	if requestHeader(req.Headers, "Idempotency-Key") != "" {
 		return true
 	}
-	path := strings.Trim(strings.ToLower(req.OpenAIPath), "/")
-	for _, prefix := range []string{"images/", "audio/"} {
-		if strings.HasPrefix(path, prefix) {
-			return false
-		}
+	if strings.HasPrefix(path, "audio/") {
+		return false
+	}
+	// Video and music generation produce a billable artifact and are charged on
+	// acceptance, so a replay is a second charge. They are not registered
+	// endpoints: they arrive through the /v1/* passthrough, which means nothing
+	// else in the relay knows about them and they would otherwise inherit
+	// retries by falling through to the line below.
+	//
+	// Named explicitly rather than "anything unregistered", because an unknown
+	// custom path is usually a read-like call (TypeSafe's /v1/systemone is the
+	// reference case) and those should keep their retries.
+	if hasPathPrefix(path, "videos/", "video/", "music/") {
+		return false
 	}
 	if path == "responses" || strings.HasPrefix(path, "responses/") {
 		return false
@@ -1155,7 +1137,88 @@ func retrySafeRequest(req Request) bool {
 	return true
 }
 
-func (s *Service) resolveUpstreamURL(channel domain.Channel, apiPath string, adapter adapters.ForwardAdapter) (string, error) {
+// hasPathPrefix reports whether path starts with any of prefixes. It exists so
+// the non-idempotent families read as one list instead of a chain of HasPrefix
+// calls, which is how a new family gets forgotten.
+func hasPathPrefix(path string, prefixes ...string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// UpstreamURLEchoHeader names the response header carrying the URL the gateway
+// actually called (scheme + host + path). The proxy sets it on the relay result
+// so the relay handler can forward it to the client and the operator can see,
+// without reading a log, which endpoint a custom-path call reached.
+const UpstreamURLEchoHeader = "X-Meta-Upstream-URL"
+
+// DroppedToolsEchoHeader names the server-side tools a Responses→chat fallback
+// had to drop (web_search, mcp, ...). A chat upstream cannot run them, so the
+// turn proceeds without them — and without this header nobody could tell
+// afterwards why the model never searched. It is set on the relay result and
+// forwarded to the client by the relay handler.
+const DroppedToolsEchoHeader = "X-Meta-Dropped-Tools"
+
+// upstreamFieldValue reads a per-request endpoint field, preferring the request
+// body over the caller's headers (a body value is the more explicit statement of
+// intent; the header is what a payload rule or a pin sets). Both spellings of a
+// field are accepted — upstream_path and upstream-path, upstream_url and
+// upstream-url — because a JSON body key and an HTTP header naturally differ.
+func upstreamFieldValue(body []byte, headers map[string]string, field string) string {
+	alternative := strings.ReplaceAll(field, "_", "-")
+	if len(body) > 0 {
+		var doc map[string]json.RawMessage
+		if err := json.Unmarshal(body, &doc); err == nil {
+			for _, key := range []string{field, alternative} {
+				if raw, ok := doc[key]; ok {
+					var value string
+					if err := json.Unmarshal(raw, &value); err == nil {
+						return strings.TrimSpace(value)
+					}
+				}
+			}
+		}
+	}
+	for key, value := range headers {
+		normalized := strings.ReplaceAll(key, "_", "-")
+		if strings.EqualFold(normalized, alternative) {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+// upstreamFields decodes the two endpoint override fields from a request body
+// and the caller headers. Both are validated so a malformed value is rejected up
+// front instead of being forwarded to an unintended endpoint.
+//
+// It reads the caller's post-rewrite body, so a payload rule that writes
+// `upstream_path` (or `upstream_url`) for one model retargets THAT model's
+// request and no other.
+func upstreamFields(body []byte, headers map[string]string) (path string, urlOverride string, err error) {
+	path = upstreamFieldValue(body, headers, "upstream_path")
+	urlOverride = upstreamFieldValue(body, headers, "upstream_url")
+	if urlOverride == "" && path != "" && (strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://")) {
+		// `upstream_path` carrying a whole URL is the natural mistake; accept it
+		// as the url override rather than rejecting a field name.
+		urlOverride, path = path, ""
+	}
+	if path != "" && !adapters.IsSafeURLPathSuffix(path) {
+		return "", "", errors.New("upstream_path must be a simple path (letters, digits, '-', '.', '/'; at most 8 segments)")
+	}
+	if urlOverride != "" {
+		parsed, parseErr := url.Parse(urlOverride)
+		if parseErr != nil || !parsed.IsAbs() || parsed.Host == "" || parsed.User != nil {
+			return "", "", errors.New("upstream_url must be an absolute http(s) URL")
+		}
+	}
+	return path, urlOverride, nil
+}
+
+func (s *Service) resolveUpstreamURL(channel domain.Channel, apiPath string, adapter adapters.ForwardAdapter, model string) (string, error) {
 	baseURL := strings.TrimSpace(channel.BaseURL)
 	if baseURL == "" {
 		if channel.SiteID == nil {
@@ -1166,6 +1229,20 @@ func (s *Service) resolveUpstreamURL(channel domain.Channel, apiPath string, ada
 			return "", fmt.Errorf("proxy: channel base url unavailable")
 		}
 		baseURL = site.BaseURL
+	}
+	// Channel-level path override/map runs BEFORE the adapter's join, but the
+	// join itself must also change: the passthrough adapter's <base>/v1/<path>
+	// rule is exactly the assumption a mapped channel is escaping (a provider
+	// whose API root is /api/paas/v4 must not gain a /v1 segment).
+	if channelMap := ParseUpstreamMap(channel.UpstreamPathOverride, channel.UpstreamPathMap, "", ""); !channelMap.Empty() {
+		apiPath = channelMap.ResolvePath(apiPath, model)
+		if _, isOpenAI := adapter.(adapters.OpenAIPassthroughAdapter); isOpenAI || adapter.Name() == "openai-compatible" {
+			joined, joinErr := adapters.JoinRawPath(baseURL, apiPath)
+			if joinErr != nil {
+				return "", fmt.Errorf("%w: %v", adapters.ErrInvalidURL, joinErr)
+			}
+			return joined, nil
+		}
 	}
 	upstreamURL, err := adapter.BuildUpstreamURL(baseURL, apiPath)
 	if err != nil {

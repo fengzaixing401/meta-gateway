@@ -87,7 +87,7 @@ func TestBindingOutranksPriorityTier(t *testing.T) {
 	stickyStore := NewStickyStore(time.Hour, systemClock{})
 	stickyStore.Bind("sess-1", 20, now)
 	selector := New(repo)
-	selector.SetSticky(stickyStore)
+	selector.SetSticky(stickyStore, true)
 	decision, err := selector.SelectSticky(context.Background(), "m", nil, "sess-1")
 	if err != nil {
 		t.Fatal(err)
@@ -96,5 +96,3 @@ func TestBindingOutranksPriorityTier(t *testing.T) {
 		t.Fatalf("bound channel 20 not selected (got %d); binding must outrank the priority tier", decision.Selected.Channel.ID)
 	}
 }
-
-func ptrI64(v int64) *int64 { return &v }

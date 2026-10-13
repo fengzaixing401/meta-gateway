@@ -12,7 +12,8 @@ import (
 
 // ProxyLogStore provides insert and query operations for proxy logs.
 type ProxyLogStore struct {
-	db *sql.DB
+	db  *sql.DB
+	fts LogFTSState
 }
 
 // ProxyLogFilter selects a page of proxy logs for Admin list views.
@@ -20,14 +21,49 @@ type ProxyLogStore struct {
 // Status, when set, matches exactly. FailedOnly selects status >= 400
 // and is ignored when Status is set.
 type ProxyLogFilter struct {
-	SiteID            *int64
-	ChannelID         *int64
+	SiteID    *int64
+	ChannelID *int64
+	// DownstreamKeyID selects one client token. Rows written before the
+	// column existed (or rejected before authentication) carry 0 and are
+	// never matched by a key filter.
+	DownstreamKeyID   *int64
 	Model             string
 	Status            *int
 	FailedOnly        bool
 	UpstreamRequestID string
 	BeforeID          *int64
 	Limit             int
+	// Since/Until bound created_at inclusively (nil = open-ended). The console
+	// sends RFC3339; SQLiteStoreTime normalizes it to the stored UTC layout.
+	Since *time.Time
+	Until *time.Time
+	// Query is free text searched across model, error text, path and both
+	// request ids. It runs through FTS5 when available and degrades to LIKE
+	// when the SQLite build has no FTS5 (or the query has no usable tokens).
+	Query string
+}
+
+// sqliteUTC renders a time in the exact layout proxy_logs/usage_records store
+// (SQLite `datetime('now')` = UTC "YYYY-MM-DD HH:MM:SS"). Binding an RFC3339
+// string would compare greater than every row and silently return nothing.
+func sqliteUTC(t time.Time) string {
+	return t.UTC().Format("2006-01-02 15:04:05")
+}
+
+// createdRange narrows a query to an inclusive created_at window. Column is
+// the qualified column name (e.g. "pl.created_at").
+func createdRange(column string, since, until *time.Time) ([]string, []any) {
+	clauses := []string{}
+	args := []any{}
+	if since != nil {
+		clauses = append(clauses, column+" >= ?")
+		args = append(args, sqliteUTC(*since))
+	}
+	if until != nil {
+		clauses = append(clauses, column+" <= ?")
+		args = append(args, sqliteUTC(*until))
+	}
+	return clauses, args
 }
 
 // Insert writes a proxy log entry.
@@ -36,9 +72,17 @@ func (s *ProxyLogStore) Insert(log *domain.ProxyLog) (int64, error) {
 	if log.Stream {
 		stream = 1
 	}
-	res, err := s.db.Exec(`INSERT INTO proxy_logs (request_id, channel_id, route_id, model, status, latency_ms, attempt, error_brief, error_detail, downstream_key_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_creation_tokens, stream, path, session_key, reasoning_effort, key_fingerprint, upstream_request_id, mapped_reasoning_effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	res, err := s.db.Exec(`INSERT INTO proxy_logs (request_id, channel_id, route_id, model, status, latency_ms, attempt, error_brief, error_detail, downstream_key_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_creation_tokens, stream, path, session_key, reasoning_effort, key_fingerprint, upstream_request_id, mapped_reasoning_effort, upstream_model, upstream_url, upstream_key_id, member_id, request_kind, completion_outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		log.RequestID, log.ChannelID, log.RouteID, log.Model, log.Status, log.LatencyMs, log.Attempt, log.ErrorBrief, log.ErrorDetail,
-		log.DownstreamKeyID, log.PromptTokens, log.CompletionTokens, log.TotalTokens, log.CacheReadTokens, log.CacheCreationTokens, stream, log.Path, log.SessionKey, log.ReasoningEffort, log.KeyFingerprint, log.UpstreamRequestID, log.MappedReasoningEffort)
+		log.DownstreamKeyID, log.PromptTokens, log.CompletionTokens, log.TotalTokens, log.CacheReadTokens, log.CacheCreationTokens, stream, log.Path, log.SessionKey, log.ReasoningEffort, log.KeyFingerprint, log.UpstreamRequestID, log.MappedReasoningEffort, log.UpstreamModel, log.UpstreamURL, log.UpstreamKeyID, log.MemberID, requestKind(log.RequestKind), func() string {
+			if log.CompletionOutcome != "" {
+				return log.CompletionOutcome
+			}
+			if log.Stream {
+				return "pending"
+			}
+			return ""
+		}())
 	if err != nil {
 		return 0, fmt.Errorf("proxylog insert: %w", err)
 	}
@@ -85,6 +129,14 @@ type LatencyHistogram struct {
 	SlowCount int   `json:"slow_count"`
 	P50Ms     int   `json:"p50_ms"`
 	P95Ms     int   `json:"p95_ms"`
+	P99Ms     int   `json:"p99_ms"`
+	// Matched is how many rows the window held before the newest-first sample
+	// cut it down to Total. The console shows both so a sample that is smaller
+	// than the window cannot be mistaken for the whole window.
+	Matched int `json:"matched"`
+	// SampleSize is the newest-first sample the distribution covers, so the
+	// caption can distinguish "all of the window" from "the tail of it".
+	SampleSize int `json:"sample_size"`
 }
 
 // FailRate returns (total, failed) relay requests since the given time.
@@ -95,28 +147,64 @@ type LatencyHistogram struct {
 func (s *ProxyLogStore) FailRate(since time.Time) (total, failed int) {
 	row := s.db.QueryRow(
 		`SELECT COUNT(*), COALESCE(SUM(CASE WHEN status >= 400 OR error_brief <> '' THEN 1 ELSE 0 END), 0) FROM proxy_logs WHERE created_at >= ?`,
-		since.UTC().Format("2006-01-02 15:04:05"),
+		sqliteUTC(since),
 	)
 	_ = row.Scan(&total, &failed)
 	return total, failed
 }
 
-// LatencyHistogram aggregates the newest sampleSize proxy log latencies.
-func (s *ProxyLogStore) LatencyHistogram(sampleSize int) (*LatencyHistogram, error) {
+// LatencyHistogram aggregates the newest sampleSize proxy log latencies,
+// optionally restricted to an inclusive time window. A window makes the panel
+// answer "how slow was the last hour", not just "how slow is the tail".
+func (s *ProxyLogStore) LatencyHistogram(sampleSize int, since, until *time.Time) (*LatencyHistogram, error) {
+	return s.latencyHistogram("proxy_logs", "id", nil, sampleSize, since, until)
+}
+
+// MemberLatencyHistogram uses completed account requests rather than individual
+// upstream attempts. userID is mandatory: it can never widen into a global read.
+func (s *ProxyLogStore) MemberLatencyHistogram(userID int64, sampleSize int, since, until *time.Time) (*LatencyHistogram, error) {
+	if userID <= 0 {
+		return nil, fmt.Errorf("member histogram requires a user")
+	}
+	return s.latencyHistogram("team_requests", "rowid", &userID, sampleSize, since, until)
+}
+
+// Table/order are private constants supplied only by the two wrappers above.
+func (s *ProxyLogStore) latencyHistogram(table, order string, userID *int64, sampleSize int, since, until *time.Time) (*LatencyHistogram, error) {
 	if sampleSize <= 0 {
 		sampleSize = 1000
 	}
-	if sampleSize > 10000 {
-		sampleSize = 10000
+	if sampleSize > 200000 {
+		sampleSize = 200000
 	}
-	rows, err := s.db.Query(`SELECT latency_ms FROM proxy_logs ORDER BY id DESC LIMIT ?`, sampleSize)
+	where, args := createdRange("created_at", since, until)
+	if userID != nil {
+		where = append(where, "user_id = ?")
+		args = append(args, *userID)
+	}
+	scope := ""
+	if len(where) > 0 {
+		scope = " WHERE " + strings.Join(where, " AND ")
+	}
+
+	hist := &LatencyHistogram{
+		Buckets:    make([]int, len(LatencyBucketBounds)+1),
+		SampleSize: sampleSize,
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM `+table+scope, args...).Scan(&hist.Matched); err != nil {
+		return nil, fmt.Errorf("proxylog histogram count: %w", err)
+	}
+
+	rows, err := s.db.Query(
+		`SELECT latency_ms FROM `+table+scope+` ORDER BY `+order+` DESC LIMIT ?`,
+		append(append([]any{}, args...), sampleSize)...,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("proxylog histogram: %w", err)
 	}
 	defer rows.Close()
 
-	hist := &LatencyHistogram{Buckets: make([]int, len(LatencyBucketBounds)+1)}
-	latencies := make([]int, 0, sampleSize)
+	latencies := make([]int, 0, 256)
 	for rows.Next() {
 		var latency int
 		if err := rows.Scan(&latency); err != nil {
@@ -135,6 +223,7 @@ func (s *ProxyLogStore) LatencyHistogram(sampleSize int) (*LatencyHistogram, err
 	sort.Ints(latencies)
 	hist.P50Ms = percentile(latencies, 50)
 	hist.P95Ms = percentile(latencies, 95)
+	hist.P99Ms = percentile(latencies, 99)
 	return hist, nil
 }
 
@@ -181,6 +270,10 @@ func (s *ProxyLogStore) ListFilter(f ProxyLogFilter) ([]domain.ProxyLog, error) 
 		where = append(where, "pl.channel_id = ?")
 		args = append(args, *f.ChannelID)
 	}
+	if f.DownstreamKeyID != nil {
+		where = append(where, "pl.downstream_key_id = ?")
+		args = append(args, *f.DownstreamKeyID)
+	}
 	if model := strings.TrimSpace(f.Model); model != "" {
 		where = append(where, "pl.model = ?")
 		args = append(args, model)
@@ -195,25 +288,49 @@ func (s *ProxyLogStore) ListFilter(f ProxyLogFilter) ([]domain.ProxyLog, error) 
 		where = append(where, "pl.id < ?")
 		args = append(args, *f.BeforeID)
 	}
+	if clauses, rangeArgs := createdRange("pl.created_at", f.Since, f.Until); len(clauses) > 0 {
+		where = append(where, clauses...)
+		args = append(args, rangeArgs...)
+	}
 	if id := strings.TrimSpace(f.UpstreamRequestID); id != "" {
 		where = append(where, "pl.upstream_request_id = ?")
 		args = append(args, id)
 	}
-	args = append(args, limit)
 
 	from := "proxy_logs pl"
+	if query := strings.TrimSpace(f.Query); query != "" {
+		if match := BuildLogFTSMatch(query); match != "" && s.fts.Available(s.db) {
+			from += " INNER JOIN proxy_logs_fts fts ON fts.rowid = pl.id"
+			where = append(where, "proxy_logs_fts MATCH ?")
+			args = append(args, match)
+		} else {
+			// No FTS5 (or nothing tokenizable): substring scan over the same
+			// columns. Slower, but the feature still works.
+			like := "%" + strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_").Replace(query) + "%"
+			where = append(where,
+				"(pl.model LIKE ? ESCAPE '\\' OR pl.error_brief LIKE ? ESCAPE '\\' OR pl.error_detail LIKE ? ESCAPE '\\' OR pl.path LIKE ? ESCAPE '\\' OR pl.request_id LIKE ? ESCAPE '\\' OR pl.upstream_request_id LIKE ? ESCAPE '\\')")
+			args = append(args, like, like, like, like, like, like)
+		}
+	}
+	args = append(args, limit)
+
 	if needsChannelJoin {
-		// LEFT JOIN so orphan channel_id rows remain visible when not site-filtered;
-		// site filter still requires a matching channels.site_id row.
-		from = "proxy_logs pl INNER JOIN channels c ON c.id = pl.channel_id"
+		// A site filter requires a matching channel, while unfiltered logs
+		// still include orphan channel IDs. Preserve any FTS join above.
+		from += " INNER JOIN channels c ON c.id = pl.channel_id"
 	}
 	// Always LEFT JOIN routes so the route pattern (model_pattern) can be shown
 	// alongside each log row; route_id 0 / missing routes render as empty.
 	from += " LEFT JOIN routes rt ON rt.id = pl.route_id"
+	// Same for the upstream key: the id is stored, the display name lives in the
+	// credential's meta_json. Resolving it at read time keeps renames visible;
+	// a deleted key (or a row from before the column existed) resolves empty and
+	// the console falls back to the fingerprint.
+	from += " LEFT JOIN credentials kc ON kc.id = pl.upstream_key_id"
 
 	query := `SELECT pl.id, pl.request_id, pl.channel_id, pl.route_id, COALESCE(rt.model_pattern, ''), pl.model, pl.status, pl.latency_ms, pl.attempt, pl.error_brief, pl.error_detail,
 		pl.downstream_key_id, pl.prompt_tokens, pl.completion_tokens, pl.total_tokens,
-		pl.cache_read_tokens, pl.cache_creation_tokens, pl.first_byte_ms, pl.client_family, pl.reasoning_effort, pl.mapped_reasoning_effort, pl.tokens_per_second, pl.stream, pl.path, pl.session_key, pl.upstream_request_id, pl.created_at
+		pl.cache_read_tokens, pl.cache_creation_tokens, pl.first_byte_ms, pl.client_family, pl.reasoning_effort, pl.mapped_reasoning_effort, pl.tokens_per_second, pl.stream, pl.path, pl.session_key, pl.upstream_request_id, COALESCE(pl.upstream_model, ''), COALESCE(pl.upstream_url, ''), COALESCE(pl.key_fingerprint, ''), pl.upstream_key_id, pl.member_id, pl.request_kind, pl.completion_outcome, COALESCE(NULLIF(CASE WHEN json_valid(kc.meta_json) THEN json_extract(kc.meta_json, '$.name') END, ''), ''), pl.created_at
 FROM ` + from + `
 WHERE ` + strings.Join(where, " AND ") + `
 ORDER BY pl.id DESC
@@ -232,7 +349,7 @@ LIMIT ?`
 		if err := rows.Scan(
 			&r.ID, &r.RequestID, &r.ChannelID, &r.RouteID, &r.RoutePattern, &r.Model, &r.Status, &r.LatencyMs, &r.Attempt, &r.ErrorBrief, &r.ErrorDetail,
 			&r.DownstreamKeyID, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens,
-			&r.CacheReadTokens, &r.CacheCreationTokens, &r.FirstByteMs, &r.ClientFamily, &r.ReasoningEffort, &r.MappedReasoningEffort, &r.TokensPerSecond, &stream, &r.Path, &r.SessionKey, &r.UpstreamRequestID, scanTime(&r.CreatedAt),
+			&r.CacheReadTokens, &r.CacheCreationTokens, &r.FirstByteMs, &r.ClientFamily, &r.ReasoningEffort, &r.MappedReasoningEffort, &r.TokensPerSecond, &stream, &r.Path, &r.SessionKey, &r.UpstreamRequestID, &r.UpstreamModel, &r.UpstreamURL, &r.KeyFingerprint, &r.UpstreamKeyID, &r.MemberID, &r.RequestKind, &r.CompletionOutcome, &r.UpstreamKeyName, scanTime(&r.CreatedAt),
 		); err != nil {
 			return nil, fmt.Errorf("proxylog scan: %w", err)
 		}

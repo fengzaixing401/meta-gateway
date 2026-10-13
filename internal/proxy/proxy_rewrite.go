@@ -2,10 +2,17 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"slices"
 	"strings"
+
+	"github.com/lan/meta-gateway/internal/domain"
 )
 
 // rewriteModelName rewrites the JSON "model" field of a request body from the
@@ -13,15 +20,22 @@ import (
 // the route's mapping_json value, expected to be {"real":"upstream-model"}.
 // It is a no-op when the body is not JSON, the field is absent, or it does not
 // match the requested alias.
-func rewriteModelName(body []byte, requestedModel, mappingJSON string) []byte {
+//
+// The name comes from domain.MemberRealModel, the same extractor the forward
+// path uses for the health key and the log's upstream name. Parsing it here
+// instead let the two disagree: the local copy did not trim, so a mapping stored
+// as {"real":" gpt-4o "} sent a padded model name upstream (a 404) while every
+// record of the request named the trimmed one.
+func rewriteModelName(body []byte, requestedModel, mappingJSON string, contentType ...string) []byte {
 	if len(body) == 0 || requestedModel == "" || mappingJSON == "" {
 		return body
 	}
-	var mapping struct {
-		Real string `json:"real"`
-	}
-	if err := json.Unmarshal([]byte(mappingJSON), &mapping); err != nil || mapping.Real == "" {
+	realModel := domain.MemberRealModel(mappingJSON)
+	if realModel == "" {
 		return body
+	}
+	if len(contentType) > 0 && strings.HasPrefix(strings.ToLower(contentType[0]), "multipart/form-data") {
+		return rewriteMultipartModel(body, requestedModel, realModel, contentType[0])
 	}
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -33,7 +47,7 @@ func rewriteModelName(body []byte, requestedModel, mappingJSON string) []byte {
 	if !ok || json.Unmarshal(rawModel, &current) != nil || current != requestedModel {
 		return body
 	}
-	real, err := json.Marshal(mapping.Real)
+	real, err := json.Marshal(realModel)
 	if err != nil {
 		return body
 	}
@@ -45,38 +59,123 @@ func rewriteModelName(body []byte, requestedModel, mappingJSON string) []byte {
 	return rewritten
 }
 
+// Rebuild only an explicitly mapped upload; ordinary passthrough stays byte
+// identical. Keep every file and optional form field, including false/zero.
+func rewriteMultipartModel(body []byte, requestedModel, realModel, contentType string) []byte {
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil || params["boundary"] == "" {
+		return body
+	}
+	reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+	var buffer bytes.Buffer
+	writer := multipart.NewWriter(&buffer)
+	if err := writer.SetBoundary(params["boundary"]); err != nil {
+		return body
+	}
+	changed := false
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return body
+		}
+		output, err := writer.CreatePart(part.Header)
+		if err != nil {
+			return body
+		}
+		if part.FormName() == "model" && part.FileName() == "" {
+			value, err := io.ReadAll(io.LimitReader(part, 4097))
+			if err != nil || len(value) > 4096 || strings.TrimSpace(string(value)) != requestedModel {
+				return body
+			}
+			if _, err := io.WriteString(output, realModel); err != nil {
+				return body
+			}
+			changed = true
+		} else if _, err := io.Copy(output, part); err != nil {
+			return body
+		}
+	}
+	if err := writer.Close(); err != nil || !changed {
+		return body
+	}
+	return buffer.Bytes()
+}
+
 // realModelFromMapping extracts {"real":"…"} from a member/route mapping so
 // health bookkeeping can key on the actual upstream name rather than the
 // client-facing alias. Empty when the mapping is absent or malformed.
-func realModelFromMapping(mappingJSON string) string {
-	var mapping struct {
-		Real string `json:"real"`
-	}
-	if err := json.Unmarshal([]byte(mappingJSON), &mapping); err != nil || mapping.Real == "" {
-		return ""
-	}
-	return strings.TrimSpace(mapping.Real)
-}
-
+//
 // reasoningEffortLevels is the ordered set of OpenAI-style reasoning effort
 // values understood by the gateway. A client-requested effort beyond a
-// channel's declared max is downgraded to the max at forward time.
+// channel's declared max is downgraded to the max at forward time, and one the
+// provider does not accept is snapped to the nearest rung it does.
 var reasoningEffortLevels = []string{
 	"none", "minimal", "low", "medium", "high", "xhigh", "max",
 }
 
-// downgradeReasoningEffort rewrites a request body's reasoning_effort when it
-// exceeds the channel's declared maximum. Returns the rewritten body and a
-// "from→to" note, or (nil, "") when no downgrade applies (missing field,
-// unknown values, or already at/below the max).
-func downgradeReasoningEffort(body []byte, maxEffort string) ([]byte, string) {
+// reasoningEffortIndex returns the rung's position in the ladder, -1 when the
+// value is not a ladder rung at all.
+func reasoningEffortIndex(effort string) int {
+	for i, level := range reasoningEffortLevels {
+		if level == effort {
+			return i
+		}
+	}
+	return -1
+}
+
+// nearestAcceptedEffort picks the highest accepted rung at or below the
+// requested one. Nothing accepted at that depth means no answer from here:
+// bumping the effort UP would add reasoning the client did not ask for, which
+// is worse than letting the upstream say no.
+func nearestAcceptedEffort(effort string, allowed []string) string {
+	limit := reasoningEffortIndex(effort)
+	if limit < 0 {
+		return ""
+	}
+	best := ""
+	bestIndex := -1
+	for _, candidate := range allowed {
+		index := reasoningEffortIndex(strings.ToLower(strings.TrimSpace(candidate)))
+		if index < 0 || index > limit || index <= bestIndex {
+			continue
+		}
+		best, bestIndex = reasoningEffortLevels[index], index
+	}
+	return best
+}
+
+// downgradeReasoningEffort rewrites a request body's reasoning_effort so the
+// upstream can actually answer it. Two independent constraints apply:
+//
+//   - maxEffort — what the operator declared this channel (or route) accepts;
+//     anything above it comes down to it;
+//   - allowed — the rungs the provider itself understands (see
+//     AcceptedReasoningLevels); a value outside the set snaps to the nearest
+//     accepted rung at or below it. TypeSafe, for one, rejects `max` and
+//     `minimal` outright.
+//
+// Returns the rewritten body and a "from→to" note, or (nil, "") when nothing
+// applies: a missing field, a value outside the ladder (never guessed at), or
+// one that already satisfies both constraints.
+func downgradeReasoningEffort(body []byte, maxEffort string, allowed []string) ([]byte, string) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, ""
 	}
 	raw, ok := payload["reasoning_effort"]
+	var nested map[string]json.RawMessage
 	if !ok {
-		return nil, ""
+		if json.Unmarshal(payload["reasoning"], &nested) != nil {
+			return nil, ""
+		}
+		raw, ok = nested["effort"]
+		if !ok {
+			return nil, ""
+		}
 	}
 	var effort string
 	if err := json.Unmarshal(raw, &effort); err != nil {
@@ -84,29 +183,42 @@ func downgradeReasoningEffort(body []byte, maxEffort string) ([]byte, string) {
 	}
 	effort = strings.ToLower(strings.TrimSpace(effort))
 	maxEffort = strings.ToLower(strings.TrimSpace(maxEffort))
-	if effort == "" || maxEffort == "" || effort == maxEffort {
+	if effort == "" || reasoningEffortIndex(effort) < 0 {
 		return nil, ""
 	}
-	effortIndex, maxIndex := -1, -1
-	for i, level := range reasoningEffortLevels {
-		if level == effort {
-			effortIndex = i
-		}
-		if level == maxEffort {
-			maxIndex = i
+	target := effort
+	if effort != maxEffort {
+		if maxIndex := reasoningEffortIndex(maxEffort); maxIndex >= 0 && reasoningEffortIndex(effort) > maxIndex {
+			target = maxEffort
 		}
 	}
-	// Unknown values pass through untouched (never guess); already-at/below max
-	// needs no rewrite.
-	if effortIndex < 0 || maxIndex < 0 || effortIndex <= maxIndex {
+	if len(allowed) > 0 && !slices.Contains(allowed, target) {
+		snapped := nearestAcceptedEffort(target, allowed)
+		// `none` is a real rung and the zero-ish case: an empty snap means
+		// nothing accepted sits below the request.
+		if snapped == "" {
+			return nil, ""
+		}
+		target = snapped
+	}
+	if target == effort {
 		return nil, ""
 	}
-	payload["reasoning_effort"] = json.RawMessage(fmt.Sprintf("%q", maxEffort))
+	if nested != nil {
+		nested["effort"] = json.RawMessage(fmt.Sprintf("%q", target))
+		encoded, err := json.Marshal(nested)
+		if err != nil {
+			return nil, ""
+		}
+		payload["reasoning"] = encoded
+	} else {
+		payload["reasoning_effort"] = json.RawMessage(fmt.Sprintf("%q", target))
+	}
 	rewritten, err := json.Marshal(payload)
 	if err != nil {
 		return nil, ""
 	}
-	return rewritten, effort + "→" + maxEffort
+	return rewritten, effort + "→" + target
 }
 
 // injectSystemPrompt prepends a system message to an OpenAI chat/completions

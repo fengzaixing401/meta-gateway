@@ -1,12 +1,15 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/lan/meta-gateway/internal/domain"
+	"github.com/lan/meta-gateway/internal/store"
 )
 
 // maxRouteGroupNameLen caps route member group names (trimmed).
@@ -41,9 +44,13 @@ func (h *AdminHandler) createRoute(w http.ResponseWriter, r *http.Request) {
 	// auto_match_channel_ids is a create-time directive, not route state: it
 	// attaches one member per listed channel that verifiably serves the model,
 	// then disappears. The store intersects the ids with the current match set.
+	// auto_match_mode widens that check from "serves this exact name" to "serves
+	// this name or one of its -sibling variants", rewriting the member's
+	// upstream name to whichever it found.
 	var body struct {
 		domain.Route
 		AutoMatchChannelIDs []int64 `json:"auto_match_channel_ids"`
+		AutoMatchMode       string  `json:"auto_match_mode"`
 	}
 	if err := decodeJSON(w, r, &body, 0, false); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON")
@@ -64,12 +71,16 @@ func (h *AdminHandler) createRoute(w http.ResponseWriter, r *http.Request) {
 	}
 	// Pins are only meaningful on an existing route (members exist first), so
 	// creating a route in single mode without a pin is accepted as auto-fall-back.
-	id, _, err := h.db.CreateRouteWithAutoMatch(&rt, body.AutoMatchChannelIDs)
+	id, _, err := h.db.CreateRouteWithAutoMatch(&rt, body.AutoMatchChannelIDs, store.ParseModelMatchMode(body.AutoMatchMode))
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
 	h.modelsCache.Invalidate()
+	// A model that was just routed should not need a manual catalog sync: the
+	// built-in classifier lands inline and the external indexes are consulted
+	// for this one model in the background. Neither can fail the create.
+	h.bootstrapNewModel(rt.ModelPattern)
 	created, err := h.db.Route.GetByID(id)
 	if err != nil {
 		writeStoreError(w, err)
@@ -80,6 +91,67 @@ func (h *AdminHandler) createRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, created)
+}
+
+// autoMatchRouteMembers attaches the channels that already serve a route's
+// model to one of its member groups. The console previews the candidates (they
+// come from /admin/discovery/model-channels) and posts the ones the operator
+// kept; an empty channel_ids means "every current match", which is the
+// one-click path.
+//
+// The store intersects the request against the live match set, so a stale
+// console selection can only ever attach a channel that really serves the
+// model — the same guard route creation uses.
+func (h *AdminHandler) autoMatchRouteMembers(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r, "id")
+	if !ok {
+		return
+	}
+	rt, err := h.db.Route.GetByID(id)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if rt == nil {
+		writeError(w, http.StatusNotFound, "route not found")
+		return
+	}
+	var body struct {
+		ChannelIDs []int64 `json:"channel_ids"`
+		// Empty is the 'default' group, matching how members are named
+		// everywhere else.
+		GroupName string `json:"group_name"`
+		// Match widens (or keeps) the model check: "related" also accepts the
+		// pattern's -sibling models, and rewrites the upstream name to whatever
+		// the channel actually serves.
+		Match string `json:"match"`
+	}
+	if err := decodeJSON(w, r, &body, 0, false); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	mode := store.ParseModelMatchMode(body.Match)
+	ids := body.ChannelIDs
+	if len(ids) == 0 {
+		matches, err := h.db.ChannelsMatchingModel(rt.ModelPattern, mode)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		ids = make([]int64, 0, len(matches))
+		for _, match := range matches {
+			ids = append(ids, match.ChannelID)
+		}
+	}
+	added, skipped, err := h.db.AttachChannelsToRoute(id, rt.ModelPattern, mode, ids, body.GroupName)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if added > 0 {
+		h.modelsCache.Invalidate()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"added": added, "skipped": skipped})
 }
 
 func (h *AdminHandler) getRoute(w http.ResponseWriter, r *http.Request) {
@@ -184,12 +256,32 @@ func (h *AdminHandler) createRouteMember(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	rm.RouteID = routeID
+	if rm.ChannelID <= 0 {
+		writeError(w, http.StatusBadRequest, "channel_id is required")
+		return
+	}
+	channel, err := h.db.Channel.GetByID(rm.ChannelID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if channel == nil {
+		// Without this the insert hits the foreign key and surfaces as an opaque
+		// 500, which reads like a database fault rather than the stale or
+		// missing channel id it actually is.
+		writeError(w, http.StatusBadRequest, "unknown channel")
+		return
+	}
 	if rm.Weight < 0 {
 		writeError(w, http.StatusBadRequest, "weight must be non-negative")
 		return
 	}
 	if _, ok := validateRouteGroup(rm.GroupName); !ok {
 		writeError(w, http.StatusBadRequest, "group name too long")
+		return
+	}
+	if err := validateMemberPricing(&rm); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	id, err := h.db.RouteMember.Create(&rm)
@@ -214,28 +306,61 @@ func (h *AdminHandler) updateRouteMember(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	var rm domain.RouteMember
-	if err := decodeJSON(w, r, &rm, 0, false); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-	rm.ID = id
-	if rm.Weight < 0 {
-		writeError(w, http.StatusBadRequest, "weight must be non-negative")
-		return
-	}
-	if _, ok := validateRouteGroup(rm.GroupName); !ok {
-		writeError(w, http.StatusBadRequest, "group name too long")
-		return
-	}
-	if err := h.db.RouteMember.Update(&rm); err != nil {
+	existing, err := h.db.RouteMember.GetByID(id)
+	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	// The PUT came from an operator action, so record the intent: this is what
-	// keeps a probe-disabled flag from surviving a manual toggle and a manual
-	// disable from being resurrected by automatic recovery.
-	if err := h.db.RouteMember.ApplyManualIntent(id, rm.Enabled); err != nil {
+	if existing == nil {
+		writeError(w, 404, "route member not found")
+		return
+	}
+	var raw json.RawMessage
+	if err := decodeJSON(w, r, &raw, 0, false); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	var input map[string]json.RawMessage
+	rm := *existing
+	if err := json.Unmarshal(raw, &input); err != nil || input == nil {
+		writeError(w, 400, "JSON object required")
+		return
+	}
+	if err := json.Unmarshal(raw, &rm); err != nil {
+		writeError(w, 400, "invalid member fields")
+		return
+	}
+	fields := map[string]bool{}
+	for name, value := range input {
+		if strings.TrimSpace(string(value)) != "null" {
+			fields[name] = true
+		}
+	}
+	rm.ID = id
+	if fields["weight"] && rm.Weight < 0 {
+		writeError(w, http.StatusBadRequest, "weight must be non-negative")
+		return
+	}
+	if _, ok := validateRouteGroup(rm.GroupName); fields["group_name"] && !ok {
+		writeError(w, http.StatusBadRequest, "group name too long")
+		return
+	}
+	if fields["price_tiers"] || fields["price_schedule"] || fields["price_prompt_per_1k"] || fields["price_completion_per_1k"] || fields["price_cache_per_1k"] || fields["price_per_request"] {
+		rule, err := h.db.BillingRule("member", strconv.FormatInt(id, 10))
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		if rule != nil {
+			writeError(w, 409, "versioned billing rule exists; use /admin/billing-rule")
+			return
+		}
+		if err := validateMemberPricing(&rm); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+	}
+	if err := h.db.RouteMember.PatchConfiguration(&rm, fields); err != nil {
 		writeStoreError(w, err)
 		return
 	}

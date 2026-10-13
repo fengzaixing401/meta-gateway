@@ -32,7 +32,7 @@ func memberByChannel(t *testing.T, db *store.DB, channelID int64) *domain.RouteM
 // own disables, so excluding enabled=0 pairs here would make every
 // auto-disable permanent.
 func TestCandidatePairsKeepsProbeDisabledPairsReachable(t *testing.T) {
-	db, err := store.Open(t.TempDir())
+	db, err := store.OpenTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestCandidatePairsKeepsProbeDisabledPairsReachable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("candidate pairs: %v", err)
 	}
-	if len(pairs) != 1 || pairs[0] != (Pair{ChannelID: chID, Model: "m1"}) {
+	if len(pairs) != 1 || pairs[0].ChannelID != chID || pairs[0].Model != "m1" || pairs[0].MemberID <= 0 {
 		t.Fatalf("pairs = %+v, want the auto-disabled pair to stay probeable", pairs)
 	}
 
@@ -74,7 +74,7 @@ func TestCandidatePairsKeepsProbeDisabledPairsReachable(t *testing.T) {
 // A member an operator disabled by hand stays out of the probe's scope: probes
 // answer to the operator, they do not second-guess them.
 func TestCandidatePairsExcludesManuallyDisabledMembers(t *testing.T) {
-	db, err := store.Open(t.TempDir())
+	db, err := store.OpenTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

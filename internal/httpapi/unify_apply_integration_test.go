@@ -20,7 +20,7 @@ import (
 // un-adopted models are dropped, and a group left with nothing is skipped
 // instead of minting an empty alias route.
 func TestUnifyApplySkipsUnadoptedVariants(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir()))
+	db, err := store.OpenTest(filepath.Join(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +29,7 @@ func TestUnifyApplySkipsUnadoptedVariants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := httpapi.New(&config.Config{
+	handler := httpapi.NewTestRouter(t, &config.Config{
 		AdminToken:  "admin-secret",
 		AdminTokens: []string{"admin-secret"},
 	}, db, enc)

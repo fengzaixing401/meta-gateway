@@ -23,12 +23,15 @@ type BalanceAccount interface {
 // the balance-history, decision-snapshot and health-history tables on the
 // same cadence.
 type BalanceSweeper struct {
-	account               BalanceAccount
-	db                    *store.DB
-	balanceRetentionDays  int
-	decisionRetentionDays int
-	healthRetentionDays   int
-	logger                *slog.Logger
+	account                   BalanceAccount
+	db                        *store.DB
+	balanceRetentionDays      int
+	decisionRetentionDays     int
+	healthRetentionDays       int
+	modelChangeRetentionDays  int
+	modelChangeAutoIgnoreDays int
+	siteProbeRetentionDays    int
+	logger                    *slog.Logger
 
 	lifecycleMu sync.Mutex
 	started     bool
@@ -44,25 +47,28 @@ type RetentionConfig struct {
 	BalanceHistoryDays   int
 	DecisionSnapshotDays int
 	HealthHistoryDays    int
+	// ModelChangeDays bounds finished model_changes rows (0 disables).
+	ModelChangeDays int
+	// ModelChangeAutoIgnoreDays auto-ignores pending removals with no route
+	// impact after that many days (0 = off — the operator decides).
+	ModelChangeAutoIgnoreDays int
+	// SiteProbeDays bounds the external site-probe rounds and their samples.
+	// This is the highest-volume pruner: one row per monitored model per site
+	// per round (every 15 minutes), so a mid-sized install writes hundreds of
+	// rows on each pass.
+	SiteProbeDays int
 }
 
 const (
 	DefaultBalanceHistoryRetentionDays   = 90
 	DefaultDecisionSnapshotRetentionDays = 7
 	DefaultHealthHistoryRetentionDays    = 90
+	DefaultModelChangeRetentionDays      = 90
+	// DefaultSiteProbeRetentionDays is a week: the verdict only needs the last
+	// couple of rounds, and the model page shows recent readings rather than a
+	// chart. Raise it deliberately before anyone builds a trend view on top.
+	DefaultSiteProbeRetentionDays = 7
 )
-
-// NewBalanceSweeper preserves the historical constructor defaults.
-func NewBalanceSweeper(account BalanceAccount, db *store.DB, healthRetentionDays int, logger *slog.Logger) *BalanceSweeper {
-	if healthRetentionDays <= 0 {
-		healthRetentionDays = DefaultHealthHistoryRetentionDays
-	}
-	return NewBalanceSweeperWithRetention(account, db, RetentionConfig{
-		BalanceHistoryDays:   DefaultBalanceHistoryRetentionDays,
-		DecisionSnapshotDays: DefaultDecisionSnapshotRetentionDays,
-		HealthHistoryDays:    healthRetentionDays,
-	}, logger)
-}
 
 // NewBalanceSweeperWithRetention builds a sweep with independently configured
 // retention windows. It is used by the application config path so a zero
@@ -77,17 +83,26 @@ func NewBalanceSweeperWithRetention(account BalanceAccount, db *store.DB, retent
 	if retention.HealthHistoryDays < 0 {
 		retention.HealthHistoryDays = DefaultHealthHistoryRetentionDays
 	}
+	if retention.ModelChangeDays < 0 {
+		retention.ModelChangeDays = DefaultModelChangeRetentionDays
+	}
+	if retention.SiteProbeDays < 0 {
+		retention.SiteProbeDays = DefaultSiteProbeRetentionDays
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &BalanceSweeper{
-		account:               account,
-		db:                    db,
-		balanceRetentionDays:  retention.BalanceHistoryDays,
-		decisionRetentionDays: retention.DecisionSnapshotDays,
-		healthRetentionDays:   retention.HealthHistoryDays,
-		logger:                logger,
-		done:                  make(chan struct{}),
+		account:                   account,
+		db:                        db,
+		balanceRetentionDays:      retention.BalanceHistoryDays,
+		decisionRetentionDays:     retention.DecisionSnapshotDays,
+		healthRetentionDays:       retention.HealthHistoryDays,
+		modelChangeRetentionDays:  retention.ModelChangeDays,
+		modelChangeAutoIgnoreDays: retention.ModelChangeAutoIgnoreDays,
+		siteProbeRetentionDays:    retention.SiteProbeDays,
+		logger:                    logger,
+		done:                      make(chan struct{}),
 	}
 }
 
@@ -176,8 +191,33 @@ func (s *BalanceSweeper) run(parent context.Context) {
 		return
 	}
 	if s.healthRetentionDays > 0 {
+		if err := s.db.PruneRouteOutcomes(s.healthRetentionDays); err != nil {
+			s.logger.Warn("availability outcomes prune failed", "error", err)
+		}
 		if _, err := s.db.HealthHistory.Prune(time.Now().AddDate(0, 0, -s.healthRetentionDays)); err != nil {
 			s.logger.Warn("health history prune failed", "error", err)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	if s.modelChangeRetentionDays > 0 {
+		if _, err := s.db.PruneModelChanges(s.modelChangeRetentionDays); err != nil {
+			s.logger.Warn("model change prune failed", "error", err)
+		}
+	}
+	if s.modelChangeAutoIgnoreDays > 0 {
+		if _, err := s.db.AutoIgnoreHarmlessModelChanges(s.modelChangeAutoIgnoreDays); err != nil {
+			s.logger.Warn("model change auto-ignore failed", "error", err)
+		}
+	}
+	if s.siteProbeRetentionDays > 0 {
+		if _, _, err := s.db.PruneSiteProbe(s.siteProbeRetentionDays); err != nil {
+			s.logger.Warn("site probe prune failed", "error", err)
+		}
+	}
+	// Adopted additions resolved their own reminder; always run, no knob.
+	if _, err := s.db.ResolveAdoptedModelChanges(); err != nil {
+		s.logger.Warn("model change adopt-resolve failed", "error", err)
 	}
 }

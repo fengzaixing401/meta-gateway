@@ -1,5 +1,9 @@
-import { AlertTriangle, Info, LoaderCircle, X } from "lucide-react";
+import { AlertTriangle, ChevronDown, Info, LoaderCircle, X } from "lucide-react";
 import {
+  cloneElement,
+  createContext,
+  isValidElement,
+  useContext,
   useCallback,
   useEffect,
   useId,
@@ -11,26 +15,40 @@ import {
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 import { formatErrorObject } from "../formatError";
-import { registerOverlay } from "./overlayStack";
+import { useModalFocus } from "./overlayFocus";
+
+const PageActionHost = createContext<HTMLElement | null>(null);
+
+/** Lets a page's data-owning child place actions in its shared page header. */
+export function PageActions({ children }: { children: ReactNode }) {
+  const host = useContext(PageActionHost);
+  return host ? createPortal(children, host) : null;
+}
 
 export function Button({
   children,
   variant = "primary",
   icon,
   className,
+  type = "button",
+  loading = false,
+  disabled,
   ...props
 }: React.ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: "primary" | "secondary" | "danger" | "quiet";
   icon?: ReactNode;
+  loading?: boolean;
+  ref?: React.Ref<HTMLButtonElement>;
 }) {
   return (
     <button
-      className={[`button button-${variant}`, className]
-        .filter(Boolean)
-        .join(" ")}
+      type={type}
+      disabled={disabled || loading}
+      aria-busy={loading || undefined}
+      className={[`button button-${variant}`, className].filter(Boolean).join(" ")}
       {...props}
     >
-      {icon}
+      {loading ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : icon}
       {children}
     </button>
   );
@@ -40,6 +58,7 @@ export function IconButton({
   label,
   children,
   className,
+  type = "button",
   ...props
 }: React.ButtonHTMLAttributes<HTMLButtonElement> & {
   label: string;
@@ -48,6 +67,7 @@ export function IconButton({
 }) {
   return (
     <button
+      type={type}
       className={["icon-button", className].filter(Boolean).join(" ")}
       aria-label={label}
       title={label}
@@ -59,30 +79,58 @@ export function IconButton({
 }
 
 export function Page({
+  as: Tag = "main",
   title,
   description,
   actions,
   children,
+  className = "",
 }: {
+  as?: "main" | "section";
   title: string;
   description: string;
   actions?: ReactNode;
-  /** @deprecated Kicker eyebrows are banned on this surface; kept for call-site compat. */
-  kicker?: string;
+  className?: string;
   children: ReactNode;
 }) {
+  const [actionHost, setActionHost] = useState<HTMLDivElement | null>(null);
   return (
-    <main className="page">
-      <header className="page-header">
-        <div className="page-heading">
-          <h1>{title}</h1>
-          <p>{description}</p>
-        </div>
-        {actions && <div className="toolbar">{actions}</div>}
-      </header>
-      {children}
-    </main>
+    <PageActionHost.Provider value={actionHost}>
+      <Tag className={`page ${className}`.trim()}>
+        <header className="page-header">
+          <div className="page-heading">
+            <h1>{title}</h1>
+            <p>{description}</p>
+          </div>
+          <div className="toolbar page-actions" ref={setActionHost}>
+            {actions}
+          </div>
+        </header>
+        {children}
+      </Tag>
+    </PageActionHost.Provider>
   );
+}
+
+// Collapsible-panel state is tab scoped: the sidebar navigates away and back,
+// and a panel the operator folded should stay folded for that session.
+function readPanelOpen(storageKey: string | undefined, fallback: boolean) {
+  if (!storageKey) return fallback;
+  try {
+    const raw = sessionStorage.getItem(`panel.${storageKey}`);
+    return raw == null ? fallback : raw === "1";
+  } catch {
+    return fallback;
+  }
+}
+
+function storePanelOpen(storageKey: string | undefined, open: boolean) {
+  if (!storageKey) return;
+  try {
+    sessionStorage.setItem(`panel.${storageKey}`, open ? "1" : "0");
+  } catch {
+    // Storage may be disabled; keep the state for this render tree only.
+  }
 }
 
 export function Panel({
@@ -92,6 +140,11 @@ export function Panel({
   children,
   className = "",
   id,
+  collapsible = false,
+  defaultOpen = true,
+  storageKey,
+  summary,
+  lede,
 }: {
   title?: string;
   titleHelp?: string;
@@ -100,21 +153,75 @@ export function Panel({
   className?: string;
   /** Optional DOM id (used by in-page section navigation). */
   id?: string;
+  /** Turn the header into a disclosure toggle so the body can fold away. */
+  collapsible?: boolean;
+  /** Starting body visibility; ignored once the operator has toggled it. */
+  defaultOpen?: boolean;
+  /** sessionStorage key that remembers the folded state across navigation. */
+  storageKey?: string;
+  /** Compact readout shown beside the title while the body is folded. */
+  summary?: ReactNode;
+  /**
+   * One short line in the body saying what this panel is for. A lede is read at a
+   * glance; a paragraph is skipped, and two paragraphs of explanation stacked in
+   * one card is how a page starts looking like documentation.
+   */
+  lede?: string;
 }) {
+  const { t } = useI18n();
+  const bodyId = useId();
+  const [open, setOpen] = useState(() => readPanelOpen(storageKey, defaultOpen));
+  const folded = collapsible && !open;
+  const toggle = () => {
+    setOpen((prev) => {
+      storePanelOpen(storageKey, !prev);
+      return !prev;
+    });
+  };
   return (
-    <section id={id} className={`panel ${className}`.trim()}>
+    <section id={id} className={`panel ${className}${folded ? " is-collapsed" : ""}`.trim()}>
       {(title || actions) && (
         <header className="panel-header">
           {title ? (
             <div className="panel-title">
-              <h2>{title}</h2>
+              {collapsible ? (
+                <button
+                  type="button"
+                  className="panel-toggle"
+                  aria-expanded={open}
+                  aria-controls={bodyId}
+                  title={open ? t("common.collapse") : t("common.expand")}
+                  onClick={toggle}
+                >
+                  <ChevronDown size={14} className="panel-toggle-icon" aria-hidden="true" />
+                  <h2>{title}</h2>
+                </button>
+              ) : (
+                <h2>{title}</h2>
+              )}
+              {/* Panel-level help stays behind the (i): it is mechanics (an env
+                  variable, what a container rebuild does), it applies whether or
+                  not you are reading this card right now, and as a paragraph it
+                  competes with the controls it is supposed to stay out of the way
+                  of. Field-level hints are the opposite case and stay visible. */}
               {titleHelp ? <InfoTip label={titleHelp} /> : null}
+              {folded && summary ? <span className="panel-summary">{summary}</span> : null}
             </div>
           ) : null}
           <div className="toolbar">{actions}</div>
         </header>
       )}
-      {children}
+      {collapsible ? (
+        <div className="panel-body" id={bodyId} hidden={folded}>
+          {lede ? <p className="panel-lede muted">{lede}</p> : null}
+          {children}
+        </div>
+      ) : (
+        <>
+          {lede ? <p className="panel-lede muted">{lede}</p> : null}
+          {children}
+        </>
+      )}
     </section>
   );
 }
@@ -125,83 +232,60 @@ export function Dialog({
   onClose,
   actions,
   danger = false,
+  busy = false,
 }: {
   title: string;
   children: ReactNode;
   onClose: () => void;
   actions?: ReactNode;
   danger?: boolean;
+  busy?: boolean;
 }) {
   const { t } = useI18n();
   const titleId = useId();
   const dialogRef = useRef<HTMLElement | null>(null);
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
-  useEffect(() => {
-    const node = dialogRef.current;
-    const previous =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
-    const focusables = () =>
-      Array.from(
-        node?.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-        ) ?? [],
-      );
-    // Move focus into the dialog on open so keyboard users land inside.
-    const first = focusables()[0];
-    (first ?? node)?.focus();
-    const onKeydown = (e: KeyboardEvent) => {
-      if (e.key !== "Tab" || !node) return;
-      const items = focusables();
-      if (items.length === 0) return;
-      const firstItem = items[0];
-      const lastItem = items[items.length - 1];
-      const active = document.activeElement;
-      if (e.shiftKey && (active === firstItem || active === node)) {
-        e.preventDefault();
-        lastItem?.focus();
-      } else if (!e.shiftKey && active === lastItem) {
-        e.preventDefault();
-        firstItem?.focus();
-      }
-    };
-    const unregister = registerOverlay(() => onCloseRef.current());
-    window.addEventListener("keydown", onKeydown);
-    return () => {
-      unregister();
-      window.removeEventListener("keydown", onKeydown);
-      previous?.focus();
-    };
-    // Mount-only: onClose is tracked via ref so re-renders do not steal focus.
-  }, []);
+  const close = () => {
+    if (!busy) onClose();
+  };
+  useModalFocus(dialogRef, close);
   // Portal to document.body so fixed backdrop is not clipped by Panel/content
   // overflow:hidden or filtered/transformed ancestors (common after ops shell restyle).
   return createPortal(
     <div
       className="dialog-backdrop"
       role="presentation"
-      onMouseDown={(e) => e.target === e.currentTarget && onClose()}
+      onMouseDown={(e) => e.target === e.currentTarget && close()}
     >
       <section
         ref={dialogRef}
+        tabIndex={-1}
         className="dialog"
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
+        aria-busy={busy || undefined}
       >
         <header>
           <div className={danger ? "danger-title" : ""}>
             {danger && <AlertTriangle size={18} />}
             <h2 id={titleId}>{title}</h2>
           </div>
-          <IconButton label={t("common.close")} onClick={onClose}>
+          <IconButton label={t("common.close")} onClick={close} disabled={busy}>
             <X size={18} />
           </IconButton>
         </header>
-        <div className="dialog-body">{children}</div>
-        {actions && <footer>{actions}</footer>}
+        <div className="dialog-body">
+          <fieldset className="overlay-fields" disabled={busy}>
+            {children}
+          </fieldset>
+        </div>
+        {actions && (
+          <footer>
+            <fieldset className="overlay-actions" disabled={busy}>
+              {actions}
+            </fieldset>
+          </footer>
+        )}
       </section>
     </div>,
     document.body,
@@ -231,15 +315,14 @@ export function ConfirmDialog({
       title={title}
       onClose={onClose}
       danger
+      busy={pending}
       actions={
         <>
-          <Button variant="secondary" onClick={onClose}>
+          <Button variant="secondary" onClick={onClose} disabled={pending}>
             {t("common.cancel")}
           </Button>
-          <Button variant="danger" disabled={pending} onClick={onConfirm}>
-            {pending
-              ? t("common.working")
-              : (confirmLabel ?? t("common.delete"))}
+          <Button variant="danger" loading={pending} onClick={onConfirm}>
+            {pending ? t("common.working") : (confirmLabel ?? t("common.delete"))}
           </Button>
         </>
       }
@@ -308,17 +391,11 @@ export function InfoTip({ label }: { label: string }) {
     const chosen = candidates.find(fits) ?? candidates[2]!;
     const left = Math.max(
       padding,
-      Math.min(
-        chosen.left,
-        window.innerWidth - bubbleRect.width - padding,
-      ),
+      Math.min(chosen.left, window.innerWidth - bubbleRect.width - padding),
     );
     const top = Math.max(
       padding,
-      Math.min(
-        chosen.top,
-        window.innerHeight - bubbleRect.height - padding,
-      ),
+      Math.min(chosen.top, window.innerHeight - bubbleRect.height - padding),
     );
     setPosition({ top, left, placement: chosen.placement });
   }, []);
@@ -343,12 +420,14 @@ export function InfoTip({ label }: { label: string }) {
   useEffect(() => {
     if (!open) return;
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
       setHovered(false);
       setFocused(false);
     };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
+    window.addEventListener("keydown", closeOnEscape, true);
+    return () => window.removeEventListener("keydown", closeOnEscape, true);
   }, [open]);
 
   const bubble =
@@ -360,11 +439,7 @@ export function InfoTip({ label }: { label: string }) {
             className="info-tip-bubble"
             data-placement={position?.placement ?? "below"}
             data-visible={position ? "true" : "false"}
-            style={
-              position
-                ? { top: position.top, left: position.left }
-                : { top: 0, left: 0 }
-            }
+            style={position ? { top: position.top, left: position.left } : { top: 0, left: 0 }}
             role="tooltip"
           >
             {label}
@@ -398,36 +473,66 @@ export function Field({
   label,
   children,
   hint,
+  error,
+  required,
   className,
 }: {
   label: string;
   children: ReactNode;
   hint?: string;
+  /** Shown under the control when the value fails validation. Announced. */
+  error?: string;
+  required?: boolean;
   className?: string;
 }) {
+  const errorId = useId();
+  // Every hint rides in the (i) beside the label. A paragraph under the control
+  // pushed the form down and competed with the thing it explained, and splitting
+  // hints into "short enough to show" and "long enough to hide" made two fields
+  // side by side look like different kinds of field. One rule, one look:
+  // the label names the control, the (i) explains it. The tip carries the text as
+  // its accessible name, so it is still announced and still keyboard-reachable.
+  // A message about the current *state* (loading, nothing found yet, an error) is
+  // not a field explanation and stays on screen where it can be seen.
+  const described = [error ? errorId : null].filter(Boolean).join(" ");
+  const describedChild =
+    isValidElement<Record<string, unknown>>(children) && children.type !== "label"
+      ? cloneElement(children, {
+          "aria-describedby": described || undefined,
+          "aria-invalid": error ? true : undefined,
+          "aria-required": required ? true : undefined,
+        })
+      : children;
   return (
-    <label className={["field", className].filter(Boolean).join(" ")}>
-      <span className="field-label">
-        <span>{label}</span>
-        {hint ? <InfoTip label={hint} /> : null}
-      </span>
-      {children}
-    </label>
+    <div className={["field", error ? "is-invalid" : null, className].filter(Boolean).join(" ")}>
+      {/* The label wraps the control so clicking its name still focuses the field.
+          The hint is the (i) in this row, not a paragraph below it. */}
+      <label className="field-label-wrap">
+        <span className="field-label">
+          <span>{label}</span>
+          {required ? (
+            <span className="field-required" aria-hidden="true">
+              *
+            </span>
+          ) : null}
+          {hint ? <InfoTip label={hint} /> : null}
+        </span>
+        {describedChild}
+      </label>
+      {error ? (
+        <span className="field-error" id={errorId} role="alert">
+          {error}
+        </span>
+      ) : null}
+    </div>
   );
 }
 
 export function StatusBadge({ value }: { value: string | boolean }) {
   const { status } = useI18n();
-  const raw =
-    typeof value === "boolean"
-      ? value
-        ? "enabled"
-        : "disabled"
-      : String(value);
+  const raw = typeof value === "boolean" ? (value ? "enabled" : "disabled") : String(value);
   return (
-    <span className={`badge badge-${raw.toLowerCase().replaceAll("_", "-")}`}>
-      {status(value)}
-    </span>
+    <span className={`badge badge-${raw.toLowerCase().replaceAll("_", "-")}`}>{status(value)}</span>
   );
 }
 
@@ -443,34 +548,23 @@ export function Loading() {
 
 export function Empty({ children }: { children?: ReactNode }) {
   const { t } = useI18n();
-  return (
-    <div className="state state-empty">{children ?? t("common.empty")}</div>
-  );
+  return <div className="state state-empty">{children ?? t("common.empty")}</div>;
 }
 
-export function ErrorState({
-  error,
-  retry,
-}: {
-  error: unknown;
-  retry?: () => void;
-}) {
+export function ErrorState({ error, retry }: { error: unknown; retry?: () => void }) {
   const { t } = useI18n();
   const formatted = formatErrorObject(error, t);
   const cause =
-    formatted.cause.trim().toLocaleLowerCase() ===
-    formatted.title.trim().toLocaleLowerCase()
+    formatted.cause.trim().toLocaleLowerCase() === formatted.title.trim().toLocaleLowerCase()
       ? ""
       : formatted.cause;
   return (
-    <div className="state state-error">
+    <div className="state state-error" role="alert">
       <AlertTriangle size={18} />
       <div className="error-state-body">
         <strong>{formatted.title}</strong>
         {cause ? <span>{cause}</span> : null}
-        {formatted.fix ? (
-          <span className="error-state-fix">{formatted.fix}</span>
-        ) : null}
+        {formatted.fix ? <span className="error-state-fix">{formatted.fix}</span> : null}
       </div>
       {retry && (
         <Button variant="secondary" onClick={retry}>
@@ -486,18 +580,18 @@ export function DataTable({
   children,
   empty,
 }: {
-  headers: string[];
+  headers: ReactNode[];
   children: ReactNode;
   empty?: boolean;
 }) {
   if (empty) return <Empty />;
-	return (
-		<div className="table-wrap" data-columns={headers.length}>
+  return (
+    <div className="table-wrap" data-columns={headers.length}>
       <table>
         <thead>
           <tr>
-            {headers.map((h) => (
-              <th key={h}>{h}</th>
+            {headers.map((h, index) => (
+              <th key={index}>{h}</th>
             ))}
           </tr>
         </thead>
@@ -566,9 +660,7 @@ export function formatDate(value?: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   const lang =
-    typeof document !== "undefined"
-      ? document.documentElement.lang || undefined
-      : undefined;
+    typeof document !== "undefined" ? document.documentElement.lang || undefined : undefined;
   return new Intl.DateTimeFormat(lang, {
     dateStyle: "medium",
     timeStyle: "short",

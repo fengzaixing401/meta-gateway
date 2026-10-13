@@ -1,10 +1,12 @@
+import type { PriceQuote, QuoteUnit } from "../features/models/pricingTypes";
+
 type Status = "enabled" | "disabled" | "auto_disabled";
 
-type ChannelHealthState =
-  "disabled" | "unhealthy" | "degraded" | "healthy" | "unknown";
+type ChannelHealthState = "disabled" | "unhealthy" | "degraded" | "healthy" | "unknown";
 type ChannelConnectivityState = "unknown" | "reachable" | "unreachable";
-type ChannelAccountState =
-  "unknown" | "ok" | "invalid" | "banned" | "rate_limited" | "failed";
+type ChannelAccountState = "unknown" | "ok" | "invalid" | "banned" | "rate_limited" | "failed";
+
+export type SiteProbeSourceKind = "uptime_kuma" | "newapi" | "sub2api_transit" | "";
 
 export interface Site {
   id: number;
@@ -14,6 +16,18 @@ export interface Site {
   status: Status;
   created_at: string;
   updated_at: string;
+  /** External probe source: the site's own public probe data. */
+  probe_source_kind?: SiteProbeSourceKind;
+  probe_source_url?: string;
+  /** Derive the source from the platform (no hand-typed URL needed). */
+  probe_auto?: boolean;
+  probe_source_config?: string;
+  probe_source_enabled: boolean;
+  probe_last_run_at?: string;
+  probe_last_error?: string;
+  /** How automated calls (probes, keep-alive) may look on this site. Their
+   *  channels inherit it unless they carry a policy of their own. */
+  call_policy?: "" | "allow_probe" | "real_calls_only";
 }
 export interface Credential {
   id: number;
@@ -25,9 +39,16 @@ export interface Credential {
   meta_json?: string;
   status: Status;
   checkin_enabled: boolean;
-models_csv?: string;
+  models_csv?: string;
   /** Distinct models this key listed in the latest discovery snapshot (-1 = none yet). */
   model_count?: number;
+  /** The model names behind model_count; empty when the key has no snapshot yet. */
+  models?: string[];
+  /**
+   * Pool tier inside the site relay pool: higher goes first, keys sharing a
+   * tier rotate. -10 = backup, 0 = balanced (default), 10 = preferred.
+   */
+  priority?: number;
   created_at?: string;
 }
 export interface Channel {
@@ -45,13 +66,37 @@ export interface Channel {
   max_reasoning_effort?: string;
   payload_rules?: string;
   max_concurrent?: number;
+  non_stream_timeout_seconds?: number;
+  stream_policy?: "" | "force_stream" | "force_non_stream";
   proxy_url?: string;
   header_override?: string;
   system_prompt?: string;
   retry_config?: string;
   model_sync_mode?: "auto" | "manual";
+  /** Replaces the endpoint path outright, e.g. "chat/completions" → "systemone". */
+  upstream_path_override?: string;
+  /** JSON object {"<openai path>":"<upstream path>"}; keys may end in "*", values may use {path} / {model}. */
+  upstream_path_map?: string;
+  /** JSON array of field maps applied to the outbound body. */
+  upstream_request_map?: string;
+  /** JSON array of field maps applied to the inbound body. */
+  upstream_response_map?: string;
   stable_first?: boolean;
   stable_first_requests?: number;
+  /** How automated calls (model probes, keep-alive) may look on this site's
+   *  channels. "" = inherit the site's policy; see site.call_policy. */
+  call_policy?: "" | "allow_probe" | "real_calls_only";
+  /** Cumulative spend ceiling for this account (0 = no limit). Reaching it parks
+   *  the channel instead of failing it: the operator's own budget came due. */
+  usage_limit_cost?: number;
+  /** Cumulative token ceiling for this account (0 = no limit). */
+  usage_limit_tokens?: number;
+  /** What the account has spent / consumed so far, per the ledger. */
+  usage_used_cost?: number;
+  usage_used_tokens?: number;
+  /** Which limit came due ("cost" | "tokens" | "cost,tokens"); empty = not parked. */
+  usage_limit_hit?: string;
+  usage_limit_hit_at?: string;
   created_at: string;
   updated_at: string;
 }
@@ -123,10 +168,20 @@ export interface Route {
   stable_first_promote_requests?: number | null;
   stable_first_requests?: number;
   model_group?: string;
+  image_edit_shim?: boolean;
+  /**
+   * Session affinity for this model: `null`/undefined = inherit the global
+   * setting, `true` = always bind a conversation to the channel that served it
+   * (prompt cache, multi-turn continuity), `false` = never bind, so requests
+   * spread across the pool.
+   */
+  sticky_session?: boolean | null;
   created_at: string;
   updated_at: string;
 }
 export interface RouteMember {
+  /** Set by automatic probing; distinct from an operator's manual disable. */
+  auto_disabled?: boolean;
   id: number;
   route_id: number;
   channel_id: number;
@@ -142,37 +197,120 @@ export interface RouteMember {
   last_error?: string;
   created_at: string;
   updated_at: string;
+  /** Self-set unit prices per 1k tokens (0 = fall to the model price). */
+  price_prompt_per_1k?: number;
+  price_completion_per_1k?: number;
+  price_cache_per_1k?: number;
+  /** Flat charge per call, for upstreams that bill by call. */
+  price_per_request?: number;
+  /** Context-length ladder and time-of-day windows, as the API carries them:
+   *  JSON text, empty when unset. See api/pricingText.ts for the helpers. */
+  price_tiers?: string;
+  price_schedule?: string;
+  // Who wrote this member's billing price: "manual" (operator) or "site"
+  // (adopted from the site's own price table), plus when it last changed.
+  price_source?: string;
+  price_updated_at?: string;
+}
+
+/**
+ * One rung of a context-length ladder. The rungs apply in ascending ceiling
+ * order and the first one the request fits under prices it; a ceiling of 0 is
+ * the open-ended rung.
+ */
+export interface PriceTier {
+  max_prompt_tokens: number;
+  prompt: number;
+  completion: number;
+  cache: number;
+  per_request: number;
+}
+
+/** A recurring window whose multiplier scales a layer's prices. */
+export interface PriceWindow {
+  /** ISO weekday numbers, 1 = Monday … 7 = Sunday. Empty = every day. */
+  days: number[];
+  /** Hours in the gateway's local time; equal values mean the whole day. */
+  from_hour: number;
+  to_hour: number;
+  multiplier: number;
 }
 export interface DownstreamKey {
+  user_id?: number;
   id: number;
   name: string;
   enabled: boolean;
   scopes?: string;
   quota_total_tokens?: number;
   quota_used_tokens?: number;
-  price_prompt_per_1k?: number;
-  price_completion_per_1k?: number;
-  price_cache_per_1k?: number;
+  /**
+   * Spend budget in the ledger's unit (0 = unlimited). It is enforced beside
+   * the token quota: whichever runs out first refuses the request.
+   */
+  quota_total_cost?: number;
+  quota_used_cost?: number;
   model_allowlist?: string;
   model_denylist?: string;
   expires_at?: string;
   allowed_ips?: string;
   group_name?: string;
   route_group_name?: string;
-  estimated_cost?: number;
+  /** Persisted billing total for this key (sum of usage_records.cost). */
+  cost?: number;
   has_token?: boolean;
+  /**
+   * The token's masked tail (last four characters), for showing which token a
+   * row is without revealing one. Empty when the gateway minted it before the
+   * hint was recorded.
+   */
+  token_hint?: string;
+  /** When this token was last used, if the gateway has seen it. */
+  last_used_at?: string;
   created_at: string;
 }
 export interface CreatedDownstreamKey extends DownstreamKey {
   token: string;
 }
+/** Writable key fields shared by the editor, data source and API client. */
+export type KeyUpdateInput = {
+  name?: string;
+  enabled?: boolean;
+  scopes?: string;
+  quota_total_tokens?: number;
+  quota_total_cost?: number;
+  model_allowlist?: string;
+  model_denylist?: string;
+  expires_at?: string;
+  allowed_ips?: string;
+  route_group_name?: string;
+  group_name?: string;
+  reset_used?: boolean;
+};
+
+export type KeyCreateInput = Omit<KeyUpdateInput, "enabled" | "reset_used"> & {
+  name: string;
+  token?: string;
+};
 export interface UsageSummary {
   request_count: number;
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  /** Cache tokens inside the same window (added in v3.1). */
+  cache_read_tokens?: number;
+  cache_creation_tokens?: number;
+  /** Status breakdown inside the same window (added in v3.1). */
+  ok_count?: number;
+  client_error_count?: number;
+  server_error_count?: number;
+  other_count?: number;
   /** Persisted billing amount for the selected window (or all time). */
   cost: number;
+  /**
+   * Mean latency of the successful calls in the same window, in milliseconds.
+   * Zero when nothing succeeded (read ok_count to tell that from a 0 ms answer).
+   */
+  avg_latency_ms?: number;
   /** Legacy field returned by older gateways. */
   estimated_cost?: number;
 }
@@ -194,6 +332,84 @@ export interface UsageRecord {
   cost?: number;
   created_at: string;
 }
+/**
+ * Fixed-width usage time series. Buckets are epoch-aligned: index i covers
+ * `since + i * bucket_seconds`. Labels are formatted client-side so they land
+ * in the viewer's timezone.
+ */
+export interface UsageSeries {
+  since: string;
+  until: string;
+  bucket_seconds: number;
+  requests: number[];
+  failed: number[];
+  tokens: number[];
+  prompt_tokens: number[];
+  completion_tokens: number[];
+  cache_read_tokens: number[];
+  cache_creation_tokens: number[];
+  cost: number[];
+}
+/** One row of the per-model usage ranking (aggregated in SQL). */
+export interface ModelUsage {
+  model: string;
+  requests: number;
+  total_tokens: number;
+  cost: number;
+  failed: number;
+}
+/** Latency distribution over a sample of relay logs. */
+export interface LatencyHistogram {
+  buckets: number[];
+  total: number;
+  slow_count: number;
+  p50_ms: number;
+  p95_ms: number;
+  p99_ms: number;
+  /** Rows the window held before the newest-first sample cut it down. */
+  matched: number;
+  sample_size: number;
+}
+/**
+ * One usage record's billing decision, as the relay recorded it. Status is the
+ * stored billing_status; evidence is the frozen rule snapshot, or null when the
+ * row predates billing rules or its stored snapshot was unreadable.
+ */
+export interface BillingExplanation {
+  status: string;
+  evidence: BillingEvidence | null;
+}
+
+/**
+ * The pricing rule snapshot behind one charge. Every field is optional on
+ * purpose: the snapshot is opaque JSON written by whatever relay version
+ * metered the call, so the console reads the fields it understands and ignores
+ * the rest rather than failing to render a newer or older shape.
+ */
+export interface BillingEvidence {
+  owner?: string;
+  revision?: number;
+  source?: string;
+  usage_source?: string;
+  ratio?: number;
+  evaluated_at?: string;
+  rates?: BillingEvidenceRates;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
+  ordinary_input_tokens?: number;
+}
+
+/** Rates are USD per 1k tokens (per_request is USD per call). */
+export interface BillingEvidenceRates {
+  input_per_1k?: number;
+  output_per_1k?: number;
+  cache_per_1k?: number;
+  cache_write_per_1k?: number;
+  per_request?: number;
+  multiplier?: number;
+  timezone?: string;
+}
+
 export interface ProxyLog {
   id: number;
   request_id: string;
@@ -215,12 +431,58 @@ export interface ProxyLog {
   first_byte_ms?: number;
   client_family?: string;
   reasoning_effort?: string;
+  /**
+   * Set when a capability downgrade rewrote the requested effort before
+   * forwarding (e.g. "high" for a client that asked for "max"). Empty when the
+   * request went upstream unchanged.
+   */
+  mapped_reasoning_effort?: string;
   tokens_per_second?: number;
   stream?: boolean;
   path?: string;
   session_key?: string;
   upstream_request_id?: string;
+  /**
+   * sha256 prefix of the upstream credential that served the attempt, never
+   * the key itself. Two attempts sharing it were served by the same upstream
+   * key, which is how a channel with a key pool is audited row by row.
+   */
+  key_fingerprint?: string;
+  /**
+   * credentials.id of the key that served the attempt. The gateway stores the
+   * id, not the secret, so this is what turns "a key whose hash starts 9f2c"
+   * into "cc #141". 0/absent on rows written before the column existed.
+   */
+  upstream_key_id?: number;
+  /**
+   * The key's display name, resolved server-side from the credential's
+   * meta_json at read time (renames show through; a deleted key resolves
+   * empty). Present only in list responses.
+   */
+  upstream_key_name?: string;
+  /**
+   * The model name this attempt actually sent upstream. Differs from `model`
+   * when the route/member rewrote the alias via a `{"real":"…"}` mapping —
+   * i.e. whenever one client-facing name is served by several real models.
+   */
+  upstream_model?: string;
+  /**
+   * The URL this attempt actually called (scheme + host + path; query and
+   * fragment stripped). Differs from `path` whenever a channel endpoint
+   * override/map relocated the request, and it is the only record of what a
+   * custom-path passthrough (`POST /v1/<anything>`) reached.
+   */
+  upstream_url?: string;
   created_at: string;
+  /** Persisted billing amount, joined from usage_records by request_id. */
+  cost?: number;
+  /**
+   * How that amount was priced: one entry per metered attempt of the request,
+   * in attempt order, so a failed-over request that billed twice shows both the
+   * decisions. Read-time annotation present only in admin list responses; the
+   * member request list never receives it.
+   */
+  billing?: BillingExplanation[];
 }
 export interface DiscoveredModel {
   id: number;
@@ -233,6 +495,12 @@ export interface DiscoveredModel {
 }
 
 /** One live-trace frame pushed by GET /admin/relay/live (SSE `request` events). */
+export interface LiveTraceRound {
+  round: number;
+  channel: string;
+  status: "running" | "ok" | "failed";
+  error?: string;
+}
 export interface LiveTraceRequest {
   request_id: string;
   status: "running" | "success" | "failed" | "canceled" | "interrupted";
@@ -244,14 +512,51 @@ export interface LiveTraceRequest {
   target_channel?: string;
   key_name?: string;
   error?: string;
+  /** Streaming (SSE) transfer. */
+  stream?: boolean;
+  /** Authenticated downstream key name the request arrived on. */
+  client_key?: string;
+  /** Time to first upstream byte (streams); 0 until known. */
+  first_byte_ms?: number;
+  /** Client-facing bytes forwarded so far. */
+  bytes_written?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  /** The operator-interrupted request this one most likely retries. */
+  retry_of?: string;
+  history?: LiveTraceRound[];
 }
 
-/** One enabled channel able to serve a route pattern (models.csv or discovery snapshot). */
+/**
+ * One enabled channel able to serve a route pattern: its own model list, the
+ * discovery snapshot, or a name this gateway already serves through it.
+ */
 export interface ModelChannelMatch {
   channel_id: number;
   channel_name: string;
-  source: "models_csv" | "discovered";
+  /**
+   * `routed` means the channel serves the name through an existing route — the
+   * matched name is then an alias this gateway renamed, and the forward name is
+   * the upstream's own.
+   */
+  source: "models_csv" | "discovered" | "routed";
+  /**
+   * The model name the attached member must FORWARD: the matched name for a
+   * sibling or a substring hit ("mimo-v2.5-flash" for a route named
+   * "mimo-v2.5"), and the upstream name behind a renamed alias.
+   */
+  model?: string;
 }
+
+/**
+ * How a route pattern is matched against what a channel serves.
+ *
+ * `related` accepts the pattern's prefix siblings ("mimo-v2.5-flash");
+ * `contains` accepts any name containing it, wherever it sits
+ * ("deepseek-ai/deepseek-v4-flash", "cn:deepseek-r1"). Both rewrite the
+ * upstream name to whichever name the channel actually serves.
+ */
+export type ModelMatchMode = "exact" | "related" | "contains";
 
 export interface UnifyVariant {
   channel_id: number;
@@ -262,11 +567,7 @@ export interface UnifyVariant {
 }
 
 /** Normalization rules, applied as a pipeline in this order. */
-export type UnifyRule =
-  | "account_prefix"
-  | "vendor_prefix"
-  | "date_suffix"
-  | "index_suffix";
+export type UnifyRule = "account_prefix" | "vendor_prefix" | "date_suffix" | "index_suffix";
 
 export interface UnifyGroup {
   canonical: string;
@@ -280,8 +581,8 @@ export interface UnifyGroup {
   risky: boolean;
   /**
    * Enabled routes whose name folds onto this canonical form but is not the
-   * canonical name itself — usually an original restored from history. The
-   * group stays listed so re-applying can hide those duplicates again.
+   * canonical name itself — usually an original rebuilt from history. The
+   * group stays listed so re-applying can delete those duplicates again.
    */
   exposed_originals?: number;
 }
@@ -289,8 +590,8 @@ export interface UnifyGroup {
 export interface UnifyPreview {
   /** Every merge the enabled rules produce, canonical form already applied. */
   groups: UnifyGroup[];
-  /** Originals currently hidden by an applied group. */
-  archived: ArchivedRoute[];
+  /** Originals removed by an applied group and not rebuilt since. */
+  deleted: DeletedRoute[];
 }
 
 /** One probe run over a selection of (channel, model) pairs. */
@@ -322,6 +623,20 @@ export interface ModelProbeResult {
   probed_at: string;
 }
 
+/**
+ * Verdict of one route-free upstream check: "does this channel serve this
+ * model?". Unlike ModelProbeResult it is never persisted — the connection
+ * drawer's 试调 is a look-before-you-adopt action, so it writes no health
+ * state and can never take a channel out of rotation.
+ */
+export interface ChannelModelTestResult {
+  model: string;
+  ok: boolean;
+  status_code: number;
+  latency_ms: number;
+  error?: string;
+}
+
 /** Latest known state of a (channel, model) pair. */
 export interface ModelHealth {
   channel_id: number;
@@ -332,6 +647,283 @@ export interface ModelHealth {
   source: string;
   /** Consecutive probe failures; drives automatic member disabling. */
   consecutive_failures: number;
+}
+
+/**
+ * External site probe data: what a site publishes about its own models.
+ *
+ * Read from the site's public status page (Uptime Kuma) or its public price
+ * table, so availability can be judged without spending upstream tokens. It is
+ * evidence, not a measurement of our own keys: the tool shows it next to our
+ * routes and only the operator's apply turns it into routing changes.
+ */
+export interface SiteProbePolicy {
+  ratio_threshold: number;
+  min_samples: number;
+  low_rounds: number;
+  high_rounds: number;
+}
+
+/** How a site's model name was tied to one of our routes. */
+export type SiteProbeMatch =
+  | "exact"
+  | "pattern"
+  | "member"
+  | "normalized"
+  /** Matched after dropping the catalog namespace (cn:glm-5.2 -> glm-5.2). */
+  | "namespace"
+  | "";
+
+export type SiteProbeVerdict = "ok" | "low" | "pending" | "insufficient" | "stale" | "no_data";
+
+/** A price the site publishes for one model, normalized to USD. */
+export interface SiteProbePrice {
+  quote_id?: number;
+  status?: string;
+  unit?: QuoteUnit;
+  cache_write_per_million?: number;
+  mode?: "token" | "fixed";
+  /**
+   * The currency the site declares for its own price table. The amounts below
+   * are in THIS currency; the gateway never converts them.
+   */
+  currency?: string;
+  /** What the site prints ("$", "¥", "¤" for a custom symbol). */
+  currency_symbol?: string;
+  input_per_million?: number;
+  output_per_million?: number;
+  cache_read_per_million?: number;
+  per_request?: number;
+  group_ratio?: number;
+  /** The published expression, kept so an unparsed price can be shown as text. */
+  raw?: string;
+  unparsed?: boolean;
+}
+
+export interface SiteProbeRound {
+  run_id: number;
+  ratio: number;
+  samples: number;
+  up_count: number;
+  weak_evidence?: boolean;
+  avg_ping_ms?: number;
+  observed_at: string;
+  price?: SiteProbePrice;
+}
+
+export interface SiteProbeMemberState {
+  member_id: number;
+  channel_id: number;
+  channel_name: string;
+  group_name?: string;
+  enabled: boolean;
+  auto_disabled: boolean;
+  /** A route pinned to this member: the store refuses to auto-disable it. */
+  single_member?: boolean;
+  /** Already carries a price in the billing layer — adoption fills gaps only. */
+  has_price?: boolean;
+}
+
+export interface SiteProbeRow {
+  route: string;
+  match: SiteProbeMatch;
+  raw_model: string;
+  site_id: number;
+  site_name: string;
+  group_name?: string;
+  verdict: SiteProbeVerdict;
+  low_streak: number;
+  ok_streak: number;
+  rounds: SiteProbeRound[];
+  members: SiteProbeMemberState[];
+  /** No availability data at all — a price-only source. */
+  price_only?: boolean;
+  source_kind?: string;
+  /**
+   * Our own relay's record for this (route, site) pair, over the last day: the
+   * availability fallback for sites that publish no probe data of their own
+   * (which is every New-API price table).
+   */
+  traffic?: {
+    samples: number;
+    failures: number;
+    ratio: number;
+    avg_first_byte_ms?: number;
+    window_hours: number;
+  };
+  /** Where the verdict's evidence came from: the site, our own traffic, or a
+   * third-party monitoring directory (last resort, always labelled). */
+  availability_source?: "site" | "traffic" | "watchbot" | "";
+  /** A third-party directory's reading for the same pair. */
+  external?: {
+    source: string;
+    ratio: number;
+    avg_latency_ms?: number;
+    first_token_ms?: number;
+    tokens_per_second?: number;
+    service_state?: string;
+    acquisition_state?: string;
+    observed_at?: string;
+  };
+  /**
+   * The model catalog's reference price (USD per 1M), filled only when the site
+   * publishes none for this model. It is already the gateway's billing fallback,
+   * so it is display-only: adopting it per member would just duplicate it.
+   */
+  catalog_price?: {
+    mode?: "token" | "fixed";
+    currency?: string;
+    currency_symbol?: string;
+    input_per_million?: number;
+    output_per_million?: number;
+    cache_read_per_million?: number;
+    per_request?: number;
+    raw?: string;
+    unparsed?: boolean;
+  };
+  /**
+   * The newest price the site published for this model, normalized to USD.
+   * Evidence: it reaches the billing layer only when an operator adopts it.
+   */
+  observed_price?: SiteProbePrice;
+}
+
+export interface SiteProbeUnmatched {
+  site_id: number;
+  site_name: string;
+  raw_model: string;
+  group_name?: string;
+  ratio: number;
+  samples: number;
+  price?: SiteProbePrice;
+}
+
+/** One collection round for one site, as the collect endpoint reports it. */
+export interface SiteProbeRun {
+  site_id: number;
+  source_kind?: string;
+  /** "ok" | "failed" | "running". */
+  status: string;
+  /** Model records this round stored; 0 with status "ok" is an empty source. */
+  monitor_count: number;
+  /** Why a failed round failed, in the upstream's own words. */
+  error?: string;
+}
+
+export interface SiteProbeSiteStatus {
+  site_id: number;
+  site_name: string;
+  probe_source_kind?: string;
+  probe_source_url?: string;
+  probe_source_enabled: boolean;
+  probe_last_run_at?: string;
+  probe_last_error?: string;
+  last_run_status?: string;
+  monitor_count: number;
+  /** Stored settings blob (auto-apply + thresholds), echoed as stored. */
+  probe_source_config?: string;
+  /** This site applies its own verdicts every round. */
+  auto_apply: boolean;
+  policy: SiteProbePolicy;
+  /** The source is derived from the platform (no hand-typed URL). */
+  probe_auto?: boolean;
+}
+
+export interface SiteProbeReport {
+  policy: SiteProbePolicy;
+  rows: SiteProbeRow[];
+  unmatched: SiteProbeUnmatched[];
+  /**
+   * Models a site publishes whose name matches one of our routes, but that
+   * route has no member on this site. Reported as a candidate — something to
+   * attach — never as a reading: there is nothing here to judge or disable.
+   */
+  name_only: SiteProbeNameOnly[];
+  sites: SiteProbeSiteStatus[];
+  generated_at: string;
+}
+
+/** A name collision with a route we serve elsewhere: a candidate, not a reading. */
+export interface SiteProbeNameOnly {
+  site_id: number;
+  site_name: string;
+  raw_model: string;
+  route: string;
+  match: SiteProbeMatch;
+  group_name?: string;
+  ratio: number;
+  samples: number;
+  price?: SiteProbePrice;
+}
+
+/** One routing change the site-probe policy proposes (or applied). */
+export interface SiteProbeAction {
+  route: string;
+  site_id: number;
+  site_name: string;
+  channel_id: number;
+  channel_name: string;
+  kind: "disable" | "recover";
+  reason: string;
+  members_moved: number;
+  /** Set when nothing moved: single_member, not_disableable, nothing_to_recover. */
+  skipped?: string;
+}
+
+/** What adopting an observed price wrote, per member. */
+export interface SiteProbeAdoptResult {
+  member_id: number;
+  adopted?: string[];
+  /** Set when nothing was written: no_price, already_priced. */
+  skipped?: string;
+}
+
+/** One site from a public monitoring directory, matched against our sites. */
+export interface SiteProbeCatalogEntry {
+  name: string;
+  url: string;
+  /** "" = pricing-shaped, the auto source derived from the platform covers it. */
+  kind: "uptime_kuma" | "newapi" | "sub2api_transit" | "auto" | "";
+  models?: number;
+  /** create | update | skip (a custom source already configured). */
+  action: string;
+  existing_site?: string;
+}
+
+/** What a pasted URL turned out to be, with a preview of its data. */
+export interface SiteProbeDetection {
+  kind: "uptime_kuma" | "newapi" | "sub2api_transit";
+  url: string;
+  base?: string;
+  slug?: string;
+  title?: string;
+  groups?: { id: number; name: string }[];
+  monitors?: {
+    id: string;
+    name: string;
+    type: string;
+    group_name: string;
+    samples: number;
+    up_count: number;
+    ratio: number;
+    avg_ping_ms?: number;
+    weak_evidence: boolean;
+  }[];
+  price_count?: number;
+  price_unparsed?: number;
+  /** Sub2API transit: which snapshot shape the site serves and what it reports. */
+  transit_mode?: "v1" | "v2";
+  transit_homepage?: string;
+  transit_readings?: {
+    name: string;
+    type: string;
+    group_name?: string;
+    samples: number;
+    up_count: number;
+    ratio: number;
+    avg_ping_ms?: number;
+    weak_evidence: boolean;
+  }[];
 }
 
 /** Probe scope. Empty arrays mean "everything". */
@@ -353,7 +945,7 @@ export interface UnifyApplyResult {
   routes_created: number;
   members_created: number;
   members_skipped: number;
-  routes_archived: number;
+  routes_deleted: number;
   batch_count: number;
 }
 
@@ -364,31 +956,34 @@ export interface UnifyBatch {
   route_id: number;
   routes_created: number;
   members_created: number;
-  routes_archived: number;
+  routes_deleted: number;
   created_at: string;
   /** Set once the batch has been reverted. */
   undone_at?: string;
 }
 
-/** An original model name hidden by an applied group, restorable on its own. */
-export interface ArchivedRoute {
+/** An original model name removed by an applied group, rebuildable on its own. */
+export interface DeletedRoute {
   batch_id: number;
   canonical: string;
   route_id: number;
   model_name: string;
-  archived_at: string;
-  /** True once this archive has been reverted (single restore or batch undo). */
-  restored: boolean;
+  deleted_at: string;
+  /** True for the older scheme: the batch parked the route (disabled) instead of deleting it. */
+  parked?: boolean;
+  /** True once this removal has been reverted (single rebuild or batch undo). */
+  rebuilt: boolean;
 }
 
 export interface UnifyOp {
   id: number;
   batch_id: number;
   seq: number;
-  op: "route_created" | "member_created" | "route_archived" | "route_enabled";
+  op: "route_created" | "member_created" | "route_archived" | "route_deleted" | "route_enabled";
   route_id: number;
   member_id?: number;
   prev_enabled?: boolean;
+  model_name?: string;
   undone: boolean;
 }
 
@@ -401,7 +996,117 @@ export interface ModelMetadata {
   supports_thinking: number; // -1 unknown, 0 no, 1 yes
   vendor: string;
   notes: string;
+  /** Self-set unit prices per 1k tokens (0 = no model-level price). */
+  price_prompt_per_1k?: number;
+  price_completion_per_1k?: number;
+  price_cache_per_1k?: number;
+  /** Flat charge per call, for upstreams that bill by call. */
+  price_per_request?: number;
+  /** Context-length ladder and time-of-day windows as JSON text; empty = unset. */
+  price_tiers?: string;
+  price_schedule?: string;
   updated_at?: string;
+}
+
+/**
+ * Protocol-level capability: which endpoint to call, which encoding it wants,
+ * how many input images it accepts. Distinct from ModelMetadata, which
+ * describes *what* a model is (context window, vendor, price).
+ */
+export interface ModelCapability {
+  model: string;
+  kind: string;
+  provider: string;
+  endpoints: string[];
+  input_formats: string[];
+  input_modalities: string[];
+  output_modalities: string[];
+  max_input_images: number;
+  supports_stream: boolean;
+  supports_tools: boolean;
+  supports_json_mode: boolean;
+  async_task: boolean;
+  size_options: string;
+  /**
+   * builtin | discovery | manual | catalog — manual rows survive both discovery
+   * re-tagging and catalog syncs; catalog rows are owned by the sync service.
+   */
+  source: string;
+  notes: string;
+  updated_at?: string;
+  /** True when no registry row exists and the answer came from the classifier. */
+  resolved_by_builtin?: boolean;
+}
+
+/** One field a catalog sync would rewrite, already rendered as strings. */
+export interface CatalogFieldChange {
+  field: string;
+  from: string;
+  to: string;
+}
+
+/**
+ * The planned outcome for one model. Each action is one of create | refresh |
+ * fill | skip_manual | disabled | unchanged.
+ */
+export interface CatalogPreviewItem {
+  model: string;
+  found: boolean;
+  sources: string[];
+  capability_action: string;
+  capability_source: string;
+  capability_kind: string;
+  capability_changes?: CatalogFieldChange[];
+  metadata_action: string;
+  metadata_changes?: CatalogFieldChange[];
+  price_action: string;
+  price_changes?: CatalogFieldChange[];
+}
+
+/** A dry run of a catalog sync: what it would write, model by model. */
+export interface CatalogPreview {
+  items: CatalogPreviewItem[];
+  requested: number;
+  matched: number;
+  missing: number;
+  sources: string[];
+  errors?: string[];
+  prices_enabled: boolean;
+  fetched: boolean;
+}
+
+/** The outcome recorded by the last applied sync. */
+export interface CatalogSyncState {
+  synced_at: string;
+  requested: number;
+  matched: number;
+  capabilities: number;
+  metadata: number;
+  prices: number;
+  skipped_manual: number;
+  missing: number;
+  sources: string[];
+  errors?: string[];
+}
+
+export interface CatalogStatus {
+  /** Null until the first sync runs. */
+  state: CatalogSyncState | null;
+  sources: string[];
+  /** True when a background sweep is configured. */
+  scheduled: boolean;
+  prices_enabled: boolean;
+}
+
+/**
+ * What a sync is allowed to write. Omitted fields default to on; prices are
+ * separate because writing them changes what a request costs.
+ */
+export interface CatalogPolicyInput {
+  models?: string[];
+  capabilities?: boolean;
+  metadata?: boolean;
+  prices?: boolean;
 }
 
 export interface ErrorPassRule {
@@ -582,21 +1287,104 @@ export interface RuntimeEditableSettings {
   health_sweep_concurrency: number;
   health_sweep_timeout_seconds: number;
   channel_retry_times: number;
-  key_pool_rotation: boolean;
   /** Gateway may query GitHub for newer releases to power the update badge. */
   update_check_enabled: boolean;
   /** Sync mode newly created channels inherit when the request omits it. */
   default_model_sync_mode: "auto" | "manual";
+  /**
+   * External site-probe collection cadence. Sites publish their own probe data
+   * at very different rates, so how often the gateway reads those pages is a
+   * setting rather than a constant (defaults: 900s + 120s jitter).
+   */
+  // Keepalive: the master switch, how often a round asks whether anything is
+  // due, and the window used by a site that has none of its own. The per-site
+  // window is data, edited on the connections page.
+  keepalive_enabled: boolean;
+  keepalive_check_interval_seconds: number;
+  keepalive_default_idle_days: number;
+  site_probe_interval_seconds: number;
+  site_probe_jitter_seconds: number;
+  /**
+   * Upstream notice-board reader cadence (internal/sitenews), in seconds.
+   * Unlike the site-probe pair, 0 is a real value: the scheduled read is off
+   * and only the overview's refresh button reads boards. -1 means unset and
+   * resolves server-side to the deployment default.
+   */
+  site_news_interval_seconds: number;
+  // Outbound client limits: 0 = the deployment default (OUTBOUND_* in the env),
+  // and a non-zero value is a live override.
+  outbound_connect_timeout_seconds: number;
+  outbound_header_timeout_seconds: number;
+  outbound_image_header_timeout_seconds: number;
+  outbound_tls_timeout_seconds: number;
+  outbound_max_idle_conns: number;
+  outbound_max_idle_conns_per_host: number;
+  // /v1 request-body ceilings in MB: 0 = the deployment default
+  // (RELAY_MAX_BODY_MB / RELAY_MAX_IMAGE_MB), non-zero = live override.
+  relay_max_body_mb: number;
+  relay_max_image_mb: number;
+}
+
+export interface SelfUpdateStatus {
+  target?: string;
+  started_at?: number;
+  /** The build the update started from, so another browser can confirm a
+   *  tracked-tag handoff (see updateLanded). */
+  from?: string;
+  available: boolean;
+  running: boolean;
+  phase: "idle" | "checking" | "pulling" | "starting-successor" | "handoff" | "failed";
+  /** "compose" is the updater sidecar: it re-reads the deployment file, so env
+   *  changes land with the image. "watchtower" updates the container from its
+   *  own inspect data, so env changes never reach it. "socket" is the gateway
+   *  holding the socket itself. */
+  mode?: "compose" | "watchtower" | "socket" | "none";
+  error?: string;
+  /** The floating image tag the executor updates, when one is set. */
+  tracking_tag?: string;
+  /** Which release channel that tag delivers: "stable", "beta", or "" for a
+   *  pin. The tag decides what can be installed, not a console preference. */
+  tracking_channel?: "stable" | "beta" | "";
+  /** Where the compose updater runs (its project directory). */
+  updater_project?: string;
+  /** Non-empty when this container's environment predates the deployment file:
+   *  the console shows the one command that fixes it. Empty means aligned. */
+  deployment_step?: "compose_recreate";
+  /** The previous compose-updater run. A failed update otherwise leaves the old
+   *  container running with no explanation anywhere the operator looks. */
+  last_result?: {
+    target?: string;
+    exit_code: number;
+    started_at?: number;
+    finished_at?: number;
+    pull?: string;
+    up?: string;
+    log?: string;
+  };
 }
 
 export interface UpdateCheckStatus {
+  channel?: "stable" | "beta";
   enabled: boolean;
   current: string;
   latest: string;
   has_update: boolean;
   release_url: string;
+  /** Release body (markdown) from GitHub, shown in the update dialog. */
+  notes?: string;
   checked_at?: string;
   error?: string;
+}
+
+/** One environment variable the process read at startup, with the value it is
+ *  actually running with. Read-only: the environment layer is fixed for the
+ *  life of the container. */
+export interface DeploymentParameter {
+  key: string;
+  kind: string;
+  value: string;
+  from_env: boolean;
+  secret: boolean;
 }
 
 export interface RuntimeSettings {
@@ -611,9 +1399,11 @@ export interface RuntimeSettings {
   backup_dir: string;
   plugins_dir: string;
   metrics_token_masked: string;
+  deployment_parameters: DeploymentParameter[];
 }
 
 export interface RoutingCandidate {
+  upstream_model?: string;
   member: RouteMember;
   channel: Channel;
   credential_usable: boolean;
@@ -630,6 +1420,9 @@ interface RouteEvaluation {
 }
 export interface RouteExplanation {
   model: string;
+  requested_group?: string;
+  route_group?: string;
+  group_fallback?: boolean;
   route_id: number;
   routing_mode?: string;
   evaluated_at: string;
@@ -689,6 +1482,15 @@ interface ModelPrice {
 }
 export interface FinanceItem {
   channel_id: number;
+  account_id?: number;
+  site_id?: number;
+  balance_known?: boolean;
+  balance_status?: "known" | "unknown" | "stale" | "refresh_failed";
+  unit?: QuoteUnit;
+  observed_at?: string;
+  refresh_error?: string;
+  upstream_group?: string;
+  quotes?: Record<string, PriceQuote>;
   balance: number;
   quota_total?: number;
   quota_used?: number;
@@ -798,6 +1600,8 @@ export interface ImportResult {
     discovery_status?: string;
     discovery_category?: string;
   }>;
+  /** Rows the document carried that could not be imported. */
+  skipped?: Array<{ index: number; name?: string; reason: string }>;
 }
 export interface ExchangeEnvelope {
   format: string;
@@ -841,13 +1645,34 @@ export interface ModuleStatus {
 /** One manifest-declared plugin configuration input. */
 export interface PluginConfigField {
   key: string;
-  type?: "string" | "text" | "number" | "bool" | "select" | "secret" | string;
+  type?:
+    "string" | "text" | "number" | "bool" | "select" | "secret" | "model" | "model_groups" | string;
   label?: string;
   description?: string;
   required?: boolean;
   secret?: boolean;
   default?: unknown;
   options?: string[];
+  /** Tucked into a collapsed group by the console; the plugin's manifest decides. */
+  advanced?: boolean;
+}
+
+/**
+ * One intercept hook a plugin currently serves. A hook lets a plugin see and
+ * rewrite traffic the gateway would otherwise handle on its own: which model a
+ * request routes to, the request body sent upstream, or the answer returned.
+ */
+export interface PluginHookStatus {
+  plugin_id: string;
+  plugin_name?: string;
+  /** route | request | response */
+  point: string;
+  path: string;
+  match_models: string[];
+  timeout_ms: number;
+  priority: number;
+  /** The circuit breaker is open; the hook is being skipped. */
+  tripped?: boolean;
 }
 
 /** GET /admin/plugins/{id}/config response. */
@@ -982,6 +1807,9 @@ export interface ModelChangeMember {
   channel_id: number;
   upstream_model: string;
   group_name: string;
+  /** False for a wildcard binding with no constant rewrite: it answers for
+   *  every model the pattern matches, so deleting it takes those down too. */
+  deletable: boolean;
 }
 export interface ModelChange {
   id: number;
@@ -993,10 +1821,28 @@ export interface ModelChange {
   detected_at: string;
   candidates: string[];
   members: ModelChangeMember[];
+  // Confidence signals (removals): confirmed = missing from several
+  // consecutive complete syncs; partial_keys = the snapshot ran with only
+  // some API keys answering (possible false positive); flap_count = repeated
+  // disappearances inside the flap window; runtime_blocked = the relay's
+  // upstream reported this channel × model as not found at request time.
+  confirmed?: boolean;
+  miss_count?: number;
+  partial_keys?: boolean;
+  flap_count?: number;
+  runtime_blocked?: boolean;
+  blocked_at?: string;
+  /** Pending addition whose model is already wired into the channel. */
+  adopted?: boolean;
 }
 export interface ModelChangesResponse {
   items: ModelChange[];
-  summary: { added: number; removed: number; affected_routes: number };
+  summary: {
+    added: number;
+    removed: number;
+    affected_routes: number;
+    confirmed: number;
+  };
 }
 export interface ModelReplacementRequest {
   change_ids: number[];
@@ -1017,4 +1863,230 @@ export interface ModelReplacementPreview {
     target_channel_id: number;
     target_model: string;
   }>;
+}
+export interface ModelDiscardRequest {
+  change_ids: number[];
+  member_ids: number[];
+  preview_token?: string;
+}
+export interface ModelDiscardItem {
+  member_id: number;
+  route_id: number;
+  route_name: string;
+  model_pattern: string;
+  group_name: string;
+  channel_id: number;
+  upstream_model: string;
+  /** The route's total member count, the discarded one included. */
+  route_members: number;
+  /** True when this binding is one of the route's last: the route goes too. */
+  route_deleted: boolean;
+}
+export interface ModelDiscardPreview {
+  preview_token: string;
+  /** Route rows deleted because every member of theirs is discarded. */
+  routes: number;
+  items: ModelDiscardItem[];
+}
+
+// ---------------------------------------------------------------------------
+// Keepalive
+// ---------------------------------------------------------------------------
+
+/**
+ * The resolved keepalive window for one channel. Every value here has already
+ * been through the channel > site > global chain, so the page shows what the
+ * next round will actually do rather than what one layer happens to hold.
+ */
+export interface KeepaliveConfig {
+  enabled: boolean;
+  idle_days: number;
+  safety_margin_days: number;
+  prompt?: string;
+  max_tokens?: number;
+  daily_cap?: number;
+  quiet_hours?: string;
+}
+
+export interface KeepaliveTarget {
+  site_id: number;
+  site_name: string;
+  channel_id: number;
+  channel_name: string;
+  /** The model a keepalive call would use; empty means "cannot keepalive". */
+  model: string;
+  /** The site's own keepalive model, empty when nothing is pinned (automatic). */
+  site_model?: string;
+  /** What this channel advertised when its list was last fetched. */
+  candidates?: string[];
+  call_policy: string;
+  config: KeepaliveConfig;
+  /** The newest real call on this account. Absent = never called. */
+  last_call_at?: string;
+  sends_today: number;
+  /** Set when the channel cannot be called at all (nothing fetched, none set). */
+  skip_reason?: string;
+
+  // Computed by the server against its own clock, so the page cannot disagree
+  // with the scheduler about what "idle" means.
+  idle_days: number;
+  remaining_days: number;
+  ready: boolean;
+  never_called: boolean;
+}
+
+export interface KeepaliveStatus {
+  targets: KeepaliveTarget[];
+  now: string;
+}
+
+export interface KeepaliveRound {
+  Checked: number;
+  Sent: number;
+  Failed: number;
+  Skipped: number;
+  NotReady: number;
+}
+
+export interface KeepaliveEvent {
+  id: number;
+  site_id: number;
+  site_name: string;
+  channel_id: number;
+  channel_name: string;
+  model: string;
+  form: string;
+  reason: string;
+  ok: boolean;
+  status_code: number;
+  error?: string;
+  created_at: string;
+}
+
+/** What one site's policy/window editor writes (PUT /admin/keepalive/sites/{id}). */
+export interface SiteKeepaliveInput {
+  call_policy: string;
+  keepalive_enabled: boolean;
+  keepalive_idle_days: number;
+  keepalive_safety_margin_days: number;
+  keepalive_model: string;
+  keepalive_prompt: string;
+  keepalive_max_tokens: number;
+  keepalive_daily_cap: number;
+  keepalive_quiet_hours: string;
+}
+
+/**
+ * What one upstream site published on its own notice board, as the gateway read
+ * it. The site owns the text and the date; `first_seen_at` is the gateway's own
+ * clock and is what the console marks as new.
+ */
+export interface SiteAnnouncement {
+  id: number;
+  site_id: number;
+  site_name: string;
+  upstream_id: string;
+  content: string;
+  extra?: string;
+  kind?: string;
+  published_at: string;
+  first_seen_at: string;
+  fetched_at: string;
+}
+
+/** GET /admin/site-news: the feed plus what it covers. */
+export interface SiteNewsFeed {
+  items: SiteAnnouncement[];
+  sites: { readable: number; reported: number };
+  last_fetched?: string;
+}
+
+/** POST /admin/site-news/refresh: what one read of every board did. */
+export interface SiteNewsRefresh {
+  sites: number;
+  fetched: number;
+  failed: number;
+  added: number;
+  errors?: string[];
+  at: string;
+}
+
+/**
+ * One API key's answer to "does the upstream still take you"
+ * (POST /admin/discovery/channels/{id}/keys/test).
+ *
+ * `category` uses the same vocabulary a failed probe publishes, so the console
+ * translates it with the one map it already has.
+ */
+export interface ChannelKeyTestResult {
+  credential_id: number;
+  ok: boolean;
+  category?: string;
+  error?: string;
+  model_count: number;
+  sample?: string[];
+  latency_ms: number;
+}
+
+/** What one 测活 round did across the keys it was asked about. */
+export interface ChannelKeyTestReport {
+  results: ChannelKeyTestResult[];
+  ok: number;
+  failed: number;
+  tested: number;
+}
+
+export interface AvailabilityBucket {
+  at: string;
+  samples: number;
+  ok: number;
+  failed: number;
+  ignored: number;
+}
+export interface AvailabilitySeries {
+  source: "traffic" | "probe" | "site" | "watchbot" | "requests";
+  scope: string;
+  samples: number;
+  ok: number;
+  failed: number;
+  ignored: number;
+  ratio: number | null;
+  last_at?: string;
+  stale: boolean;
+  buckets: AvailabilityBucket[];
+  paths: string[];
+}
+export interface AvailabilityItem {
+  member_id?: number;
+  route_id?: number;
+  channel_id?: number;
+  site_id?: number;
+  model: string;
+  primary: AvailabilitySeries | null;
+  evidence: AvailabilitySeries[];
+  ambiguous?: boolean;
+}
+export interface AvailabilityReport {
+  members: AvailabilityItem[];
+  models: AvailabilityItem[];
+  routes: AvailabilityItem[];
+  since: string;
+  until: string;
+}
+export interface SiteObservation {
+  id: string;
+  site_id: number;
+  raw_model: string;
+  monitor_id?: string;
+  group_name?: string;
+  price: SiteProbePrice;
+  observed_at: string;
+  series: AvailabilitySeries;
+  weak_evidence: boolean;
+}
+export interface SiteObservations {
+  items: SiteObservation[];
+  sites: SiteProbeSiteStatus[];
+  since: string;
+  until: string;
 }

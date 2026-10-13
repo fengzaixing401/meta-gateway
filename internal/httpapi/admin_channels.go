@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"strings"
@@ -234,25 +235,36 @@ func (h *AdminHandler) updateChannel(w http.ResponseWriter, r *http.Request) {
 	// Every field is a pointer so omission preserves the stored value while an
 	// explicit zero/empty value can still clear fields that support it.
 	var patch struct {
-		SiteID             *int64  `json:"site_id"`
-		CredentialID       *int64  `json:"credential_id"`
-		Name               *string `json:"name"`
-		BaseURL            *string `json:"base_url"`
-		ModelsCSV          *string `json:"models_csv"`
-		GroupName          *string `json:"group_name"`
-		Priority           *int    `json:"priority"`
-		Weight             *int    `json:"weight"`
-		Status             *string `json:"status"`
-		TypeHint           *string `json:"type_hint"`
-		MaxReasoningEffort *string `json:"max_reasoning_effort"`
-		PayloadRules       *string `json:"payload_rules"`
-		MaxConcurrent      *int    `json:"max_concurrent"`
-		ProxyURL           *string `json:"proxy_url"`
-		HeaderOverride     *string `json:"header_override"`
-		SystemPrompt       *string `json:"system_prompt"`
-		RetryConfig        *string `json:"retry_config"`
-		ModelSyncMode      *string `json:"model_sync_mode"`
-		StableFirst        *bool   `json:"stable_first"`
+		SiteID                  *int64  `json:"site_id"`
+		CredentialID            *int64  `json:"credential_id"`
+		Name                    *string `json:"name"`
+		BaseURL                 *string `json:"base_url"`
+		ModelsCSV               *string `json:"models_csv"`
+		GroupName               *string `json:"group_name"`
+		Priority                *int    `json:"priority"`
+		Weight                  *int    `json:"weight"`
+		Status                  *string `json:"status"`
+		TypeHint                *string `json:"type_hint"`
+		MaxReasoningEffort      *string `json:"max_reasoning_effort"`
+		PayloadRules            *string `json:"payload_rules"`
+		MaxConcurrent           *int    `json:"max_concurrent"`
+		NonStreamTimeoutSeconds *int    `json:"non_stream_timeout_seconds"`
+		StreamPolicy            *string `json:"stream_policy"`
+		ProxyURL                *string `json:"proxy_url"`
+		HeaderOverride          *string `json:"header_override"`
+		SystemPrompt            *string `json:"system_prompt"`
+		RetryConfig             *string `json:"retry_config"`
+		ModelSyncMode           *string `json:"model_sync_mode"`
+		UpstreamPathOverride    *string `json:"upstream_path_override"`
+		UpstreamPathMap         *string `json:"upstream_path_map"`
+		UpstreamRequestMap      *string `json:"upstream_request_map"`
+		UpstreamResponseMap     *string `json:"upstream_response_map"`
+		StableFirst             *bool   `json:"stable_first"`
+		CallPolicy              *string `json:"call_policy"`
+		// The channel's usage budget. Both are absolute totals in the ledger's own
+		// units; 0 clears the limit (and releases a channel the old limit parked).
+		UsageLimitCost   *float64 `json:"usage_limit_cost"`
+		UsageLimitTokens *int64   `json:"usage_limit_tokens"`
 	}
 	if err := decodeJSON(w, r, &patch, 0, false); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON")
@@ -363,9 +375,72 @@ func (h *AdminHandler) updateChannel(w http.ResponseWriter, r *http.Request) {
 		}
 		ch.ModelSyncMode = mode
 	}
+	// NonStreamTimeoutSeconds: per-channel cap for non-streaming upstream
+	// attempts; 0 preserves the global default (5 minutes).
+	if patch.NonStreamTimeoutSeconds != nil {
+		if *patch.NonStreamTimeoutSeconds < 0 || *patch.NonStreamTimeoutSeconds > 86400 {
+			writeError(w, http.StatusBadRequest, "non_stream_timeout_seconds must be 0..86400")
+			return
+		}
+		ch.NonStreamTimeoutSeconds = *patch.NonStreamTimeoutSeconds
+	}
+	// StreamPolicy: only the known values are accepted; a missing field
+	// preserves the stored policy.
+	if patch.StreamPolicy != nil {
+		policy := strings.ToLower(strings.TrimSpace(*patch.StreamPolicy))
+		if domain.NormalizeStreamPolicy(policy) != policy {
+			writeError(w, http.StatusBadRequest, "stream_policy must be empty, force_stream or force_non_stream")
+			return
+		}
+		ch.StreamPolicy = policy
+	}
 	// StableFirst: a missing field preserves the current grayscale state.
 	if patch.StableFirst != nil {
 		ch.StableFirst = *patch.StableFirst
+	}
+	// CallPolicy: how automated traffic (model probes, keep-alive) may look on
+	// this site. An empty value is not "no policy" — it means inherit the
+	// site's, which the store resolves with COALESCE (see store/keepalive.go),
+	// so clearing it hands the decision back to the site.
+	if patch.CallPolicy != nil {
+		policy := strings.TrimSpace(*patch.CallPolicy)
+		if policy != "" && domain.NormalizeCallPolicy(policy) != policy {
+			writeError(w, http.StatusBadRequest, "call_policy must be empty, allow_probe or real_calls_only")
+			return
+		}
+		ch.CallPolicy = policy
+	}
+	// The usage budget. The store re-derives the counters from the ledger and
+	// releases a channel the old limit parked when these change, so the numbers
+	// here are the operator's intent, never a cache to echo back.
+	if patch.UsageLimitCost != nil {
+		if math.IsNaN(*patch.UsageLimitCost) || math.IsInf(*patch.UsageLimitCost, 0) || *patch.UsageLimitCost < 0 {
+			writeError(w, http.StatusBadRequest, "usage_limit_cost must be a non-negative number")
+			return
+		}
+		ch.UsageLimitCost = *patch.UsageLimitCost
+	}
+	if patch.UsageLimitTokens != nil {
+		if *patch.UsageLimitTokens < 0 {
+			writeError(w, http.StatusBadRequest, "usage_limit_tokens must be >= 0")
+			return
+		}
+		ch.UsageLimitTokens = *patch.UsageLimitTokens
+	}
+	// Custom endpoint / field mapping. An explicit empty value clears the
+	// mapping, so a channel can be returned to plain passthrough without a
+	// manual DB edit.
+	if patch.UpstreamPathOverride != nil {
+		ch.UpstreamPathOverride = strings.TrimSpace(*patch.UpstreamPathOverride)
+	}
+	if patch.UpstreamPathMap != nil {
+		ch.UpstreamPathMap = strings.TrimSpace(*patch.UpstreamPathMap)
+	}
+	if patch.UpstreamRequestMap != nil {
+		ch.UpstreamRequestMap = strings.TrimSpace(*patch.UpstreamRequestMap)
+	}
+	if patch.UpstreamResponseMap != nil {
+		ch.UpstreamResponseMap = strings.TrimSpace(*patch.UpstreamResponseMap)
 	}
 	// Only accept a new site_id when it is a positive id; never wipe ownership.
 	if patch.SiteID != nil && *patch.SiteID > 0 {
@@ -433,6 +508,21 @@ func (h *AdminHandler) validateChannel(ch *domain.Channel) error {
 	ch.HeaderOverride = strings.TrimSpace(ch.HeaderOverride)
 	ch.SystemPrompt = strings.TrimSpace(ch.SystemPrompt)
 	ch.RetryConfig = strings.TrimSpace(ch.RetryConfig)
+	ch.UpstreamPathOverride = strings.TrimSpace(ch.UpstreamPathOverride)
+	ch.UpstreamPathMap = strings.TrimSpace(ch.UpstreamPathMap)
+	ch.UpstreamRequestMap = strings.TrimSpace(ch.UpstreamRequestMap)
+	ch.UpstreamResponseMap = strings.TrimSpace(ch.UpstreamResponseMap)
+	// new-api-style one-field configuration: an operator who pastes the complete
+	// upstream endpoint (`https://api.typesafe.ai/v1/systemone`) as the base URL
+	// gets it split into root + endpoint override instead of being handed a
+	// doubled path (`/v1/systemone/v1/chat/completions`). An endpoint explicitly
+	// typed into the override field always wins over the inferred one.
+	if splitBase, inferredOverride, splitErr := adapters.SplitEndpointBaseURL(ch.BaseURL); splitErr == nil && inferredOverride != "" {
+		ch.BaseURL = splitBase
+		if ch.UpstreamPathOverride == "" {
+			ch.UpstreamPathOverride = inferredOverride
+		}
+	}
 	if ch.Name == "" {
 		return errors.New("name is required")
 	}
@@ -442,11 +532,36 @@ func (h *AdminHandler) validateChannel(ch *domain.Channel) error {
 	if ch.MaxConcurrent < 0 {
 		return errors.New("max_concurrent must be non-negative")
 	}
-	if ch.Status != domain.StatusEnabled && ch.Status != domain.StatusDisabled {
+	if ch.NonStreamTimeoutSeconds < 0 {
+		return errors.New("non_stream_timeout_seconds must be non-negative")
+	}
+	if math.IsNaN(ch.UsageLimitCost) || math.IsInf(ch.UsageLimitCost, 0) || ch.UsageLimitCost < 0 {
+		return errors.New("usage_limit_cost must be a non-negative number")
+	}
+	if ch.UsageLimitTokens < 0 {
+		return errors.New("usage_limit_tokens must be non-negative")
+	}
+	if domain.NormalizeStreamPolicy(ch.StreamPolicy) != ch.StreamPolicy {
+		return errors.New("invalid stream_policy")
+	}
+	if ch.Status != domain.StatusEnabled && ch.Status != domain.StatusDisabled && ch.Status != domain.StatusAutoDisabled {
+		// auto_disabled is a stored state, not a client's request: a PATCH that
+		// preserves it (raise the usage limit, fix a typo) must not be refused as
+		// "invalid status" — that would make a parked channel uneditable, which is
+		// exactly when the operator needs to edit it.
 		return errors.New("invalid channel status")
 	}
 	if ch.ModelSyncMode != "" && ch.ModelSyncMode != domain.ModelSyncModeAuto && ch.ModelSyncMode != domain.ModelSyncModeManual {
 		return errors.New("invalid model_sync_mode")
+	}
+	// The channel's call policy is "" (inherit the site) or one of the two
+	// declared values. It is validated rather than normalized: normalize maps
+	// unknown input onto allow_probe, which is the right default for a site
+	// (there is nothing to inherit) and the wrong one here — a typo would
+	// silently authorize probing on a site that bans it.
+	ch.CallPolicy = strings.TrimSpace(ch.CallPolicy)
+	if ch.CallPolicy != "" && domain.NormalizeCallPolicy(ch.CallPolicy) != ch.CallPolicy {
+		return errors.New("invalid call_policy")
 	}
 	if ch.PayloadRules == "[]" {
 		ch.PayloadRules = ""
@@ -480,9 +595,36 @@ func (h *AdminHandler) validateChannel(ch *domain.Channel) error {
 	if err != nil || credential == nil || credential.SiteID != *ch.SiteID {
 		return errors.New("credential does not belong to site")
 	}
-	return nil
+	// A provider whose wire contract is not OpenAI chat ships its endpoint and
+	// field mapping with the provider itself, so picking it in the console is
+	// enough. Applied after the base-URL split above (a pasted full endpoint is
+	// already peeled off by then) and before the validation below, so the
+	// profile's own maps go through the same gate as a hand-written one.
+	providerType := ch.TypeHint
+	if providerType == "" {
+		providerType = site.Platform
+	}
+	proxy.ApplyProviderProfile(ch, providerType)
+	return validateUpstreamMap(ch)
 }
 
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
+
+// validateUpstreamMap validates the custom-endpoint / field-mapping columns and
+// canonicalizes their empty forms. It delegates the grammar to the proxy package
+// (which owns the runtime engine) so the API and the relay can never disagree
+// about what a valid mapping is.
+func validateUpstreamMap(ch *domain.Channel) error {
+	override, pathMap, requestMap, responseMap, err := proxy.ValidateUpstreamMap(
+		ch.UpstreamPathOverride, ch.UpstreamPathMap, ch.UpstreamRequestMap, ch.UpstreamResponseMap)
+	if err != nil {
+		return err
+	}
+	ch.UpstreamPathOverride = override
+	ch.UpstreamPathMap = pathMap
+	ch.UpstreamRequestMap = requestMap
+	ch.UpstreamResponseMap = responseMap
+	return nil
+}

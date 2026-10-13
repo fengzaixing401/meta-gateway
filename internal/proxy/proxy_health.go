@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -20,11 +21,14 @@ import (
 // consecutive counter) and auto-disables the channel once the channel-level
 // consecutive failures reach the configured threshold.
 //
-// Probe traffic is excluded: a failing probe is the answer the operator asked
-// for, not a fault, so it must not cool a member down, bump the channel
-// consecutive counter, or nudge the error rate.
+// Synthetic traffic (probes, the console's 试调) is excluded: a failed check is
+// the answer the operator asked for, not a fault, so it must not cool a member
+// down, bump the channel consecutive counter, or nudge the error rate. Cooling
+// a production channel because someone pressed 试调 would be a self-inflicted
+// outage, and it would lock the operator out of retrying that same row for the
+// length of the cooldown.
 func (s *Service) recordMemberFailure(req Request, memberID, channelID int64, model string, cooldown time.Duration, category string) {
-	if req.Probe {
+	if req.Probe || req.Diagnostic {
 		return
 	}
 	if !s.faultProtectionEnabled.Load() {
@@ -110,7 +114,54 @@ func (s *Service) recordMemberSuccess(channelID int64) {
 	}
 }
 
-func (s *Service) recordAttempt(req Request, candidate domain.RoutingCandidate, attempt int, result *relay.Result, category string, keyFP string) {
+// recordAttempt writes one attempt row. keyFP/keyID describe the upstream
+// credential that served it (empty/0 when the attempt failed before reaching a
+// key): the fingerprint identifies the key material, the id names the row the
+// console shows. The secret itself is never passed here.
+// markRealCall records the moment the upstream last received a request on this
+// channel — the clock a site's "no call for N days" ban counts against, and the
+// input the keepalive scheduler reads.
+//
+// It is called from recordAttempt, the one place every attempt passes through,
+// so client traffic, model probes and keepalives all feed one clock with no
+// per-path wiring to forget. An HTTP status is the test for "it arrived": a
+// transport failure (no status) never reached the upstream, while a 429 arrived
+// just as much as a 200 did.
+//
+// The write is throttled per channel in memory: the window is measured in days,
+// and one UPDATE per attempt would serialise SQLite's single writer for a value
+// a minute-old row already answers.
+func (s *Service) markRealCall(channelID int64, at time.Time) {
+	if channelID <= 0 || s.db == nil {
+		return
+	}
+	s.realCallMu.Lock()
+	if s.lastRealCallAt == nil {
+		s.lastRealCallAt = make(map[int64]time.Time)
+	}
+	if last, ok := s.lastRealCallAt[channelID]; ok && at.Sub(last) < realCallMarkInterval {
+		s.realCallMu.Unlock()
+		return
+	}
+	s.lastRealCallAt[channelID] = at
+	s.realCallMu.Unlock()
+
+	if err := s.db.Channel.MarkRealCall(channelID, at); err != nil {
+		log.Printf("proxy: mark real call channel=%d: %v", channelID, err)
+	}
+}
+
+// realCallMarkInterval is how stale the recorded clock may be. A minute keeps a
+// 15-day window exact while collapsing a burst of traffic into a single write.
+const realCallMarkInterval = time.Minute
+
+func (s *Service) recordAttempt(req Request, candidate domain.RoutingCandidate, attempt int, result *relay.Result, category string, keyFP string, keyID int64) {
+	// The idle clock starts here, before the probe early-return below: a probe is
+	// synthetic to us but it is a real request to the site, and it resets the
+	// same counter a client request would.
+	if result != nil && result.StatusCode > 0 {
+		s.markRealCall(candidate.Channel.ID, s.now())
+	}
 	// Probes are synthetic; logging them would flood the proxy log with
 	// traffic no client asked for. Their outcome lives in probe_results.
 	if req.Probe {
@@ -126,11 +177,26 @@ func (s *Service) recordAttempt(req Request, candidate domain.RoutingCandidate, 
 	if result.Err != nil || isRetryableStatus(result.StatusCode) || category == "refresh_retry" {
 		errorBrief = category
 	}
-	_, err := s.db.ProxyLog.Insert(&domain.ProxyLog{
-		RequestID:             req.RequestID,
-		ChannelID:             candidate.Channel.ID,
-		RouteID:               candidate.Member.RouteID,
+	logID, err := s.db.ProxyLog.Insert(&domain.ProxyLog{
+		RequestID: req.RequestID,
+		ChannelID: candidate.Channel.ID,
+		RouteID:   candidate.Member.RouteID,
+		MemberID:  candidate.Member.ID,
+		CompletionOutcome: func() string {
+			if result.Err != nil || status < 200 || status >= 300 {
+				return "failed"
+			}
+			return "pending"
+		}(),
+		RequestKind: func() string {
+			if req.Diagnostic {
+				return "diagnostic"
+			}
+			return "traffic"
+		}(),
 		Model:                 req.Model,
+		UpstreamModel:         req.UpstreamModel,
+		UpstreamURL:           req.UpstreamURLActual,
 		Status:                status,
 		LatencyMs:             result.LatencyMs,
 		Attempt:               attempt,
@@ -146,10 +212,18 @@ func (s *Service) recordAttempt(req Request, candidate domain.RoutingCandidate, 
 		ReasoningEffort:       req.ReasoningEffort,
 		MappedReasoningEffort: req.MappedReasoningEffort,
 		KeyFingerprint:        keyFP,
+		UpstreamKeyID:         keyID,
 		UpstreamRequestID:     upstreamRequestID(result),
 	})
 	if err != nil {
 		log.Printf("proxy: record attempt request_id=%s channel_id=%d attempt=%d: %v", req.RequestID, candidate.Channel.ID, attempt, err)
+	}
+	result.AttemptLogID = logID
+	// Live-trace failover chain: finalize this round's entry so the console
+	// shows A✗ → B✗ → C instead of only the current channel.
+	if observer := s.liveTraceObserver.Load(); observer != nil && req.RequestID != "" {
+		ok := result.Err == nil && result.StatusCode >= 200 && result.StatusCode < 300
+		(*observer).RoundOutcome(req.RequestID, attempt, candidate.Channel.Name, ok, category)
 	}
 }
 
@@ -220,12 +294,18 @@ func (s *Service) RecordUsage(req Request, channelID int64, status int, tokens u
 	if total <= 0 {
 		total = tokens.PromptTokens + tokens.CompletionTokens
 	}
-	if total <= 0 || s.db == nil {
+	if s.db == nil {
 		return
 	}
-	// Billing: cost = key unit prices × model ratio, computed and persisted at
+	// Missing usage cannot suppress a successful fixed fee. Failed responses
+	// without measured usage never incur a call charge. Keep zero token quotas.
+	if total <= 0 && (!tokens.Valid() && (status < 200 || status >= 300)) {
+		return
+	}
+	// Billing: local unit prices × model ratio, computed and persisted at
 	// record time so bills are stable even if prices are edited later.
 	record := &domain.UsageRecord{
+		UserID:              req.UserID,
 		RequestID:           req.RequestID,
 		DownstreamKeyID:     req.DownstreamKeyID,
 		ChannelID:           channelID,
@@ -245,7 +325,7 @@ func (s *Service) RecordUsage(req Request, channelID int64, status int, tokens u
 			record.GroupName = key.GroupName
 		}
 	}
-	record.Cost = s.billingCost(req, tokens)
+	record.Cost, record.BillingStatus, record.BillingEvidence = s.billingDecision(req, tokens)
 	// Usage row, downstream-key quota increment, and proxy-log token backfill
 	// commit in one transaction (store.RecordRelayUsage), so a partial failure
 	// can never leave metered usage without its quota charge.
@@ -254,31 +334,95 @@ func (s *Service) RecordUsage(req Request, channelID int64, status int, tokens u
 	}
 }
 
-// billingCost computes the persisted cost for a usage record: per-1k unit
-// prices of the downstream key, multiplied by the model's billing ratio.
-// Cache-read tokens are billed at the prompt rate. Failures are never fatal;
-// a price lookup error degrades to 0 cost rather than dropping the record.
 func (s *Service) billingCost(req Request, tokens usage.Tokens) float64 {
+	cost, _, _ := s.billingDecision(req, tokens)
+	return cost
+}
+
+func (s *Service) billingDecision(req Request, tokens usage.Tokens) (float64, string, string) {
 	if s.db == nil {
-		return 0
+		return 0, "calculation_error", ""
+	}
+	var layer domain.PriceLayer
+	var priced bool
+	if req.BillingSnapshot == nil {
+		layer, priced = s.priceLayer(req)
+	}
+	ratio, at := 1.0, time.Now()
+	if req.BillingSnapshot != nil {
+		layer, ratio, at = req.BillingSnapshot.Layer, req.BillingSnapshot.Ratio, req.BillingSnapshot.At
+		priced = layer.Priced()
+	} else if s.db.ModelRatio != nil {
+		if value, err := s.db.ModelRatio.GetRatio(req.Model); err == nil {
+			ratio = value
+		}
+	}
+	if !priced {
+		return 0, "unpriced", ""
+	}
+	input := tokens.BillingInputTokens()
+	rates := layer.Rates(input, at)
+	ordinary := max(input-max(tokens.CacheCreationTokens, 0), 0)
+	cost, valid := domain.DecimalCharge(rates, ordinary, tokens.CompletionTokens, tokens.CacheReadTokens, tokens.CacheCreationTokens, ratio)
+	status := "settled"
+	if !valid {
+		cost, status = 0, "calculation_error"
+	} else if layer.State == "free" {
+		status = "explicitly_free"
+	} else if layer.State == "explicit" && layer.Mode != "request" && ((tokens.CacheReadTokens > 0 && !layer.CachePresent && len(layer.Tiers) == 0) || (tokens.CacheCreationTokens > 0 && layer.CacheWrite == nil)) {
+		cost, status = 0, "price_missing"
+	} else if tokens.Estimated {
+		status = "estimated"
+	} else if !tokens.Valid() && rates.PerRequest == 0 {
+		status = "usage_missing"
+	}
+	evidence, _ := json.Marshal(map[string]any{"owner": layer.Owner, "revision": layer.Revision, "source": layer.Source, "quote_id": layer.QuoteID, "rule_state": layer.State, "rates": rates, "ratio": ratio, "evaluated_at": at, "usage_source": tokens.Source(), "ordinary_input_tokens": ordinary, "cache_read_tokens": tokens.CacheReadTokens, "cache_write_tokens": tokens.CacheCreationTokens})
+	return cost, status, string(evidence)
+}
+
+// Explicit rules freeze when the serving member is chosen. Legacy rules keep
+// their historical finish-time behavior until the operator replaces them.
+func (s *Service) freezeBilling(req Request) *BillingSnapshot {
+	layer, _ := s.priceLayer(req)
+	if layer.State == "legacy" {
+		return nil
 	}
 	ratio := 1.0
-	if s.db.ModelRatio != nil {
-		if r, err := s.db.ModelRatio.GetRatio(req.Model); err == nil {
-			ratio = r
-		} else {
-			log.Printf("proxy: billing ratio model=%s: %v", req.Model, err)
+	if r, err := s.db.ModelRatio.GetRatio(req.Model); err == nil {
+		ratio = r
+	}
+	return &BillingSnapshot{Layer: layer, Ratio: ratio, At: time.Now()}
+}
+
+// priceLayer resolves the price layer in force for a request: the member that
+// served it, else the model's own metadata.
+//
+// A layer that cannot be read is logged and skipped rather than fatal. The
+// second return value answers "is anything priced here", which is deliberately
+// NOT the same as "are the flat columns non-zero" — see billingCost.
+func (s *Service) priceLayer(req Request) (domain.PriceLayer, bool) {
+	if s.db.ModelMetadata == nil {
+		return domain.PriceLayer{}, false
+	}
+	upstream := req.UpstreamModel
+	// Internal callers may only carry the member id. Public relay callbacks
+	// pass the actual attempt model, avoiding this extra lookup on that path.
+	if upstream == "" && req.MemberID > 0 && s.db.RouteMember != nil {
+		if member, err := s.db.RouteMember.GetByID(req.MemberID); err == nil && member != nil {
+			var routeMapping string
+			if s.db.Route != nil {
+				if route, err := s.db.Route.GetByID(member.RouteID); err == nil && route != nil {
+					routeMapping = route.MappingJSON
+				}
+			}
+			upstream = domain.ResolveUpstreamModel(req.Model, member.MappingJSON, routeMapping)
 		}
 	}
-	pricePrompt, priceCompletion := 0.0, 0.0
-	if req.DownstreamKeyID > 0 && s.db.DownstreamKey != nil {
-		if key, err := s.db.DownstreamKey.GetByID(req.DownstreamKeyID); err == nil && key != nil {
-			pricePrompt, priceCompletion = key.PricePromptPer1k, key.PriceCompletionPer1k
-		}
+	layer, priced, err := s.db.ResolveBillingLayer(req.Model, upstream, req.MemberID)
+	if err != nil {
+		log.Printf("proxy: model prices model=%s: %v", req.Model, err)
 	}
-	prompt := float64(tokens.PromptTokens + tokens.CacheReadTokens + tokens.CacheCreationTokens)
-	completion := float64(tokens.CompletionTokens)
-	return (prompt/1000.0*pricePrompt + completion/1000.0*priceCompletion) * ratio
+	return layer, priced
 }
 
 // RecordStreamFailure marks the member that served a stream as failed after the

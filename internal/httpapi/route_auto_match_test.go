@@ -1,8 +1,11 @@
 package httpapi_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
@@ -14,16 +17,33 @@ import (
 	"github.com/lan/meta-gateway/internal/store"
 )
 
+// postExpectStatus sends a POST and returns the status code instead of failing
+// on an error code, so a test can assert the 404 the happy-path helper hides.
+func postExpectStatus(t *testing.T, url string, payload any) int {
+	t.Helper()
+	encoded, _ := json.Marshal(payload)
+	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(encoded))
+	req.Header.Set("Authorization", "Bearer admin-test")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+	return resp.StatusCode
+}
+
 // TestRouteAutoMatch covers the add-route dialog's auto-match end to end: the
 // preview endpoint, member attachment on create, and the flag being a
 // create-time directive rather than stored route state.
 func TestRouteAutoMatch(t *testing.T) {
 	dataDir := t.TempDir()
-	db, _ := store.Open(dataDir)
+	db, _ := store.OpenTest(dataDir)
 	defer db.Close()
 	enc, _ := crypto.New("auto-match-test-master-key-32-char!")
 	cfg := &config.Config{AdminToken: "admin-test", MetricsToken: "metrics-test", BackupDir: filepath.Join(dataDir, "backups"), MaxAdminBodyBytes: 1 << 20, AuditRetentionDays: 90, AuditRetentionRows: 100000, ExchangeAllowSecretExport: true, OutboundAllowCIDRs: []string{"127.0.0.1/32"}, Cooldown: time.Second}
-	server := httptest.NewServer(httpapi.New(cfg, db, enc))
+	server := httptest.NewServer(httpapi.NewTestRouter(t, cfg, db, enc))
 	defer server.Close()
 
 	var site struct{ ID int64 }
@@ -70,13 +90,274 @@ func TestRouteAutoMatch(t *testing.T) {
 
 func listMemberChannelIDs(t *testing.T, base string, routeID int64) []int64 {
 	t.Helper()
-	var members []struct {
-		ChannelID int64 `json:"channel_id"`
-	}
-	json.Unmarshal(get(t, fmt.Sprintf("%s/admin/routes/%d/members", base, routeID)), &members)
+	members := listMembers(t, base, routeID)
 	ids := make([]int64, 0, len(members))
 	for _, member := range members {
 		ids = append(ids, member.ChannelID)
 	}
 	return ids
+}
+
+func listMembers(t *testing.T, base string, routeID int64) []struct {
+	ChannelID int64  `json:"channel_id"`
+	GroupName string `json:"group_name"`
+} {
+	t.Helper()
+	var members []struct {
+		ChannelID int64  `json:"channel_id"`
+		GroupName string `json:"group_name"`
+	}
+	json.Unmarshal(get(t, fmt.Sprintf("%s/admin/routes/%d/members", base, routeID)), &members)
+	return members
+}
+
+// TestRouteAutoMatchExistingRoute covers the console's one-click "add every
+// channel that serves this model" on a route that already exists: the empty
+// body means all matches, an explicit list means the kept ones, and both go
+// through the same intersection as creation.
+func TestRouteAutoMatchExistingRoute(t *testing.T) {
+	dataDir := t.TempDir()
+	db, _ := store.OpenTest(dataDir)
+	defer db.Close()
+	enc, _ := crypto.New("auto-match-attach-master-key-32c!")
+	cfg := &config.Config{AdminToken: "admin-test", MetricsToken: "metrics-test", BackupDir: filepath.Join(dataDir, "backups"), MaxAdminBodyBytes: 1 << 20, AuditRetentionDays: 90, AuditRetentionRows: 100000, ExchangeAllowSecretExport: true, OutboundAllowCIDRs: []string{"127.0.0.1/32"}, Cooldown: time.Second}
+	server := httptest.NewServer(httpapi.NewTestRouter(t, cfg, db, enc))
+	defer server.Close()
+
+	var site struct{ ID int64 }
+	json.Unmarshal(post(t, server.URL+"/admin/sites", map[string]any{"name": "s", "base_url": "https://api.example.com", "platform": "openai-compatible", "status": "enabled"}), &site)
+	var cred struct{ ID int64 }
+	json.Unmarshal(post(t, server.URL+"/admin/sites/"+itoa(site.ID)+"/credentials", map[string]any{"kind": "api_key", "secret": "sk-test", "status": "enabled"}), &cred)
+	newChannel := func(name, modelsCSV, status string) int64 {
+		var channel struct{ ID int64 }
+		json.Unmarshal(post(t, server.URL+"/admin/channels", map[string]any{"site_id": site.ID, "credential_id": cred.ID, "name": name, "base_url": "https://api.example.com", "type_hint": "openai-compatible", "status": status, "models_csv": modelsCSV}), &channel)
+		return channel.ID
+	}
+	serving := newChannel("serving", "deepseek-v4-flash", "enabled")
+	alsoServing := newChannel("also-serving", "deepseek-v4-flash,gpt-4o", "enabled")
+	offline := newChannel("offline", "deepseek-v4-flash", "disabled")
+
+	var route struct{ ID int64 }
+	json.Unmarshal(post(t, server.URL+"/admin/routes", map[string]any{"model_pattern": "deepseek-v4-flash", "enabled": true}), &route)
+	if members := listMemberChannelIDs(t, server.URL, route.ID); len(members) != 0 {
+		t.Fatalf("bare members = %v, want none", members)
+	}
+
+	// An explicit list is intersected with the enabled matches: the disabled
+	// channel is refused, so the response reports the skip instead of silently
+	// attaching it.
+	var result struct {
+		Added   int `json:"added"`
+		Skipped int `json:"skipped"`
+	}
+	json.Unmarshal(post(t, fmt.Sprintf("%s/admin/routes/%d/auto-match", server.URL, route.ID),
+		map[string]any{"channel_ids": []int64{serving, offline, 99999}}), &result)
+	if result.Added != 1 || result.Skipped != 2 {
+		t.Fatalf("attach = %+v, want added 1 skipped 2", result)
+	}
+	if members := listMemberChannelIDs(t, server.URL, route.ID); len(members) != 1 || members[0] != serving {
+		t.Fatalf("members = %v, want [%d]", members, serving)
+	}
+
+	// Empty body = "every current match", and re-running adds nothing.
+	json.Unmarshal(post(t, fmt.Sprintf("%s/admin/routes/%d/auto-match", server.URL, route.ID), map[string]any{}), &result)
+	if result.Added != 1 || result.Skipped != 0 {
+		t.Fatalf("attach all = %+v, want added 1 skipped 0", result)
+	}
+	members := listMemberChannelIDs(t, server.URL, route.ID)
+	have := map[int64]bool{}
+	for _, id := range members {
+		have[id] = true
+	}
+	if len(members) != 2 || !have[serving] || !have[alsoServing] {
+		t.Fatalf("members = %v, want both %d and %d", members, serving, alsoServing)
+	}
+	json.Unmarshal(post(t, fmt.Sprintf("%s/admin/routes/%d/auto-match", server.URL, route.ID), map[string]any{}), &result)
+	if result.Added != 0 || result.Skipped != 0 {
+		t.Fatalf("idempotent attach = %+v, want a no-op", result)
+	}
+	if again := listMemberChannelIDs(t, server.URL, route.ID); len(again) != 2 {
+		t.Fatalf("members after re-run = %v, want no duplicates", again)
+	}
+
+	// group_name targets a member group instead of the implicit default, so
+	// the same channel can be attached to a second group without the default
+	// membership absorbing it (groups are additive, and a key bound to one
+	// group must not silently miss a channel attached to another).
+	json.Unmarshal(post(t, fmt.Sprintf("%s/admin/routes/%d/auto-match", server.URL, route.ID),
+		map[string]any{"channel_ids": []int64{serving}, "group_name": "blue"}), &result)
+	if result.Added != 1 || result.Skipped != 0 {
+		t.Fatalf("grouped attach = %+v, want added 1 skipped 0", result)
+	}
+	grouped := 0
+	for _, member := range listMembers(t, server.URL, route.ID) {
+		if member.ChannelID == serving && member.GroupName == "blue" {
+			grouped++
+		}
+	}
+	if grouped != 1 {
+		t.Fatalf("blue membership = %d, want exactly one row", grouped)
+	}
+	if rows := listMembers(t, server.URL, route.ID); len(rows) != 3 {
+		t.Fatalf("member rows = %d, want one per (channel, group) pair", len(rows))
+	}
+
+	// An unknown route is a 404, not a silent success.
+	if code := postExpectStatus(t, fmt.Sprintf("%s/admin/routes/99999/auto-match", server.URL), map[string]any{}); code != 404 {
+		t.Fatalf("unknown route status = %d, want 404", code)
+	}
+}
+
+// TestRouteAutoMatchRelatedScope covers the console's match-scope switch: a
+// route named after the base model can also adopt the channels that only list
+// a -variant of it, and those members carry a {"real": …} redirect so the
+// upstream receives a name it actually serves.
+func TestRouteAutoMatchRelatedScope(t *testing.T) {
+	dataDir := t.TempDir()
+	db, _ := store.OpenTest(dataDir)
+	defer db.Close()
+	enc, _ := crypto.New("auto-match-related-master-key-32c!")
+	cfg := &config.Config{AdminToken: "admin-test", MetricsToken: "metrics-test", BackupDir: filepath.Join(dataDir, "backups"), MaxAdminBodyBytes: 1 << 20, AuditRetentionDays: 90, AuditRetentionRows: 100000, ExchangeAllowSecretExport: true, OutboundAllowCIDRs: []string{"127.0.0.1/32"}, Cooldown: time.Second}
+	server := httptest.NewServer(httpapi.NewTestRouter(t, cfg, db, enc))
+	defer server.Close()
+
+	var site struct{ ID int64 }
+	json.Unmarshal(post(t, server.URL+"/admin/sites", map[string]any{"name": "s", "base_url": "https://api.example.com", "platform": "openai-compatible", "status": "enabled"}), &site)
+	var cred struct{ ID int64 }
+	json.Unmarshal(post(t, server.URL+"/admin/sites/"+itoa(site.ID)+"/credentials", map[string]any{"kind": "api_key", "secret": "sk-test", "status": "enabled"}), &cred)
+	newChannel := func(name, modelsCSV string) int64 {
+		var channel struct{ ID int64 }
+		json.Unmarshal(post(t, server.URL+"/admin/channels", map[string]any{"site_id": site.ID, "credential_id": cred.ID, "name": name, "base_url": "https://api.example.com", "type_hint": "openai-compatible", "status": "enabled", "models_csv": modelsCSV}), &channel)
+		return channel.ID
+	}
+	base := newChannel("base", "mimo-v2.5")
+	variant := newChannel("variant", "mimo-v2.5-flash")
+	// The name a prefix rule cannot reach: the term sits in the middle.
+	namespaced := newChannel("namespaced", "cn:mimo-v2.5-r1")
+
+	// The preview answers for the requested scope, and names what matched.
+	var preview struct {
+		Items []struct {
+			ChannelID int64  `json:"channel_id"`
+			Model     string `json:"model"`
+		} `json:"items"`
+	}
+	json.Unmarshal(get(t, server.URL+"/admin/discovery/model-channels?model=mimo-v2.5"), &preview)
+	if len(preview.Items) != 1 || preview.Items[0].ChannelID != base {
+		t.Fatalf("exact preview = %+v, want only the base channel", preview)
+	}
+	json.Unmarshal(get(t, server.URL+"/admin/discovery/model-channels?model=mimo-v2.5&match=related"), &preview)
+	if len(preview.Items) != 2 {
+		t.Fatalf("related preview = %+v, want base + variant", preview)
+	}
+	for _, item := range preview.Items {
+		if item.ChannelID == variant && item.Model != "mimo-v2.5-flash" {
+			t.Fatalf("variant matched as %q", item.Model)
+		}
+	}
+	// Contains reaches the namespaced name the prefix scope misses.
+	json.Unmarshal(get(t, server.URL+"/admin/discovery/model-channels?model=mimo-v2.5&match=contains"), &preview)
+	if len(preview.Items) != 3 {
+		t.Fatalf("contains preview = %+v, want every channel serving the family", preview)
+	}
+	for _, item := range preview.Items {
+		if item.ChannelID == namespaced && item.Model != "cn:mimo-v2.5-r1" {
+			t.Fatalf("namespaced matched as %q", item.Model)
+		}
+	}
+
+	// Creating with the related scope attaches base + variant, and the variant
+	// member rewrites its upstream name.
+	var route struct{ ID int64 }
+	json.Unmarshal(post(t, server.URL+"/admin/routes", map[string]any{"model_pattern": "mimo-v2.5", "enabled": true, "auto_match_mode": "related", "auto_match_channel_ids": []int64{base, variant}}), &route)
+	members := listMembers(t, server.URL, route.ID)
+	if len(members) != 2 {
+		t.Fatalf("members = %+v, want both channels", members)
+	}
+	var detail []struct {
+		ChannelID   int64  `json:"channel_id"`
+		MappingJSON string `json:"mapping_json"`
+	}
+	json.Unmarshal(get(t, fmt.Sprintf("%s/admin/routes/%d/members", server.URL, route.ID)), &detail)
+	for _, member := range detail {
+		switch member.ChannelID {
+		case base:
+			if member.MappingJSON != "" {
+				t.Fatalf("exact member must not rewrite: %+v", member)
+			}
+		case variant:
+			if member.MappingJSON != `{"real":"mimo-v2.5-flash"}` {
+				t.Fatalf("variant member mapping = %q", member.MappingJSON)
+			}
+		}
+	}
+
+	// The same request with the contains scope picks up the namespaced channel,
+	// and its member forwards the name that upstream actually serves.
+	var wide struct{ ID int64 }
+	json.Unmarshal(post(t, server.URL+"/admin/routes", map[string]any{"model_pattern": "mimo", "enabled": true, "auto_match_mode": "contains", "auto_match_channel_ids": []int64{base, variant, namespaced}}), &wide)
+	json.Unmarshal(get(t, fmt.Sprintf("%s/admin/routes/%d/members", server.URL, wide.ID)), &detail)
+	seen := map[int64]string{}
+	for _, member := range detail {
+		seen[member.ChannelID] = member.MappingJSON
+	}
+	if len(detail) != 3 {
+		t.Fatalf("contains members = %+v, want all three channels", detail)
+	}
+	if seen[namespaced] != `{"real":"cn:mimo-v2.5-r1"}` {
+		t.Fatalf("namespaced member mapping = %q, want the upstream name", seen[namespaced])
+	}
+}
+
+// TestCreateRouteBootstrapsCapabilities covers the half of the auto-sync that
+// has to happen inside the request: a model that was just routed gets its
+// built-in classification row without anyone pressing a button. The external
+// half is covered by the worker's own test — it must never block or fail a
+// create, so a deployment without catalogs behaves exactly like this.
+func TestCreateRouteBootstrapsCapabilities(t *testing.T) {
+	dataDir := t.TempDir()
+	db, _ := store.OpenTest(dataDir)
+	defer db.Close()
+	enc, _ := crypto.New("bootstrap-capability-master-key-32!")
+	cfg := &config.Config{AdminToken: "admin-test", MetricsToken: "metrics-test", BackupDir: filepath.Join(dataDir, "backups"), MaxAdminBodyBytes: 1 << 20, AuditRetentionDays: 90, AuditRetentionRows: 100000, ExchangeAllowSecretExport: true, OutboundAllowCIDRs: []string{"127.0.0.1/32"}, Cooldown: time.Second}
+	server := httptest.NewServer(httpapi.NewTestRouter(t, cfg, db, enc))
+	defer server.Close()
+
+	// A brand-new model name no catalog row can exist for yet.
+	json.Unmarshal(post(t, server.URL+"/admin/routes", map[string]any{"model_pattern": "grok-imagine-video", "enabled": true}), &struct{}{})
+
+	var caps struct {
+		Items []struct {
+			Model    string `json:"model"`
+			Kind     string `json:"kind"`
+			Source   string `json:"source"`
+			Endpoint string `json:"-"`
+		} `json:"items"`
+	}
+	json.Unmarshal(get(t, server.URL+"/admin/model-capabilities"), &caps)
+	found := false
+	for _, item := range caps.Items {
+		if item.Model != "grok-imagine-video" {
+			continue
+		}
+		found = true
+		if item.Kind != "video" {
+			t.Fatalf("kind = %q, want the classifier's video verdict", item.Kind)
+		}
+		if item.Source != "discovery" {
+			t.Fatalf("source = %q, want discovery (classifier-owned, still refreshable)", item.Source)
+		}
+	}
+	if !found {
+		t.Fatalf("route create did not bootstrap a capability row: %+v", caps.Items)
+	}
+
+	// A wildcard is a matcher, not a callable model: nothing to look up.
+	json.Unmarshal(post(t, server.URL+"/admin/routes", map[string]any{"model_pattern": "grok-*", "enabled": true}), &struct{}{})
+	json.Unmarshal(get(t, server.URL+"/admin/model-capabilities"), &caps)
+	for _, item := range caps.Items {
+		if item.Model == "grok-*" {
+			t.Fatal("a wildcard pattern must not become a capability row")
+		}
+	}
 }

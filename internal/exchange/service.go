@@ -19,7 +19,7 @@ type DiscoveryRefresher interface {
 	Refresh(context.Context, int64) (*discovery.RefreshResult, error)
 }
 
-// KeySyncer pulls upstream sk- keys using a site user token (best-effort).
+// KeySyncer pulls upstream relay keys using a site user token (best-effort).
 type KeySyncer interface {
 	SyncKeys(ctx context.Context, channelID int64) (created, reused, masked int, category string, err error)
 }
@@ -60,6 +60,10 @@ type ImportResult struct {
 	KeySyncSkipped      int                `json:"key_sync_skipped_count"`
 	KeySync             []KeySyncOutcome   `json:"key_sync,omitempty"`
 	Items               []CapabilityItem   `json:"items"`
+	// Skipped lists rows the document carried that could not be imported
+	// (no credential, duplicate identity, bad base URL). They never fail the
+	// import; the operator decides what to do with them.
+	Skipped []SkippedItem `json:"skipped,omitempty"`
 }
 
 type KeySyncOutcome struct {
@@ -125,7 +129,8 @@ func (s *Service) Export(ctx context.Context, request ExportRequest) (*Envelope,
 		}
 		item := Item{Name: strings.TrimSpace(row.Name), BaseURL: baseURL,
 			Models: normalizeList([]string{row.ModelsCSV}), Group: normalizeGroup(row.GroupName),
-			Priority: row.Priority, Weight: row.Weight, SiteTypeHint: normalizeType(typeHint)}
+			Priority: row.Priority, Weight: row.Weight, SiteTypeHint: normalizeType(typeHint),
+			CheckinEnabled: row.CheckinEnabled}
 		if request.IncludeSecrets {
 			plaintext, decryptErr := s.enc.Decrypt(row.SecretEnc)
 			if decryptErr != nil {
@@ -168,10 +173,11 @@ func (s *Service) ImportWithOptions(ctx context.Context, data []byte, opts Impor
 	if mode != ImportModeIncremental && mode != ImportModeReplace {
 		return nil, formatError(ErrorValidation)
 	}
-	items, err := Parse(data)
+	report, err := ParseWithReport(data)
 	if err != nil {
 		return nil, err
 	}
+	items := report.Items
 	var candidates []store.ExchangeLegacyCandidate
 	if mode == ImportModeIncremental {
 		candidates, err = s.store.LegacyCandidates(ctx)
@@ -216,7 +222,8 @@ func (s *Service) ImportWithOptions(ctx context.Context, data []byte, opts Impor
 		return nil, formatError(ErrorInternal)
 	}
 	result := &ImportResult{CreatedCount: len(persisted.CreatedChannelIDs),
-		UpdatedCount: len(persisted.UpdatedChannelIDs), AdoptedCount: len(persisted.AdoptedChannelIDs)}
+		UpdatedCount: len(persisted.UpdatedChannelIDs), AdoptedCount: len(persisted.AdoptedChannelIDs),
+		Skipped: report.Skipped}
 	result.ChannelIDs = persisted.ChannelIDs()
 	sort.Slice(result.ChannelIDs, func(i, j int) bool { return result.ChannelIDs[i] < result.ChannelIDs[j] })
 	// Channels are already committed. Post-steps are best-effort only.

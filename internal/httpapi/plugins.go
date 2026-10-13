@@ -5,10 +5,11 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"log/slog"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	pathpkg "path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -46,6 +47,8 @@ func (h *PluginHandler) Register(r chi.Router) {
 	r.Get("/plugins/catalog", h.catalog)
 	r.Get("/plugins/status", h.status)
 	r.Get("/plugins", h.list)
+	// Static segment before the {id} routes, matching the other plugin routes.
+	r.Get("/plugins/hooks", h.hooksDeclarations)
 	r.Get("/plugins/market", h.marketList)
 	r.Post("/plugins/market/{id}/install", h.marketInstall)
 	r.Post("/plugins/register", h.registerSidecar)
@@ -64,9 +67,18 @@ func (h *PluginHandler) Register(r chi.Router) {
 func (h *PluginHandler) marketList(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
+	entries, err := h.service.MarketPlugins(ctx)
+	if err != nil {
+		// No registry answered. Reporting an empty market here sent operators
+		// looking for a plugin that "is not published" while the real problem
+		// was a registry the gateway could not reach (2026-09-25).
+		slog.Warn("plugin market unavailable", "error", err)
+		writeError(w, http.StatusBadGateway, "plugin_market_unavailable")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"sources": h.service.MarketSources(),
-		"plugins": h.service.MarketPlugins(ctx),
+		"plugins": entries,
 	})
 }
 
@@ -117,6 +129,17 @@ func (h *PluginHandler) RegisterPublic(r chi.Router) {
 
 func (h *PluginHandler) catalog(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, h.service.Catalog())
+}
+
+// hooksDeclarations lists every loaded intercept hook: which plugin sees which
+// models at which point. The console shows this so an operator can tell that a
+// virtual model ("auto") is answered by a plugin rather than a route.
+func (h *PluginHandler) hooksDeclarations(w http.ResponseWriter, _ *http.Request) {
+	hooks := h.service.HookStatuses()
+	if hooks == nil {
+		hooks = []plugins.HookStatus{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"hooks": hooks})
 }
 
 func (h *PluginHandler) list(w http.ResponseWriter, _ *http.Request) {
@@ -399,36 +422,7 @@ func (h *PluginHandler) proxySidecar(w http.ResponseWriter, r *http.Request) {
 		requestPath = "/"
 	}
 	target.Path = strings.TrimRight(target.Path, "/") + "/" + strings.TrimLeft(requestPath, "/")
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	// NewSingleHostReverseProxy only rewrites scheme/host; the path must be
-	// set explicitly or the plugin receives /admin/plugins/{id}/proxy/… and
-	// 404s. Query params are preserved (the admin ?t= token is stripped).
-	proxy.Director = func(req *http.Request) {
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.URL.Path = target.Path
-		if spec.APIKey != "" {
-			req.Header.Set("X-Plugin-Key", spec.APIKey)
-		}
-		if configHeader != "" {
-			req.Header.Set(plugins.XPluginConfigHeader, configHeader)
-		}
-		if authMode == sidecarAuthAdmin {
-			req.Header.Del("Authorization")
-		} else if authMode == sidecarAuthPlugin {
-			// Normalize the accepted plugin credential so surrounding whitespace
-			// cannot be interpreted differently by the sidecar.
-			req.Header.Set("Authorization", "Bearer "+pluginToken)
-		}
-		q := req.URL.Query()
-		q.Del("t")
-		req.URL.RawQuery = q.Encode()
-	}
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		setPluginSecurityHeaderValues(resp.Header)
-		return nil
-	}
-	proxy.ServeHTTP(w, r)
+	newPluginReverseProxy(target, h.service.SidecarTransport(), authMode, pluginToken, spec.APIKey, configHeader).ServeHTTP(w, r)
 }
 
 // forwardAPIPrefix reverse-proxies a root-level API prefix (declared via
@@ -467,31 +461,7 @@ func (h *PluginHandler) forwardAPIPrefix(w http.ResponseWriter, r *http.Request)
 	// Preserve the full prefix path: /v0/management/login → {url}/v0/management/login.
 	rest := strings.TrimPrefix(r.URL.Path, owner.Prefix)
 	target.Path = strings.TrimRight(target.Path, "/") + owner.Prefix + rest
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.Director = func(req *http.Request) {
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.URL.Path = target.Path
-		if owner.Spec.APIKey != "" {
-			req.Header.Set("X-Plugin-Key", owner.Spec.APIKey)
-		}
-		if configHeader != "" {
-			req.Header.Set(plugins.XPluginConfigHeader, configHeader)
-		}
-		if authMode == sidecarAuthAdmin {
-			req.Header.Del("Authorization")
-		} else if authMode == sidecarAuthPlugin {
-			req.Header.Set("Authorization", "Bearer "+pluginToken)
-		}
-		q := req.URL.Query()
-		q.Del("t")
-		req.URL.RawQuery = q.Encode()
-	}
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		setPluginSecurityHeaderValues(resp.Header)
-		return nil
-	}
-	proxy.ServeHTTP(w, r)
+	newPluginReverseProxy(target, h.service.SidecarTransport(), authMode, pluginToken, owner.Spec.APIKey, configHeader).ServeHTTP(w, r)
 }
 
 // sidecarAuth authenticates a public sidecar request and returns the forwarding
@@ -582,7 +552,23 @@ func equalSecret(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
+// pluginErrorCodePattern pulls the machine-readable code out of a wrapped
+// plugin error ("plugin_artifact_download: Get \"https://…\": …").
+var pluginErrorCodePattern = regexp.MustCompile(`plugin_[a-z0-9_]+`)
+
+// writePluginError maps a plugin error onto a response.
+//
+// The default branch used to answer a bare "internal_error" with no log line,
+// which made a registry timeout indistinguishable from a corrupt archive and
+// left nothing to diagnose (2026-09-25). Now the code travels to the console
+// (the frontend catalog turns it into a sentence) and the full chain goes to
+// the log; upstream-shaped failures — registry, release API, artifact host —
+// answer 502 because the operator's configuration is not what failed.
 func writePluginError(w http.ResponseWriter, err error) {
+	code := pluginErrorCodePattern.FindString(err.Error())
+	if code == "" {
+		code = "internal_error"
+	}
 	switch {
 	case errors.Is(err, plugins.ErrNotFound):
 		writeError(w, http.StatusNotFound, "plugin_not_found")
@@ -594,20 +580,26 @@ func writePluginError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "plugin_invalid_id")
 	case errors.Is(err, plugins.ErrCoreImmutable):
 		writeError(w, http.StatusBadRequest, "plugin_core_immutable")
+	case isUpstreamPluginFailure(code):
+		slog.Error("plugin install failed", "code", code, "error", err)
+		writeError(w, http.StatusBadGateway, code)
 	default:
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		slog.Error("plugin request failed", "code", code, "error", err)
+		writeError(w, http.StatusInternalServerError, code)
 	}
 }
 
-// requirePluginEnabled returns middleware that 404s unless plugin id is enabled.
-func requirePluginEnabled(service *plugins.Service, id string) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if service == nil || !service.IsEnabled(id) {
-				writeError(w, http.StatusNotFound, "plugin_disabled")
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
+// isUpstreamPluginFailure reports whether the failure happened outside the
+// gateway: an unreachable registry, a GitHub release that cannot be resolved,
+// or an artifact host that answered with an error or the wrong bytes.
+func isUpstreamPluginFailure(code string) bool {
+	switch {
+	case code == "plugin_market_unavailable":
+		return true
+	case strings.HasPrefix(code, "plugin_release_"):
+		return true
+	case strings.HasPrefix(code, "plugin_artifact_"):
+		return true
 	}
+	return false
 }

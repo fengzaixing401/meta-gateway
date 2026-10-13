@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,87 +16,88 @@ func (h *AdminHandler) listDownstreamKeys(w http.ResponseWriter, r *http.Request
 		writeStoreError(w, err)
 		return
 	}
+	// Cost is the persisted billing total per key (SUM of usage_records.cost),
+	// not a price×token estimate: each request bills at the resolved model
+	// price, so only the recorded cost is authoritative.
+	costByKey := map[int64]float64{}
+	if h.db.Usage != nil {
+		if costs, costErr := h.db.Usage.CostByKey(); costErr == nil {
+			costByKey = costs
+		} else {
+			log.Printf("admin: downstream key costs: %v", costErr)
+		}
+	}
 	// Never expose token_hash.
 	type safeKey struct {
-		ID                   int64   `json:"id"`
-		Name                 string  `json:"name"`
-		Enabled              bool    `json:"enabled"`
-		Scopes               string  `json:"scopes,omitempty"`
-		QuotaTotalTokens     int64   `json:"quota_total_tokens"`
-		QuotaUsedTokens      int64   `json:"quota_used_tokens"`
-		PricePromptPer1k     float64 `json:"price_prompt_per_1k"`
-		PriceCompletionPer1k float64 `json:"price_completion_per_1k"`
-		PriceCachePer1k      float64 `json:"price_cache_per_1k"`
-		ModelAllowlist       string  `json:"model_allowlist,omitempty"`
-		ModelDenylist        string  `json:"model_denylist,omitempty"`
-		ExpiresAt            string  `json:"expires_at,omitempty"`
-		AllowedIPs           string  `json:"allowed_ips,omitempty"`
-		RouteGroupName       string  `json:"route_group_name,omitempty"`
-		EstimatedCost        float64 `json:"estimated_cost"`
-		CreatedAt            string  `json:"created_at"`
-		HasToken             bool    `json:"has_token"`
+		ID               int64  `json:"id"`
+		UserID           int64  `json:"user_id,omitempty"`
+		Name             string `json:"name"`
+		Enabled          bool   `json:"enabled"`
+		Scopes           string `json:"scopes,omitempty"`
+		QuotaTotalTokens int64  `json:"quota_total_tokens"`
+		QuotaUsedTokens  int64  `json:"quota_used_tokens"`
+		// The same budget in money (0 = unlimited). Both are enforced.
+		QuotaTotalCost float64 `json:"quota_total_cost"`
+		QuotaUsedCost  float64 `json:"quota_used_cost"`
+		ModelAllowlist string  `json:"model_allowlist,omitempty"`
+		ModelDenylist  string  `json:"model_denylist,omitempty"`
+		ExpiresAt      string  `json:"expires_at,omitempty"`
+		AllowedIPs     string  `json:"allowed_ips,omitempty"`
+		RouteGroupName string  `json:"route_group_name,omitempty"`
+		// The tenant group this token is bound to (its quota/rate-limit
+		// container). Returned so the console can show and resubmit it; without
+		// the field the binding was write-only.
+		GroupName string  `json:"group_name,omitempty"`
+		Cost      float64 `json:"cost"`
+		CreatedAt string  `json:"created_at"`
+		HasToken  bool    `json:"has_token"`
 	}
 	result := make([]safeKey, 0, len(keys))
 	for _, k := range keys {
-		// Cost estimate uses used tokens split is unknown at key level; charge all used as prompt-equivalent mixed average.
-		estimated := 0.0
-		if k.QuotaUsedTokens > 0 {
-			// Prefer average of prompt/completion unit prices when both set; else whichever is set.
-			unit := 0.0
-			if k.PricePromptPer1k > 0 && k.PriceCompletionPer1k > 0 {
-				unit = (k.PricePromptPer1k + k.PriceCompletionPer1k) / 2
-			} else if k.PricePromptPer1k > 0 {
-				unit = k.PricePromptPer1k
-			} else {
-				unit = k.PriceCompletionPer1k
-			}
-			if unit > 0 {
-				estimated = (float64(k.QuotaUsedTokens) / 1000.0) * unit
-			}
-		}
 		// Re-viewable plaintext is available only for keys created after
 		// plaintext storage landed (token_enc set).
 		hasToken := len(k.TokenEnc) > 0
 		result = append(result, safeKey{
-			ID:                   k.ID,
-			Name:                 k.Name,
-			Enabled:              k.Enabled,
-			Scopes:               k.Scopes,
-			QuotaTotalTokens:     k.QuotaTotalTokens,
-			QuotaUsedTokens:      k.QuotaUsedTokens,
-			PricePromptPer1k:     k.PricePromptPer1k,
-			PriceCompletionPer1k: k.PriceCompletionPer1k,
-			PriceCachePer1k:      k.PriceCachePer1k,
-			ModelAllowlist:       k.ModelAllowlist,
-			ModelDenylist:        k.ModelDenylist,
-			ExpiresAt:            k.ExpiresAt,
-			AllowedIPs:           k.AllowedIPs,
-			RouteGroupName:       k.RouteGroupName,
-			EstimatedCost:        estimated,
-			CreatedAt:            k.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
-			HasToken:             hasToken,
+			ID:               k.ID,
+			UserID:           k.UserID,
+			Name:             k.Name,
+			Enabled:          k.Enabled,
+			Scopes:           k.Scopes,
+			QuotaTotalTokens: k.QuotaTotalTokens,
+			QuotaUsedTokens:  k.QuotaUsedTokens,
+			QuotaTotalCost:   k.QuotaTotalCost,
+			QuotaUsedCost:    k.QuotaUsedCost,
+			ModelAllowlist:   k.ModelAllowlist,
+			ModelDenylist:    k.ModelDenylist,
+			ExpiresAt:        k.ExpiresAt,
+			AllowedIPs:       k.AllowedIPs,
+			RouteGroupName:   k.RouteGroupName,
+			GroupName:        k.GroupName,
+			Cost:             costByKey[k.ID],
+			CreatedAt:        k.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+			HasToken:         hasToken,
 		})
 	}
 	writeJSON(w, http.StatusOK, result)
 }
 
 type createKeyResponse struct {
-	ID                   int64   `json:"id"`
-	Name                 string  `json:"name"`
-	Token                string  `json:"token"`
-	Enabled              bool    `json:"enabled"`
-	Scopes               string  `json:"scopes,omitempty"`
-	QuotaTotalTokens     int64   `json:"quota_total_tokens"`
-	QuotaUsedTokens      int64   `json:"quota_used_tokens"`
-	PricePromptPer1k     float64 `json:"price_prompt_per_1k"`
-	PriceCompletionPer1k float64 `json:"price_completion_per_1k"`
-	PriceCachePer1k      float64 `json:"price_cache_per_1k"`
-	ModelAllowlist       string  `json:"model_allowlist,omitempty"`
-	ModelDenylist        string  `json:"model_denylist,omitempty"`
-	ExpiresAt            string  `json:"expires_at,omitempty"`
-	AllowedIPs           string  `json:"allowed_ips,omitempty"`
-	RouteGroupName       string  `json:"route_group_name,omitempty"`
-	CreatedAt            string  `json:"created_at"`
+	ID               int64   `json:"id"`
+	Name             string  `json:"name"`
+	Token            string  `json:"token"`
+	Enabled          bool    `json:"enabled"`
+	Scopes           string  `json:"scopes,omitempty"`
+	QuotaTotalTokens int64   `json:"quota_total_tokens"`
+	QuotaUsedTokens  int64   `json:"quota_used_tokens"`
+	QuotaTotalCost   float64 `json:"quota_total_cost"`
+	QuotaUsedCost    float64 `json:"quota_used_cost"`
+	ModelAllowlist   string  `json:"model_allowlist,omitempty"`
+	ModelDenylist    string  `json:"model_denylist,omitempty"`
+	ExpiresAt        string  `json:"expires_at,omitempty"`
+	AllowedIPs       string  `json:"allowed_ips,omitempty"`
+	RouteGroupName   string  `json:"route_group_name,omitempty"`
+	GroupName        string  `json:"group_name,omitempty"`
+	CreatedAt        string  `json:"created_at"`
 }
 
 func (h *AdminHandler) createDownstreamKey(w http.ResponseWriter, r *http.Request) {
@@ -103,18 +105,16 @@ func (h *AdminHandler) createDownstreamKey(w http.ResponseWriter, r *http.Reques
 		Name string `json:"name"`
 		// Token is optional. When empty, the server generates an mg-… secret.
 		// When set, the provided secret is stored as a hash only (raw never re-readable).
-		Token                string  `json:"token,omitempty"`
-		Scopes               string  `json:"scopes,omitempty"`
-		QuotaTotalTokens     int64   `json:"quota_total_tokens"`
-		PricePromptPer1k     float64 `json:"price_prompt_per_1k"`
-		PriceCompletionPer1k float64 `json:"price_completion_per_1k"`
-		PriceCachePer1k      float64 `json:"price_cache_per_1k"`
-		GroupName            string  `json:"group_name,omitempty"`
-		ModelAllowlist       string  `json:"model_allowlist,omitempty"`
-		ModelDenylist        string  `json:"model_denylist,omitempty"`
-		ExpiresAt            string  `json:"expires_at,omitempty"`
-		AllowedIPs           string  `json:"allowed_ips,omitempty"`
-		RouteGroupName       string  `json:"route_group_name,omitempty"`
+		Token            string  `json:"token,omitempty"`
+		Scopes           string  `json:"scopes,omitempty"`
+		QuotaTotalTokens int64   `json:"quota_total_tokens"`
+		QuotaTotalCost   float64 `json:"quota_total_cost"`
+		GroupName        string  `json:"group_name,omitempty"`
+		ModelAllowlist   string  `json:"model_allowlist,omitempty"`
+		ModelDenylist    string  `json:"model_denylist,omitempty"`
+		ExpiresAt        string  `json:"expires_at,omitempty"`
+		AllowedIPs       string  `json:"allowed_ips,omitempty"`
+		RouteGroupName   string  `json:"route_group_name,omitempty"`
 	}
 	if err := decodeJSON(w, r, &req, 0, false); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON")
@@ -161,8 +161,8 @@ func (h *AdminHandler) createDownstreamKey(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "quota_total_tokens must be >= 0")
 		return
 	}
-	if req.PricePromptPer1k < 0 || req.PriceCompletionPer1k < 0 || req.PriceCachePer1k < 0 {
-		writeError(w, http.StatusBadRequest, "prices must be >= 0")
+	if req.QuotaTotalCost < 0 {
+		writeError(w, http.StatusBadRequest, "quota_total_cost must be >= 0")
 		return
 	}
 	if err := auth.ValidateKeyExpiry(req.ExpiresAt); err != nil {
@@ -181,21 +181,19 @@ func (h *AdminHandler) createDownstreamKey(w http.ResponseWriter, r *http.Reques
 		tokenEnc = encToken
 	}
 	key := &domain.DownstreamKey{
-		TokenHash:            hash,
-		TokenEnc:             []byte(tokenEnc),
-		Name:                 req.Name,
-		Enabled:              true,
-		Scopes:               req.Scopes,
-		QuotaTotalTokens:     req.QuotaTotalTokens,
-		PricePromptPer1k:     req.PricePromptPer1k,
-		PriceCompletionPer1k: req.PriceCompletionPer1k,
-		PriceCachePer1k:      req.PriceCachePer1k,
-		ModelAllowlist:       strings.TrimSpace(req.ModelAllowlist),
-		ModelDenylist:        strings.TrimSpace(req.ModelDenylist),
-		ExpiresAt:            strings.TrimSpace(req.ExpiresAt),
-		AllowedIPs:           strings.TrimSpace(req.AllowedIPs),
-		GroupName:            strings.TrimSpace(req.GroupName),
-		RouteGroupName:       strings.TrimSpace(req.RouteGroupName),
+		TokenHash:        hash,
+		TokenEnc:         []byte(tokenEnc),
+		Name:             req.Name,
+		Enabled:          true,
+		Scopes:           req.Scopes,
+		QuotaTotalTokens: req.QuotaTotalTokens,
+		QuotaTotalCost:   req.QuotaTotalCost,
+		ModelAllowlist:   strings.TrimSpace(req.ModelAllowlist),
+		ModelDenylist:    strings.TrimSpace(req.ModelDenylist),
+		ExpiresAt:        strings.TrimSpace(req.ExpiresAt),
+		AllowedIPs:       strings.TrimSpace(req.AllowedIPs),
+		GroupName:        strings.TrimSpace(req.GroupName),
+		RouteGroupName:   strings.TrimSpace(req.RouteGroupName),
 	}
 	id, err := h.db.DownstreamKey.Create(key)
 	if err != nil {
@@ -209,22 +207,22 @@ func (h *AdminHandler) createDownstreamKey(w http.ResponseWriter, r *http.Reques
 	}
 
 	writeJSON(w, http.StatusCreated, createKeyResponse{
-		ID:                   id,
-		Name:                 req.Name,
-		Token:                raw,
-		Enabled:              true,
-		Scopes:               req.Scopes,
-		QuotaTotalTokens:     req.QuotaTotalTokens,
-		QuotaUsedTokens:      0,
-		PricePromptPer1k:     req.PricePromptPer1k,
-		PriceCompletionPer1k: req.PriceCompletionPer1k,
-		PriceCachePer1k:      req.PriceCachePer1k,
-		ModelAllowlist:       strings.TrimSpace(req.ModelAllowlist),
-		ModelDenylist:        strings.TrimSpace(req.ModelDenylist),
-		ExpiresAt:            strings.TrimSpace(req.ExpiresAt),
-		AllowedIPs:           strings.TrimSpace(req.AllowedIPs),
-		RouteGroupName:       strings.TrimSpace(req.RouteGroupName),
-		CreatedAt:            createdAt,
+		ID:               id,
+		Name:             req.Name,
+		Token:            raw,
+		Enabled:          true,
+		Scopes:           req.Scopes,
+		QuotaTotalTokens: req.QuotaTotalTokens,
+		QuotaUsedTokens:  0,
+		QuotaTotalCost:   req.QuotaTotalCost,
+		QuotaUsedCost:    0,
+		ModelAllowlist:   strings.TrimSpace(req.ModelAllowlist),
+		ModelDenylist:    strings.TrimSpace(req.ModelDenylist),
+		ExpiresAt:        strings.TrimSpace(req.ExpiresAt),
+		AllowedIPs:       strings.TrimSpace(req.AllowedIPs),
+		RouteGroupName:   strings.TrimSpace(req.RouteGroupName),
+		GroupName:        strings.TrimSpace(req.GroupName),
+		CreatedAt:        createdAt,
 	})
 }
 
@@ -243,20 +241,18 @@ func (h *AdminHandler) updateDownstreamKey(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var req struct {
-		Name                 *string  `json:"name"`
-		Enabled              *bool    `json:"enabled"`
-		Scopes               *string  `json:"scopes"`
-		QuotaTotalTokens     *int64   `json:"quota_total_tokens"`
-		PricePromptPer1k     *float64 `json:"price_prompt_per_1k"`
-		PriceCompletionPer1k *float64 `json:"price_completion_per_1k"`
-		PriceCachePer1k      *float64 `json:"price_cache_per_1k"`
-		GroupName            *string  `json:"group_name"`
-		ModelAllowlist       *string  `json:"model_allowlist"`
-		ModelDenylist        *string  `json:"model_denylist"`
-		ExpiresAt            *string  `json:"expires_at"`
-		AllowedIPs           *string  `json:"allowed_ips"`
-		RouteGroupName       *string  `json:"route_group_name"`
-		ResetUsed            bool     `json:"reset_used"`
+		Name             *string  `json:"name"`
+		Enabled          *bool    `json:"enabled"`
+		Scopes           *string  `json:"scopes"`
+		QuotaTotalTokens *int64   `json:"quota_total_tokens"`
+		QuotaTotalCost   *float64 `json:"quota_total_cost"`
+		GroupName        *string  `json:"group_name"`
+		ModelAllowlist   *string  `json:"model_allowlist"`
+		ModelDenylist    *string  `json:"model_denylist"`
+		ExpiresAt        *string  `json:"expires_at"`
+		AllowedIPs       *string  `json:"allowed_ips"`
+		RouteGroupName   *string  `json:"route_group_name"`
+		ResetUsed        bool     `json:"reset_used"`
 	}
 	if err := decodeJSON(w, r, &req, 0, false); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON")
@@ -288,26 +284,12 @@ func (h *AdminHandler) updateDownstreamKey(w http.ResponseWriter, r *http.Reques
 		}
 		existing.QuotaTotalTokens = *req.QuotaTotalTokens
 	}
-	if req.PricePromptPer1k != nil {
-		if *req.PricePromptPer1k < 0 {
-			writeError(w, http.StatusBadRequest, "price_prompt_per_1k must be >= 0")
+	if req.QuotaTotalCost != nil {
+		if *req.QuotaTotalCost < 0 {
+			writeError(w, http.StatusBadRequest, "quota_total_cost must be >= 0")
 			return
 		}
-		existing.PricePromptPer1k = *req.PricePromptPer1k
-	}
-	if req.PriceCompletionPer1k != nil {
-		if *req.PriceCompletionPer1k < 0 {
-			writeError(w, http.StatusBadRequest, "price_completion_per_1k must be >= 0")
-			return
-		}
-		existing.PriceCompletionPer1k = *req.PriceCompletionPer1k
-	}
-	if req.PriceCachePer1k != nil {
-		if *req.PriceCachePer1k < 0 {
-			writeError(w, http.StatusBadRequest, "price_cache_per_1k must be >= 0")
-			return
-		}
-		existing.PriceCachePer1k = *req.PriceCachePer1k
+		existing.QuotaTotalCost = *req.QuotaTotalCost
 	}
 	if req.ModelAllowlist != nil {
 		existing.ModelAllowlist = strings.TrimSpace(*req.ModelAllowlist)
@@ -344,27 +326,28 @@ func (h *AdminHandler) updateDownstreamKey(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		existing.QuotaUsedTokens = 0
+		existing.QuotaUsedCost = 0
 	}
 	if err := h.db.DownstreamKey.Update(existing); err != nil {
 		writeStoreError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":                      existing.ID,
-		"name":                    existing.Name,
-		"enabled":                 existing.Enabled,
-		"scopes":                  existing.Scopes,
-		"quota_total_tokens":      existing.QuotaTotalTokens,
-		"quota_used_tokens":       existing.QuotaUsedTokens,
-		"price_prompt_per_1k":     existing.PricePromptPer1k,
-		"price_completion_per_1k": existing.PriceCompletionPer1k,
-		"price_cache_per_1k":      existing.PriceCachePer1k,
-		"model_allowlist":         existing.ModelAllowlist,
-		"model_denylist":          existing.ModelDenylist,
-		"expires_at":              existing.ExpiresAt,
-		"allowed_ips":             existing.AllowedIPs,
-		"route_group_name":        existing.RouteGroupName,
-		"created_at":              existing.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		"id":                 existing.ID,
+		"name":               existing.Name,
+		"enabled":            existing.Enabled,
+		"scopes":             existing.Scopes,
+		"quota_total_tokens": existing.QuotaTotalTokens,
+		"quota_used_tokens":  existing.QuotaUsedTokens,
+		"quota_total_cost":   existing.QuotaTotalCost,
+		"quota_used_cost":    existing.QuotaUsedCost,
+		"model_allowlist":    existing.ModelAllowlist,
+		"model_denylist":     existing.ModelDenylist,
+		"expires_at":         existing.ExpiresAt,
+		"allowed_ips":        existing.AllowedIPs,
+		"route_group_name":   existing.RouteGroupName,
+		"group_name":         existing.GroupName,
+		"created_at":         existing.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 	})
 }
 

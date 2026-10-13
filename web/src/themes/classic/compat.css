@@ -1,0 +1,377 @@
+/* The classic frame owns its layout; business views and safe overlays are shared. */
+:root[data-appearance="classic"] .theme-classic { --nav-width: 0px; background: transparent; }
+/* The atmosphere element carries two jobs: the ambient haze (CSS on modern)
+   and the user's persisted custom background (inline style from ConsoleShell).
+   Classic wants the image but none of the indigo haze — and it wants the
+   alabaster veil the old .console-custom-bg block used to lay over it.
+   Keying the veil on [style] keeps it off when no image is configured. */
+:root[data-appearance="classic"] .theme-classic .console-atmosphere { background-image: none; }
+:root[data-appearance="classic"] .theme-classic .console-atmosphere[style]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(160deg, rgba(248, 250, 252, .94) 0%, rgba(244, 247, 250, .9) 45%, rgba(236, 242, 247, .95) 100%);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+}
+:root[data-appearance="classic"] .theme-classic .console-main { margin-left: 0; min-height: calc(100dvh - 95px); }
+:root[data-appearance="classic"] .theme-classic .console-content { max-width: 1600px; padding: 0 24px; }
+:root[data-appearance="classic"] .theme-classic .page { padding: 28px 0; }
+:root[data-appearance="classic"] .theme-classic .console-page-foot { padding: 12px 24px 22px; }
+:root[data-appearance="classic"] .theme-classic .dashboard-aura { display: none; }
+:root[data-appearance="classic"] .theme-classic .dashboard-page .page-header { min-height: 0; margin-bottom: 26px; padding: 0 0 20px; }
+:root[data-appearance="classic"] .theme-classic .dashboard-page h1:after { display: none; }
+/* The modern telemetry segment carries a 24px right margin so its own
+   border-right divider sits in the gap. Classic draws the divider on the LEFT
+   edge instead and never restates the margin, so it leaked through: the active
+   segment's tint stopped 24px short of its cell and the notch read as the
+   highlight failing to fill. Classic needs no margin at all. */
+:root[data-appearance="classic"] .telemetry-segment { margin-right: 0; }
+/* Both columns stretch so the directory and the detail card share one top and
+   one bottom edge. `align-items: start` let the detail card end wherever its
+   content happened to stop, which read as the two sides being misaligned.
+
+   Stretching the column is not enough on its own: the card inside is
+   `position: sticky` (theme.css), and a stretched grid item does NOT force a
+   sticky child to fill it — the child keeps its content height, so the card's
+   bottom edge stopped short of the directory's by however much content it was
+   missing. `.classic-channel-detail` is therefore a flex column and the card
+   grows into it. The card also has to stop being sticky itself, or it would
+   detach from its own column and float; the column carries the stickiness
+   instead, which is what keeps the card in view while the long list scrolls. */
+:root[data-appearance="classic"] .theme-classic .channels-workspace { display: grid; grid-template-columns: minmax(0,1.6fr) minmax(310px,1fr); grid-template-rows: minmax(0, 1fr); gap: 20px; align-items: stretch; }
+:root[data-appearance="classic"] .classic-channel-detail { min-width: 0; position: sticky; top: 118px; display: flex; flex-direction: column; }
+:root[data-appearance="classic"] .classic-channel-detail > .detail-card { }
+/* The workspace is capped to the space actually left below the page chrome so
+   the console stops scrolling as a whole. It used to inherit the directory's
+   `min(70vh, 820px)` (styles.css), and 70vh ignores everything the workspace
+   sits below — the fixed topbar (58), the page heading (81), the telemetry strip
+   (91) and their paddings, 322px in total — plus the page foot (49) and the gap
+   above it (28). At an 839px-tall viewport that put the page at 986px, so the
+   window scrolled to reveal a list that was already scrolling inside itself,
+   and the right card followed the list down because the two columns share one
+   bottom edge.
+
+   Capping the workspace (not just the list) is what makes both columns fit: the
+   grid row is the taller of the two, so capping only the list left the row sized
+   by the detail card's content. `max-height` rather than `height` matters — a
+   fixed height would stretch both columns to the cap even when a single row of
+   channels leaves nothing to fill, which is the same empty-space complaint in
+   another form. The row is `minmax(0, 1fr)` rather than the default `auto`
+   because an auto row grows to its content and would overflow the capped
+   container. Each column then fills the row and owns its own scrolling — the
+   list through `.list-shell-body`, the card through `overflow-y` here.
+
+   `min-height` keeps both usable on short viewports, where the page legitimately
+   scrolls again (a 200px list is worse than a scrollbar). */
+:root[data-appearance="classic"] .theme-classic .channels-workspace { max-height: calc(100dvh - 400px); min-height: 280px; }
+:root[data-appearance="classic"] .theme-classic .channels-directory { max-height: none; height: auto; min-height: 0; }
+:root[data-appearance="classic"] .classic-channel-detail { min-height: 0; height: auto; }
+:root[data-appearance="classic"] .classic-channel-detail > .detail-card { flex: 1 1 auto; position: static; overflow-y: auto; overscroll-behavior: contain; }
+/* The card's own bottom padding is the strip the fill has to cover too. With
+   `bottom: 0` the bar stopped 12px short of the card's border, and whatever
+   scrolled past the fold stayed visible in that strip — content showing through
+   the bar while its buttons sat on top of it. The shared rule's negative offset
+   cancels the card padding (`bottom: -12px` + `padding-bottom: 12px`), so the
+   surface reaches the border and the fold is no longer a window. */
+:root[data-appearance="classic"] .classic-channel-detail > .detail-card > .detail-primary-bar { position: sticky; margin-bottom: 0; background: var(--surface); }
+/* The directory's first row is already pushed down by its filter row, so the
+   detail card needs the same lead-in — otherwise its first chip row sits flush
+   against the frame and the two columns read as level but not aligned. Placed
+   after the cap block above so the padding is not lost in the later shorthand. */
+:root[data-appearance="classic"] .classic-channel-detail > .detail-card { padding-top: 25px; }
+:root[data-appearance="classic"] .theme-classic .models-split { grid-template-columns: minmax(0,1.35fr) minmax(390px,1fr); grid-template-rows: minmax(0, 1fr); max-height: calc(100dvh - 376px); min-height: 280px; }
+:root[data-appearance="classic"] .theme-classic .model-directory { min-height: 0; position: static; max-height: none; }
+/* The model detail card is a direct grid child and carries
+   `max-height: min(70vh, 820px)` (styles.css `.ops-detail-card.is-compact`). At a
+   548px-tall viewport 70vh is 384px, so the card stopped there while the
+   directory kept its full 538px — the left column hung below the right one,
+   which is the misalignment this rule removes. The split's own cap now bounds
+   the row and the card stretches into it; the card still needs its own
+   `overflow-y` (already set by `.ops-detail-card.is-compact`) because its
+   content can exceed a short row. */
+:root[data-appearance="classic"] .theme-classic .models-split > .ops-detail-card { max-height: none; overflow-y: auto; overscroll-behavior: contain; }
+:root[data-appearance="classic"] .theme-classic .models-split > .ops-detail-card > .detail-primary-bar { position: sticky; margin-bottom: 0; background: var(--surface); }
+:root[data-appearance="classic"] .theme-classic .model-row-upstream,
+:root[data-appearance="classic"] .theme-classic .model-row-status { display: table-cell; }
+:root[data-appearance="classic"] .theme-classic .model-nav-provider { display: none; }
+:root[data-appearance="classic"] .workspace-filter-row { padding: 14px; border-bottom: 1px solid var(--line); }
+:root[data-appearance="classic"] .workspace-filter-row .workspace-list-caption { display: none; }
+:root[data-appearance="classic"] .classic-mobile-trigger { display: none; }
+:root[data-appearance="classic"] .gateway-classic { pointer-events: auto !important; z-index: 10000; outline: none; }
+:root[data-appearance="classic"] .gateway-classic .transition-art { position: absolute; inset: 0; pointer-events: none; }
+:root[data-appearance="classic"] .gateway-classic .cinematic-skip { z-index: 10; pointer-events: auto; background: var(--surface); border-color: var(--line-strong); color: var(--ink); }
+:root[data-appearance="classic"] .gateway-classic.is-revealing .gateway-door { animation-duration: var(--entry-reveal); }
+:root[data-appearance="classic"] .gateway-classic.is-sealing .gateway-door { animation-duration: var(--entry-charge); }
+:root[data-appearance="classic"] .gateway-classic.is-revealing .gateway-transition-lock { animation-duration: var(--entry-reveal); }
+:root[data-appearance="classic"] .login-page { min-height: 100dvh; display: flex; flex-direction: column; }
+:root[data-appearance="classic"] .login-stage { display: grid; grid-template-columns: 1.2fr 1fr; gap: 9%; width: min(1080px,100%); align-items: center; }
+:root[data-appearance="classic"] .login-card { width: auto; border-radius: 0; }
+:root[data-appearance="classic"] .console-brand-mark { background: transparent; border-radius: 0; box-shadow: none; }
+/* The brand mark carries its own near-black tile, so the classic frame and
+   tint come off; only the grid slot stays. */
+:root[data-appearance="classic"] .brand-mark { background: transparent; border-color: transparent; box-shadow: none; }
+:root[data-appearance="classic"] .brand-mark svg { width: 100%; height: 100%; display: block; }
+@media (min-width: 761px) and (max-width: 1400px) {
+  :root[data-appearance="classic"] .gate-console-deck { display: grid; grid-template-columns: auto 1fr; grid-template-rows: auto auto; height: auto; min-height: 0; padding-top: 10px; padding-bottom: 10px; row-gap: 7px; }
+  :root[data-appearance="classic"] .deck-identity { grid-column: 1; grid-row: 1; }
+  :root[data-appearance="classic"] .deck-status-cluster { grid-column: 2; grid-row: 1; }
+  :root[data-appearance="classic"] .deck-sector-rail { grid-column: 1/-1; grid-row: 2; justify-content: flex-start; }
+}
+@media (max-width: 1100px) {
+  :root[data-appearance="classic"] .theme-classic .channels-workspace,
+  :root[data-appearance="classic"] .theme-classic .models-split { grid-template-columns: minmax(0,1fr); grid-template-rows: none; max-height: none; min-height: 0; }
+  /* Stacked: the detail card is no longer a sibling column, so there is no
+     bottom edge to match, nothing to cap, and no reason to stretch it. */
+  :root[data-appearance="classic"] .theme-classic .models-split > .ops-detail-card { max-height: min(70vh, 820px); }
+  :root[data-appearance="classic"] .theme-classic .models-split > .ops-detail-card > .detail-primary-bar { position: static; }
+  /* Stacked: the detail card is no longer a sibling column, so there is no
+     bottom edge to match, nothing to cap, and no reason to stretch it. */
+  :root[data-appearance="classic"] .theme-classic .channels-workspace { max-height: none; min-height: 0; grid-template-rows: none; }
+  :root[data-appearance="classic"] .theme-classic .channels-directory { height: auto; max-height: min(70vh, 820px); }
+  :root[data-appearance="classic"] .classic-channel-detail { position: static; }
+  :root[data-appearance="classic"] .classic-channel-detail > .detail-card { flex: 0 0 auto; overflow-y: visible; }
+}
+@media (max-width: 760px) {
+  :root[data-appearance="classic"] .gate-console-deck { display: flex; flex-wrap: wrap; gap: 10px; padding: 12px 16px; }
+  :root[data-appearance="classic"] .deck-sector-rail { display: none; }
+  :root[data-appearance="classic"] .classic-mobile-trigger { display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; margin-left: auto; background: var(--surface); color: var(--ink); border: 1px solid var(--line); }
+  :root[data-appearance="classic"] .deck-status-cluster { width: 100%; justify-content: flex-end; }
+  :root[data-appearance="classic"] .theme-classic .console-content { padding: 0 16px; }
+  :root[data-appearance="classic"] .theme-classic .page { padding-top: 22px; }
+  :root[data-appearance="classic"] .theme-classic .telemetry-strip { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); }
+  :root[data-appearance="classic"] .theme-classic .telemetry-segment { min-width: 0; margin: 0; padding: 16px; }
+  :root[data-appearance="classic"] .login-stage { grid-template-columns: 1fr; gap: 28px; }
+  :root[data-appearance="classic"] .login-sculpture { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root[data-appearance="classic"] .gateway-classic { animation: none; background: var(--bg); }
+  :root[data-appearance="classic"] .gateway-classic .transition-art { display: none; }
+}
+
+/* ---------------------------------------------------------------- palette --
+   The snapshot was carried over from the deep-space canvas era. Four shadows
+   tuned for black read as heavy smudges on the alabaster surface, and one
+   hover border went full black. */
+:root[data-appearance="classic"] .chart-wrap {
+  box-shadow: inset 0 1px 2px rgba(15, 42, 66, .05);
+}
+:root[data-appearance="classic"] .toast {
+  box-shadow: 0 10px 28px rgba(15, 42, 66, .14), 0 2px 6px rgba(15, 42, 66, .08);
+}
+:root[data-appearance="classic"] .market-card:hover {
+  box-shadow: 0 10px 26px rgba(15, 42, 66, .12), 0 0 0 1px var(--primary-hairline);
+}
+:root[data-appearance="classic"] .tone-primary.is-interactive:hover {
+  border-color: var(--line-strong);
+}
+
+/* -------------------------------------------------------------- geometry --
+   Components introduced after the snapshot still carry the modern corner
+   radius, which fights the classic zero-radius language. */
+:root[data-appearance="classic"] .route-policy-disclosure,
+:root[data-appearance="classic"] .login-card-mark,
+:root[data-appearance="classic"] .workbench-ref,
+:root[data-appearance="classic"] .workbench-ref-add,
+:root[data-appearance="classic"] .workbench-ref-remove,
+:root[data-appearance="classic"] .workbench-shot,
+:root[data-appearance="classic"] .workbench-history-item,
+:root[data-appearance="classic"] .workbench-history-item img,
+:root[data-appearance="classic"] .appearance-card,
+:root[data-appearance="classic"] .appearance-modes > button,
+:root[data-appearance="classic"] .appearance-mini-header i {
+  border-radius: var(--radius);
+}
+
+/* ---------------------------------------------------------------- tokens --
+   tokens.css defines the ambient haze for modern only. Classic never
+   restated them, so every consumer — the login atmosphere above all — fell
+   back to the modern indigo. Restate them in the classic spectrum. */
+:root[data-appearance="classic"] {
+  --ambient-a: rgba(124, 196, 240, .1);
+  --ambient-b: rgba(212, 175, 55, .05);
+  --ambient-c: rgba(15, 42, 66, .04);
+}
+
+/* --------------------------------------------------------------- motion --
+   motion.css is the modern art layer and hardcodes its own palette
+   (#3357e8 indigo, #8ac3cf teal, #d5b66e gold, rgba(41,62,54,…) ink-green).
+   It carries no .theme-modern gate, so those pixels paint in classic too.
+   Only the rules that actually render on the classic login are restated. */
+:root[data-appearance="classic"] .login-motion .login-atmosphere {
+  background:
+    radial-gradient(ellipse at 12% 24%, var(--ambient-a), transparent 57%),
+    radial-gradient(ellipse at 82% 18%, var(--ambient-b), transparent 52%),
+    radial-gradient(ellipse at 25% 100%, var(--ambient-c), transparent 55%);
+}
+:root[data-appearance="classic"] .login-light-ribbons i {
+  background: linear-gradient(90deg, transparent, rgba(124, 196, 240, .3), rgba(212, 175, 55, .18), transparent);
+}
+:root[data-appearance="classic"] .login-light-ribbons i:after {
+  background: linear-gradient(90deg, transparent, var(--primary), transparent);
+}
+:root[data-appearance="classic"] .login-motion .login-tile.is-front {
+  box-shadow: 8px 8px 0 rgba(15, 42, 66, .08);
+}
+:root[data-appearance="classic"] .login-motion .login-submit:before {
+  background: linear-gradient(90deg, transparent, rgba(124, 196, 240, .28), transparent);
+}
+:root[data-appearance="classic"] .login-motion .login-submit:after {
+  background: linear-gradient(90deg, transparent, var(--primary), var(--accent), transparent);
+}
+
+/* styles.css tints the chat-image-edit badge at (0,2,0) while classic's own
+   badge rule sits at (0,3,0) and would win — the classic counterpart has to be
+   spelled at (0,4,0). */
+:root[data-appearance="classic"] .model-meta-badge.is-shim {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 40%, var(--line));
+  background: color-mix(in srgb, var(--warning) 10%, var(--surface));
+}
+
+/* Classic top-aligns `.panel-header` where the base sheet (styles/system.css)
+   asks for `center`. Top-alignment only reads as aligned while every item is the
+   same height — but a header pairs a ~21px title with the 38px window picker, so
+   the two tops met and the two optical centres missed by 7px (8.5px on the log
+   histogram, 2.25px wherever a `.panel-muted` readout sits opposite the title).
+   The title looked lifted and the control looked sunk. Centring resolves per
+   flex line, so `flex-wrap` still owns overflow: a title that wraps above its
+   toolbar keeps its own row and is unaffected. */
+:root[data-appearance="classic"] .panel-header {
+  align-items: center;
+}
+
+/* A folded panel keeps only its header. Classic draws that header with a
+   bottom divider plus 14px of padding and pads the panel 24/26px, so a lone
+   title would sit above a stray rule inside an oversized box. */
+:root[data-appearance="classic"] .panel.is-collapsed {
+  padding: 16px 20px;
+}
+:root[data-appearance="classic"] .panel.is-collapsed .panel-header {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: 0;
+  min-height: 0;
+}
+
+/* —— Controls ——
+   The console's control language (white field, hairline, focus ring) lives once,
+   in styles/system.css, and this appearance reads it the way the modern one does.
+   The deliberate difference is the corner radius, which is a token: 0 here, 10px
+   there. This file used to restate the whole treatment for classic, which is how
+   the two appearance layers drifted into disagreeing about what a field is. */
+
+/* —— Readability on this appearance's own palette ——
+   Three token corrections, all measured rather than felt. They live here because
+   base.css is a snapshot of the upstream palette and console-side differences
+   belong in this layer.
+
+   --muted: the snapshot's #5d7188 measures 4.49:1 on a white card and 4.29:1 on
+   the #eef3f7 panels that hint text, tab labels and badges actually sit on. A
+   hair under AA is still under AA, so this is the value that clears it on every
+   surface the token is used against (5.2 on #eef3f7, 4.85 on the hover tint).
+
+   --primary-ink / --accent-ink: the powder blue (#7cc4f0) and the gilt gold
+   (#d4af37) are fill colours — as text on a light surface they measure 1.9:1 and
+   1.9:1. These are the same brand hues, at text weight: 5.6 and 6.0 on white,
+   4.7 and 5.0 on the darkest surface they appear on.
+
+   In dark, the brand fills are already light enough to read as text, so the ink
+   tokens resolve to them; the danger fill is light red, where white text is
+   3.3:1 — hence --on-danger flipping to dark ink instead. */
+:root[data-appearance="classic"] {
+  --muted: #55677c;
+  --primary-ink: #276d99;
+  --accent-ink: #7d5f1a;
+}
+:root.dark[data-appearance="classic"] {
+  --muted: #93a8bd;
+  --primary-ink: #7cc4f0;
+  --accent-ink: #d4af37;
+  --on-danger: #2a1417;
+}
+
+/* —— Text-safe brand hues, in this appearance's own layer ——
+   theme.css carries its own copies of these rules and outranks the shared ones,
+   so the same two corrections are stated once more where they win. Both are the
+   brand hue at text weight rather than fill weight: measured 1.9:1 and 1.9:1 as
+   they stood, 5.6:1 and 6.0:1 here. */
+:root[data-appearance="classic"] .empty-hero-kicker,
+:root[data-appearance="classic"] .endpoint-copy strong,
+:root[data-appearance="classic"] .endpoint-mono {
+  color: var(--primary-ink);
+}
+:root[data-appearance="classic"] .exchange-format-badge.is-primary {
+  color: var(--accent-ink);
+}
+:root[data-appearance="classic"] .setup-guide-go {
+  color: var(--primary-ink);
+}
+:root[data-appearance="classic"] .setup-guide-dismiss {
+  color: var(--muted);
+}
+/* The classic danger button paints its label white; on this appearance's dark
+   scheme the danger fill is light red, where white measures 3.3:1. */
+:root[data-appearance="classic"] .button-danger {
+  color: var(--on-danger);
+}
+
+/* —— Sticky, which never worked in this appearance ——
+   `overflow-x: hidden` on `body` (base.css) and on `.authenticated-stage`
+   (theme.css) turns each of those boxes into a scroll container — and a
+   `position: sticky` element resolves against its nearest scroll container,
+   which here is one that never scrolls, so the element simply travels with the
+   page. The settings rail, the top bar and every `position: sticky` table header
+   in this appearance were written to pin and could not.
+
+   `overflow-x: clip` is the same cut without the scroll container, and `visible`
+   on body is safe because the root still clips sideways overflow. */
+:root[data-appearance="classic"] body {
+  overflow-x: visible;
+}
+:root[data-appearance="classic"] .authenticated-stage {
+  overflow-x: clip;
+}
+
+/* The logs band stays one row in this appearance too. The shared rules live in
+   styles/workspaces.css, which this appearance's own telemetry-strip block (a
+   bordered card with a 180px segment minimum) is imported after and would
+   otherwise win, wrapping five figures into 2+2+1. Mirrored here for the three
+   cases the shared layer handles: room for a row, not enough room, phones. */
+:root[data-appearance="classic"] .logs-overview .telemetry-strip {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+@container (min-width: 640px) {
+  :root[data-appearance="classic"] .logs-overview .telemetry-strip {
+    grid-template-columns: repeat(auto-fit, minmax(0, 1fr));
+  }
+}
+@media (max-width: 820px) {
+  :root[data-appearance="classic"] .logs-overview .telemetry-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* The classic pack caps the cockpit lists itself (max-height 220px on the
+   channel/log lists, 320px on the news list). The shared layer sizes them to
+   the panel now, so a row of two panels ends level instead of leaving a hole
+   under the shorter list. */
+:root[data-appearance="classic"] .cockpit-channel-list,
+:root[data-appearance="classic"] .cockpit-log-list,
+:root[data-appearance="classic"] .site-news-list {
+  max-height: none;
+}
+
+/* The classic pack sizes a drawer at `height: 100vh`, but the backdrop around it
+   adds 12px of padding top and bottom — so the drawer was 24px taller than the
+   viewport and its footer (取消 / 保存) hung below the fold: the form looked like
+   it had no save button. The shared layer already subtracts the padding; this
+   brings the binding back in line. */
+:root[data-appearance="classic"] .drawer {
+  height: calc(100dvh - 24px);
+}
+@media (max-width: 860px) {
+  :root[data-appearance="classic"] .drawer {
+    height: 100dvh;
+  }
+}
