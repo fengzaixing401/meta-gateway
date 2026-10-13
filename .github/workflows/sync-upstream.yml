@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -19,6 +23,10 @@ jobs:
           ref: master
 
       - name: Merge upstream master
+        env:
+          # GITHUB_TOKEN 永远没有 workflows 权限，无法推送 .github/workflows/* 的改动。
+          # 因此优先使用仓库 secret SYNC_TOKEN（classic PAT，需 repo + workflow scope）。
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
@@ -26,5 +34,21 @@ jobs:
           git remote add upstream https://github.com/ZiChuanLan/meta-gateway.git
           git fetch upstream master
           git checkout master
+
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "already up to date with upstream, nothing to do"
+            exit 0
+          fi
+
+          BEFORE=$(git rev-parse HEAD)
           git merge --no-edit upstream/master
-          git push origin master
+
+          if [ -z "${SYNC_TOKEN:-}" ]; then
+            echo "::error::secret SYNC_TOKEN 未配置；若本次合并包含 .github/workflows/ 改动，推送会被拒绝。"
+            git push origin master
+          else
+            git remote set-url origin "https://x-access-token:${SYNC_TOKEN}@github.com/${{ github.repository }}.git"
+            git push origin master
+            git remote set-url origin "https://github.com/${{ github.repository }}.git"
+          fi
+          echo "synced ${BEFORE} -> $(git rev-parse HEAD)"
